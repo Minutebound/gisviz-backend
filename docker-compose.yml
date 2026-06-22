@@ -7,9 +7,7 @@ services:
     container_name: gisviz-auth-db
     restart: always
     environment:
-      POSTGRES_USER: auth_user
-      POSTGRES_PASSWORD: AuthSecurePassword2026
-      POSTGRES_DB: gisviz_auth_db
+      - .env.db
     ports:
       - "5433:5432"
     volumes:
@@ -30,9 +28,7 @@ services:
     container_name: gisviz-spatial-db
     restart: always
     environment:
-      POSTGRES_USER: gis_user
-      POSTGRES_PASSWORD: SpatialSecurePassword2026
-      POSTGRES_DB: gisviz_gis_db
+      - .env.db
     ports:
       - "5434:5432" # Mapped to 5434 on the host to avoid collision with auth-db
     volumes:
