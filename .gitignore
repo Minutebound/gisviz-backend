@@ -1,0 +1,58 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ---- Environment & secrets ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- FastAPI / app runtime ----
+*.log
+logs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.cache/
+
+# ---- Databases (local dumps / SQLite) ----
+*.sqlite3
+*.db
+*.sql
+
+# ---- Docker ----
+# Volumes are named in compose, but ignore any local bind data
+docker-data/
+*.pid
+
+# ---- IDE / editors ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Alembic (if you add migrations later) ----
+# Keep migration scripts, ignore nothing by default — leave as a reminder
