@@ -1,56 +1,303 @@
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from app.db.models import Publication, User
 import json
+import secrets
+from typing import List, Dict, Any, Optional
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.db.models import (
+    GeographicPublicationRecord,
+    PublicationLikeRecord,
+    PublicationCommentRecord,
+    CategoryRecord,
+    PublicationCategoryLink,
+    PlatformUserRecord,
+)
+from app.services.cache_service import cache_service
+from app.core.config import settings
+
+
+def _make_share_slug() -> str:
+    return secrets.token_urlsafe(8)[:12]
+
 
 class GeographicPublicationService:
-    def retrieve_global_stream(self, spatial_db: Session, auth_db: Session, skip: int = 0, limit: int = 50):
-        # 1. Fetch raw spatial data from PostGIS using the NEW schema names
-        query = text("""
-            SELECT 
-                id, author_user_id, parent_publication_id, 
-                title, description, primary_airport_geocode,
-                layer_metadata, tags, 
-                view_count, likes_count, comments_count, saves_count, 
-                is_public, created_at, updated_at,
-                data_license, temporal_start, temporal_end,
-                ST_AsGeoJSON(geometry) as geometry,
-                ST_AsGeoJSON(bounding_box) as bounding_box
-            FROM publications
-            ORDER BY created_at DESC
-            OFFSET :skip LIMIT :limit
-        """)
-        
-        raw_posts = spatial_db.execute(query, {"skip": skip, "limit": limit}).fetchall()
-        
-        if not raw_posts:
+
+    # ----------------------------------------------------------------
+    # Shared: hydrate raw rows with author info + categories
+    # ----------------------------------------------------------------
+    def _hydrate(
+        self,
+        posts_db: Session,
+        users_db: Session,
+        rows: list,
+    ) -> List[Dict[str, Any]]:
+        if not rows:
             return []
-            
-        # 2. Extract unique author IDs to look up in the Auth DB
-        author_ids = list(set([str(row.author_user_id) for row in raw_posts]))
-        
-        # 3. Fetch user profiles from Auth DB using the new `User` model properties
-        users = auth_db.query(User).filter(User.id.in_(author_ids)).all()
-        user_map = {str(u.id): u for u in users}
-        
-        # 4. Stitch the spatial data and user profiles together
-        formatted_posts = []
-        for row in raw_posts:
-            post_dict = dict(row._mapping)
-            
-            # Parse PostGIS GeoJSON strings back into Python dictionaries
-            if post_dict.get('geometry'):
-                post_dict['geometry'] = json.loads(post_dict['geometry'])
-            if post_dict.get('bounding_box'):
-                post_dict['bounding_box'] = json.loads(post_dict['bounding_box'])
-            
-            # Attach User metadata mapping to the new columns
-            author = user_map.get(str(post_dict['author_user_id']))
-            post_dict['author_handle'] = author.handle if author else "Unknown User"
-            post_dict['author_avatar_url'] = author.avatar_url if author else ""
-            
-            formatted_posts.append(post_dict)
-            
-        return formatted_posts
+
+        publication_ids = [str(r.publication_id) for r in rows]
+        author_ids = list({str(r.author_user_id) for r in rows})
+
+        # --- author profiles (users DB) ---
+        users = (
+            users_db.query(PlatformUserRecord)
+            .filter(PlatformUserRecord.user_id.in_(author_ids))
+            .all()
+        )
+        user_map = {str(u.user_id): u for u in users}
+
+        # --- categories for these publications (posts DB) ---
+        cat_rows = (
+            posts_db.query(PublicationCategoryLink, CategoryRecord)
+            .join(CategoryRecord, PublicationCategoryLink.category_id == CategoryRecord.category_id)
+            .filter(PublicationCategoryLink.publication_id.in_(publication_ids))
+            .all()
+        )
+        cat_map: Dict[str, List[Dict[str, Any]]] = {}
+        for link, cat in cat_rows:
+            cat_map.setdefault(str(link.publication_id), []).append(
+                {
+                    "category_id": cat.category_id,
+                    "slug": cat.slug,
+                    "label": cat.label,
+                    "usage_count": cat.usage_count,
+                }
+            )
+
+        formatted = []
+        for row in rows:
+            d = dict(row._mapping)
+            if d.get("spatial_geometry"):
+                d["spatial_geometry"] = json.loads(d["spatial_geometry"])
+
+            author = user_map.get(str(d["author_user_id"]))
+            d["author_handle"] = author.user_handle if author else "Unknown User"
+            d["author_avatar_url"] = author.avatar_storage_url if author else ""
+            d["categories"] = cat_map.get(str(d["publication_id"]), [])
+            d["share_url"] = f"/p/{d['share_slug']}"
+            formatted.append(d)
+
+        return formatted
+
+    def _select_sql(self, where: str = "", order: str = "ORDER BY created_timestamp DESC") -> str:
+        return f"""
+            SELECT
+                publication_id, author_user_id, publication_title,
+                layer_attribute_metadata, share_slug,
+                total_likes_count, total_comments_count,
+                created_timestamp, updated_timestamp,
+                ST_AsGeoJSON(spatial_geometry) AS spatial_geometry
+            FROM geographic_publications
+            {where}
+            {order}
+            OFFSET :skip LIMIT :limit
+        """
+
+    # ----------------------------------------------------------------
+    # Global stream
+    # ----------------------------------------------------------------
+    def retrieve_global_stream(
+        self, posts_db: Session, users_db: Session, skip: int = 0, limit: int = 50
+    ):
+        rows = posts_db.execute(
+            text(self._select_sql()), {"skip": skip, "limit": limit}
+        ).fetchall()
+        return self._hydrate(posts_db, users_db, rows)
+
+    # ----------------------------------------------------------------
+    # Search with read-through Redis cache
+    # ----------------------------------------------------------------
+    def search_publications(
+        self, posts_db: Session, users_db: Session, query: str, skip: int = 0, limit: int = 50
+    ):
+        cached = cache_service.get_search_results(query, skip, limit)
+        if cached is not None:
+            return cached
+
+        sql = self._select_sql(
+            where="WHERE publication_title ILIKE :q",
+            order="ORDER BY created_timestamp DESC",
+        )
+        rows = posts_db.execute(
+            text(sql), {"q": f"%{query}%", "skip": skip, "limit": limit}
+        ).fetchall()
+        results = self._hydrate(posts_db, users_db, rows)
+
+        cache_service.set_search_results(query, skip, limit, results)
+        return results
+
+    # ----------------------------------------------------------------
+    # Likes (toggle) — keeps PG counter + Redis mirror in sync
+    # ----------------------------------------------------------------
+    def toggle_like(self, posts_db: Session, publication_id: str, user_id: str) -> Dict[str, Any]:
+        pub = (
+            posts_db.query(GeographicPublicationRecord)
+            .filter(GeographicPublicationRecord.publication_id == publication_id)
+            .first()
+        )
+        if not pub:
+            raise ValueError("Publication not found")
+
+        existing = (
+            posts_db.query(PublicationLikeRecord)
+            .filter(
+                PublicationLikeRecord.publication_id == publication_id,
+                PublicationLikeRecord.user_id == user_id,
+            )
+            .first()
+        )
+
+        if existing:
+            posts_db.delete(existing)
+            pub.total_likes_count = max(0, pub.total_likes_count - 1)
+            liked = False
+            cache_service.incr_like(str(publication_id), -1)
+            cache_service.bump_trending(str(publication_id), weight=-1.0)
+        else:
+            posts_db.add(PublicationLikeRecord(publication_id=publication_id, user_id=user_id))
+            pub.total_likes_count += 1
+            liked = True
+            cache_service.incr_like(str(publication_id), 1)
+            cache_service.bump_trending(str(publication_id), weight=1.0)
+
+        posts_db.commit()
+        posts_db.refresh(pub)
+        return {
+            "publication_id": publication_id,
+            "user_id": user_id,
+            "liked": liked,
+            "total_likes_count": pub.total_likes_count,
+        }
+
+    # ----------------------------------------------------------------
+    # Comments
+    # ----------------------------------------------------------------
+    def add_comment(
+        self, posts_db: Session, publication_id: str, user_id: str,
+        content: str, parent_comment_id: Optional[str] = None,
+    ) -> PublicationCommentRecord:
+        pub = (
+            posts_db.query(GeographicPublicationRecord)
+            .filter(GeographicPublicationRecord.publication_id == publication_id)
+            .first()
+        )
+        if not pub:
+            raise ValueError("Publication not found")
+
+        if parent_comment_id:
+            parent = (
+                posts_db.query(PublicationCommentRecord)
+                .filter(
+                    PublicationCommentRecord.comment_id == parent_comment_id,
+                    PublicationCommentRecord.publication_id == publication_id,
+                )
+                .first()
+            )
+            if not parent:
+                raise ValueError("Parent comment not found on this publication")
+
+        comment = PublicationCommentRecord(
+            publication_id=publication_id,
+            user_id=user_id,
+            content=content,
+            parent_comment_id=parent_comment_id,
+        )
+        posts_db.add(comment)
+        pub.total_comments_count += 1
+        posts_db.commit()
+        posts_db.refresh(comment)
+
+        cache_service.incr_comment(str(publication_id), 1)
+        cache_service.bump_trending(str(publication_id), weight=0.5)
+        return comment
+
+    def get_comment_thread(
+        self, posts_db: Session, users_db: Session, publication_id: str
+    ) -> List[Dict[str, Any]]:
+        rows = (
+            posts_db.query(PublicationCommentRecord)
+            .filter(PublicationCommentRecord.publication_id == publication_id)
+            .order_by(PublicationCommentRecord.created_timestamp.asc())
+            .all()
+        )
+
+        author_ids = list({str(c.user_id) for c in rows})
+        users = (
+            users_db.query(PlatformUserRecord)
+            .filter(PlatformUserRecord.user_id.in_(author_ids))
+            .all()
+        )
+        user_map = {str(u.user_id): u for u in users}
+
+        nodes: Dict[str, Dict[str, Any]] = {}
+        for c in rows:
+            author = user_map.get(str(c.user_id))
+            nodes[str(c.comment_id)] = {
+                "comment_id": c.comment_id,
+                "publication_id": c.publication_id,
+                "user_id": c.user_id,
+                "author_handle": author.user_handle if author else "Unknown User",
+                "author_avatar_url": author.avatar_storage_url if author else "",
+                "parent_comment_id": c.parent_comment_id,
+                "content": c.content,
+                "is_edited": bool(c.is_edited),
+                "created_timestamp": c.created_timestamp,
+                "updated_timestamp": c.updated_timestamp,
+                "replies": [],
+            }
+
+        roots: List[Dict[str, Any]] = []
+        for node in nodes.values():
+            parent_id = str(node["parent_comment_id"]) if node["parent_comment_id"] else None
+            if parent_id and parent_id in nodes:
+                nodes[parent_id]["replies"].append(node)
+            else:
+                roots.append(node)
+        return roots
+
+    # ----------------------------------------------------------------
+    # Create publication (with approved categories) + bust search cache
+    # ----------------------------------------------------------------
+    def create_publication(
+        self, posts_db: Session, users_db: Session, author_user_id: str,
+        title: str, geojson: Dict[str, Any], metadata: Dict[str, Any],
+        category_ids: List[int],
+    ) -> Dict[str, Any]:
+        pub = GeographicPublicationRecord(
+            author_user_id=author_user_id,
+            publication_title=title,
+            spatial_geometry=text("ST_GeomFromGeoJSON(:gj)").bindparams(gj=json.dumps(geojson)),
+            layer_attribute_metadata=metadata,
+            share_slug=_make_share_slug(),
+        )
+        posts_db.add(pub)
+        posts_db.flush()
+
+        for cid in category_ids:
+            cat = posts_db.query(CategoryRecord).filter(CategoryRecord.category_id == cid).first()
+            if cat:
+                posts_db.add(PublicationCategoryLink(publication_id=pub.publication_id, category_id=cid))
+                cat.usage_count += 1
+
+        # keep author's publication_count fresh
+        author = (
+            users_db.query(PlatformUserRecord)
+            .filter(PlatformUserRecord.user_id == author_user_id)
+            .first()
+        )
+        if author:
+            author.publication_count += 1
+            users_db.commit()
+
+        posts_db.commit()
+        posts_db.refresh(pub)
+
+        cache_service.invalidate_search()  # new content should appear immediately
+
+        rows = posts_db.execute(
+            text(self._select_sql(where="WHERE publication_id = :pid", order="")),
+            {"pid": str(pub.publication_id), "skip": 0, "limit": 1},
+        ).fetchall()
+        return self._hydrate(posts_db, users_db, rows)[0]
+
 
 post_service = GeographicPublicationService()

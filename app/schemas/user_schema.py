@@ -1,48 +1,50 @@
-from pydantic import BaseModel, EmailStr, UUID4, Field
-from typing import Optional, List
+from pydantic import BaseModel, EmailStr, UUID4
 from datetime import datetime
+from typing import Optional, Dict, Any
+
 
 class UserRegistrationPayload(BaseModel):
-    handle: str = Field(..., min_length=3, max_length=50)
-    email: EmailStr
-    password: str = Field(..., min_length=8)
+    user_handle: str
+    email_address: EmailStr
+    plaintext_password: str
+
 
 class UserAuthenticationResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    user_id: UUID4
-    handle: str
-    email: str
+    user_handle: str
+    email_address: str
 
-class UserProfileData(BaseModel):
-    id: UUID4
-    handle: str
-    email: EmailStr
-    avatar_url: Optional[str] = None
-    bio: Optional[str] = None
-    is_verified: bool
-    subscription_tier: str
-    expert_level: Optional[str] = None
-    created_at: datetime
+
+class RoleData(BaseModel):
+    role_id: int
+    name: str
+    permissions: Dict[str, Any] = {}
 
     class Config:
         from_attributes = True
 
-class UserProfileUpdate(BaseModel):
-    handle: Optional[str] = Field(None, min_length=3, max_length=50)
-    bio: Optional[str] = Field(None, max_length=500)
-    avatar_url: Optional[str] = None
 
-class FollowActionResponse(BaseModel):
-    status: str  # Will return "followed" or "unfollowed"
-    follower_count: int
+class UserProfileData(BaseModel):
+    user_id: UUID4
+    user_handle: str
+    email_address: EmailStr
+    avatar_storage_url: Optional[str] = None
+    role: Optional[RoleData] = None
+    follower_count: int = 0
+    following_count: int = 0
+    publication_count: int = 0
+    created_timestamp: datetime
 
-class NetworkUserItem(BaseModel):
-    handle: str
-    avatar_url: Optional[str]
-    followed_at: datetime
-    days_following: int  # Dynamic timeframe calculation
+    class Config:
+        from_attributes = True
 
-class NetworkListResponse(BaseModel):
-    users: List[NetworkUserItem]
-    total_count: int
+
+class FollowEventData(BaseModel):
+    actor_user_id: UUID4
+    target_user_id: UUID4
+    action: str
+    occurred_timestamp: datetime
+
+    class Config:
+        from_attributes = True

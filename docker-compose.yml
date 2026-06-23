@@ -1,102 +1,95 @@
 services:
-  # --------------------------------------------------------
-  # 1. Authentication & Identity Store (PostgreSQL)
-  # --------------------------------------------------------
-  auth-db:
+
+  # ────────────────────────────────────────────────────────
+  # 1. Users DB  (PostgreSQL 15)
+  # Credentials injected from .env via Compose interpolation.
+  # ────────────────────────────────────────────────────────
+  users-db:
     image: postgres:15-alpine
-    container_name: gisviz-auth-db
+    container_name: gisviz-users-db
     restart: always
     environment:
-      - .env.db
-    ports:
-      - "5433:5432"
+      POSTGRES_USER: "${USERS_DB_USER}"
+      POSTGRES_PASSWORD: "${USERS_DB_PASSWORD}"
+      POSTGRES_DB: "${USERS_DB_NAME}"
     volumes:
-      - auth-db-data:/var/lib/postgresql/data
-    networks:
-      - gisviz-network
+      - users-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "auth_user", "-d", "gisviz_auth_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${USERS_DB_USER} -d ${USERS_DB_NAME}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - gisviz-network
 
-  # --------------------------------------------------------
-  # 2. Spatial Data & Geographic Engine (PostGIS)
-  # --------------------------------------------------------
-  spatial-db:
+  # ────────────────────────────────────────────────────────
+  # 2. Posts DB  (PostGIS 15-3.3)
+  # ────────────────────────────────────────────────────────
+  posts-db:
     image: postgis/postgis:15-3.3
-    container_name: gisviz-spatial-db
+    container_name: gisviz-posts-db
     restart: always
     environment:
-      - .env.db
-    ports:
-      - "5434:5432" # Mapped to 5434 on the host to avoid collision with auth-db
+      POSTGRES_USER: "${POSTS_DB_USER}"
+      POSTGRES_PASSWORD: "${POSTS_DB_PASSWORD}"
+      POSTGRES_DB: "${POSTS_DB_NAME}"
     volumes:
-      - spatial-db-data:/var/lib/postgresql/data
-    networks:
-      - gisviz-network
+      - posts-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "gis_user", "-d", "gisviz_gis_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTS_DB_USER} -d ${POSTS_DB_NAME}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - gisviz-network
 
-  # --------------------------------------------------------
-  # 3. Analytics & Trending Cache (Redis)
-  # --------------------------------------------------------
+  # ────────────────────────────────────────────────────────
+  # 3. Redis Cache
+  # ────────────────────────────────────────────────────────
   cache:
     image: redis:7-alpine
     container_name: gisviz-cache
     restart: always
-    ports:
-      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
       - cache-data:/data
-    networks:
-      - gisviz-network
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - gisviz-network
 
-  # --------------------------------------------------------
-  # 4. Database Management GUI (pgAdmin)
-  # --------------------------------------------------------
+  # ────────────────────────────────────────────────────────
+  # 4. pgAdmin 4  — DB management GUI
+  # Access at http://localhost:5050
+  # Login with PGADMIN_DEFAULT_EMAIL / PGADMIN_DEFAULT_PASSWORD from .env
+  # ────────────────────────────────────────────────────────
   pgadmin:
-    image: dpage/pgadmin4
+    image: dpage/pgadmin4:latest
     container_name: gisviz-pgadmin
     restart: always
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@gisviz.com
-      PGADMIN_DEFAULT_PASSWORD: AdminSecurePassword2026
-      PGADMIN_LISTEN_PORT: 80
+      PGADMIN_DEFAULT_EMAIL: "${PGADMIN_EMAIL}"
+      PGADMIN_DEFAULT_PASSWORD: "${PGADMIN_PASSWORD}"
+      PGADMIN_LISTEN_PORT: "80"
     ports:
       - "5050:80"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
     depends_on:
-      - auth-db
-      - spatial-db
-    networks:
-      - gisviz-network
-    
-
-  # --------------------------------------------------------
-  # 5. Cache Management GUI (RedisInsight)
-  # --------------------------------------------------------
-  redisinsight:
-    image: redis/redisinsight:latest
-    container_name: gisviz-redisinsight
-    restart: always
-    ports:
-      - "5540:5540"
-    depends_on:
-      - cache
+      users-db:
+        condition: service_healthy
+      posts-db:
+        condition: service_healthy
     networks:
       - gisviz-network
 
-  # --------------------------------------------------------
-  # 6. FastAPI Application Engine
-  # --------------------------------------------------------
+  # ────────────────────────────────────────────────────────
+  # 5. FastAPI backend
+  # All app config read from .env.backend at runtime.
+  # ────────────────────────────────────────────────────────
   api:
     build:
       context: .
@@ -108,28 +101,27 @@ services:
     ports:
       - "8001:8001"
     depends_on:
-      auth-db:
-        condition: service_started
-      spatial-db:
-        condition: service_started
+      users-db:
+        condition: service_healthy
+      posts-db:
+        condition: service_healthy
       cache:
-        condition: service_started
+        condition: service_healthy
     networks:
       - gisviz-network
-    volumes:
-      - .:/app
-# --------------------------------------------------------
-# Global Network & Persistent Volumes
-# --------------------------------------------------------
+
+# ──────────────────────────────────────────────────────────
 networks:
   gisviz-network:
     name: gisviz-network
     driver: bridge
 
 volumes:
-  auth-db-data:
-    name: gisviz-auth-db-data
-  spatial-db-data:
-    name: gisviz-spatial-db-data
+  users-db-data:
+    name: gisviz-users-db-data
+  posts-db-data:
+    name: gisviz-posts-db-data
   cache-data:
     name: gisviz-cache-data
+  pgadmin-data:
+    name: gisviz-pgadmin-data

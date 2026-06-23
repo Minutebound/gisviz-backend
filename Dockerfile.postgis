@@ -1,0 +1,9 @@
+FROM postgres:15
+
+# Install the native PostGIS packages directly from the Debian apt repository
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       postgresql-15-postgis-3 \
+       postgresql-15-postgis-3-scripts \
+       postgis \
+    && rm -rf /var/lib/apt/lists/*

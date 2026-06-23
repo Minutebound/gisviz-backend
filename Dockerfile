@@ -51,5 +51,5 @@ USER gisvizuser
 
 EXPOSE 8001
 
-# Execute the application via Uvicorn ASGI server
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload", "--workers", "4"]
+# Execute the application via Uvicorn ASGI server (Removed --reload to allow --workers)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "4"]
