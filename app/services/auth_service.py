@@ -79,7 +79,7 @@ def get_current_authenticated_user(
     db: Session = Depends(get_users_db),   # renamed
 ):
     credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
+        status_code=status.HTTP_401_UNpublisherIZED,
         detail="Could not validate credentials",
     )
     try:

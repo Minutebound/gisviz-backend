@@ -41,9 +41,9 @@ class GeographicPublicationPayload(BaseModel):
 
 class GeographicPublicationResponse(BaseModel):
     publication_id: UUID4
-    author_user_id: UUID4
-    author_handle: str
-    author_avatar_url: Optional[str] = ""
+    publisher_user_id: UUID4
+    publisher_handle: str
+    publisher_avatar_url: Optional[str] = ""
     publication_title: str
     categories: List[CategoryData] = []
     layer_attribute_metadata: Dict[str, Any]
@@ -77,8 +77,8 @@ class CommentData(BaseModel):
     comment_id: UUID4
     publication_id: UUID4
     user_id: UUID4
-    author_handle: Optional[str] = None
-    author_avatar_url: Optional[str] = None
+    publisher_handle: Optional[str] = None
+    publisher_avatar_url: Optional[str] = None
     parent_comment_id: Optional[UUID4] = None
     content: str
     is_edited: bool = False

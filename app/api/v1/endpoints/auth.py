@@ -37,7 +37,7 @@ def authenticate_platform_account(
         form_data.password, user.hashed_security_password
     ):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_401_UNpublisherIZED,
             detail="Incorrect user handle or password",
             headers={"WWW-Authenticate": "Bearer"},
         )

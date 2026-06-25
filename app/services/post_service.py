@@ -23,7 +23,7 @@ def _make_share_slug() -> str:
 class GeographicPublicationService:
 
     # ----------------------------------------------------------------
-    # Shared: hydrate raw rows with author info + categories
+    # Shared: hydrate raw rows with publisher info + categories
     # ----------------------------------------------------------------
     def _hydrate(
         self,
@@ -35,12 +35,12 @@ class GeographicPublicationService:
             return []
 
         publication_ids = [str(r.publication_id) for r in rows]
-        author_ids = list({str(r.author_user_id) for r in rows})
+        publisher_ids = list({str(r.publisher_user_id) for r in rows})
 
-        # --- author profiles (users DB) ---
+        # --- publisher profiles (users DB) ---
         users = (
             users_db.query(PlatformUserRecord)
-            .filter(PlatformUserRecord.user_id.in_(author_ids))
+            .filter(PlatformUserRecord.user_id.in_(publisher_ids))
             .all()
         )
         user_map = {str(u.user_id): u for u in users}
@@ -69,9 +69,9 @@ class GeographicPublicationService:
             if d.get("spatial_geometry"):
                 d["spatial_geometry"] = json.loads(d["spatial_geometry"])
 
-            author = user_map.get(str(d["author_user_id"]))
-            d["author_handle"] = author.user_handle if author else "Unknown User"
-            d["author_avatar_url"] = author.avatar_storage_url if author else ""
+            publisher = user_map.get(str(d["publisher_user_id"]))
+            d["publisher_handle"] = publisher.user_handle if publisher else "Unknown User"
+            d["publisher_avatar_url"] = publisher.avatar_storage_url if publisher else ""
             d["categories"] = cat_map.get(str(d["publication_id"]), [])
             d["share_url"] = f"/p/{d['share_slug']}"
             formatted.append(d)
@@ -81,7 +81,7 @@ class GeographicPublicationService:
     def _select_sql(self, where: str = "", order: str = "ORDER BY created_timestamp DESC") -> str:
         return f"""
             SELECT
-                publication_id, author_user_id, publication_title,
+                publication_id, publisher_user_id, publication_title,
                 layer_attribute_metadata, share_slug,
                 total_likes_count, total_comments_count,
                 created_timestamp, updated_timestamp,
@@ -220,23 +220,23 @@ class GeographicPublicationService:
             .all()
         )
 
-        author_ids = list({str(c.user_id) for c in rows})
+        publisher_ids = list({str(c.user_id) for c in rows})
         users = (
             users_db.query(PlatformUserRecord)
-            .filter(PlatformUserRecord.user_id.in_(author_ids))
+            .filter(PlatformUserRecord.user_id.in_(publisher_ids))
             .all()
         )
         user_map = {str(u.user_id): u for u in users}
 
         nodes: Dict[str, Dict[str, Any]] = {}
         for c in rows:
-            author = user_map.get(str(c.user_id))
+            publisher = user_map.get(str(c.user_id))
             nodes[str(c.comment_id)] = {
                 "comment_id": c.comment_id,
                 "publication_id": c.publication_id,
                 "user_id": c.user_id,
-                "author_handle": author.user_handle if author else "Unknown User",
-                "author_avatar_url": author.avatar_storage_url if author else "",
+                "publisher_handle": publisher.user_handle if publisher else "Unknown User",
+                "publisher_avatar_url": publisher.avatar_storage_url if publisher else "",
                 "parent_comment_id": c.parent_comment_id,
                 "content": c.content,
                 "is_edited": bool(c.is_edited),
@@ -258,12 +258,12 @@ class GeographicPublicationService:
     # Create publication (with approved categories) + bust search cache
     # ----------------------------------------------------------------
     def create_publication(
-        self, posts_db: Session, users_db: Session, author_user_id: str,
+        self, posts_db: Session, users_db: Session, publisher_user_id: str,
         title: str, geojson: Dict[str, Any], metadata: Dict[str, Any],
         category_ids: List[int],
     ) -> Dict[str, Any]:
         pub = GeographicPublicationRecord(
-            author_user_id=author_user_id,
+            publisher_user_id=publisher_user_id,
             publication_title=title,
             spatial_geometry=text("ST_GeomFromGeoJSON(:gj)").bindparams(gj=json.dumps(geojson)),
             layer_attribute_metadata=metadata,
@@ -278,14 +278,14 @@ class GeographicPublicationService:
                 posts_db.add(PublicationCategoryLink(publication_id=pub.publication_id, category_id=cid))
                 cat.usage_count += 1
 
-        # keep author's publication_count fresh
-        author = (
+        # keep publisher's publication_count fresh
+        publisher = (
             users_db.query(PlatformUserRecord)
-            .filter(PlatformUserRecord.user_id == author_user_id)
+            .filter(PlatformUserRecord.user_id == publisher_user_id)
             .first()
         )
-        if author:
-            author.publication_count += 1
+        if publisher:
+            publisher.publication_count += 1
             users_db.commit()
 
         posts_db.commit()

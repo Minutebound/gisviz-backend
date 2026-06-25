@@ -94,7 +94,7 @@ class GeographicPublicationRecord(PostsBase):
 
     # Cross-database link — enforced logically in the API, not by an FK,
     # because users live in a separate Postgres instance.
-    author_user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    publisher_user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
 
     publication_title = Column(String(255), nullable=False)
     spatial_geometry = Column(
@@ -151,7 +151,7 @@ class PublicationCommentRecord(PostsBase):
         ForeignKey("geographic_publications.publication_id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
-    user_id = Column(UUID(as_uuid=True), nullable=False, index=True)  # author of the comment
+    user_id = Column(UUID(as_uuid=True), nullable=False, index=True)  # publisher of the comment
 
     # Self-referencing FK for nested replies (adjacency list).
     # NULL = top-level comment; otherwise points at the comment being replied to.
