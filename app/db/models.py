@@ -5,18 +5,16 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from geoalchemy2 import Geometry
 
 from app.db.database import UsersBase, PostsBase
-
 
 # ============================================================
 #  USERS DATABASE
 # ============================================================
 
 class RoleRecord(UsersBase):
-    """Role-based access control. Permissions stored as JSON flags so new
-    capabilities don't require a migration."""
+    """Role-based access control. 
+    Expected roles: admin, editor, viewer, publisher, support."""
     __tablename__ = "roles"
 
     role_id = Column(Integer, primary_key=True, autoincrement=True)
@@ -34,34 +32,60 @@ class PlatformUserRecord(UsersBase):
     user_handle = Column(String(50), unique=True, index=True, nullable=False)
     email_address = Column(String(100), unique=True, index=True, nullable=False)
     hashed_security_password = Column(String(255), nullable=False)
-    avatar_storage_url = Column(String)
+    
+    # --- AUTHENTICATION & SECURITY ---
+    is_verified = Column(Integer, default=0, nullable=False)
+    verification_otp = Column(String(6), nullable=True)
+    otp_expires_at = Column(DateTime(timezone=True), nullable=True)
+    
+    password_reset_token = Column(String(128), unique=True, index=True, nullable=True)
+    reset_token_expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    # --- PROFILE & SOCIALS ---
+    avatar_path = Column(String, nullable=True)
+    title = Column(String(100), nullable=True)
+    linkedin_url = Column(String(255), nullable=True)
+    medium_url = Column(String(255), nullable=True)
+    website_url = Column(String(255), nullable=True)
 
     role_id = Column(Integer, ForeignKey("roles.role_id"), nullable=True, index=True)
 
-    # Denormalized social counters (kept in sync via follow events / triggers)
+    # --- COUNTERS ---
     follower_count = Column(Integer, default=0, nullable=False)
     following_count = Column(Integer, default=0, nullable=False)
-    publication_count = Column(Integer, default=0, nullable=False)
+    post_count = Column(Integer, default=0, nullable=False)
 
-    is_active = Column(Integer, default=1, nullable=False)  # soft-disable flag
+    is_active = Column(Integer, default=1, nullable=False)
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     updated_timestamp = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
     role = relationship("RoleRecord", back_populates="users")
+    location = relationship("UserLocationRecord", back_populates="user", uselist=False, cascade="all, delete-orphan")
+
+
+class UserLocationRecord(UsersBase):
+    __tablename__ = "user_locations"
+
+    location_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("platform_users.user_id", ondelete="CASCADE"), unique=True)
+    
+    place = Column(String(100), nullable=True)
+    state = Column(String(100), nullable=True)
+    country = Column(String(100), nullable=True)
+    formatted_string = Column(String(255), nullable=True) 
+
+    user = relationship("PlatformUserRecord", back_populates="location")
 
 
 class FollowEventRecord(UsersBase):
-    """Append-only audit log of every follow/unfollow action.
-    NEVER updated or deleted — current state is derived from the latest event
-    per (actor, target) pair, or read from FollowCurrentRecord."""
     __tablename__ = "follow_events"
 
     event_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    actor_user_id = Column(UUID(as_uuid=True), nullable=False, index=True)   # who acted
-    target_user_id = Column(UUID(as_uuid=True), nullable=False, index=True)  # whom
-    action = Column(String(10), nullable=False)  # 'follow' | 'unfollow'
+    actor_user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    target_user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    action = Column(String(10), nullable=False)
     occurred_timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -70,8 +94,6 @@ class FollowEventRecord(UsersBase):
 
 
 class FollowCurrentRecord(UsersBase):
-    """Materialized current-follow state — fast lookup, maintained from the
-    event stream. One row per active follow relationship."""
     __tablename__ = "follows_current"
 
     actor_user_id = Column(UUID(as_uuid=True), primary_key=True)
@@ -84,28 +106,21 @@ class FollowCurrentRecord(UsersBase):
 
 
 # ============================================================
-#  POSTS DATABASE  (PostGIS)
+#  POSTS DATABASE  
 # ============================================================
 
-class GeographicPublicationRecord(PostsBase):
-    __tablename__ = "geographic_publications"
+class PostRecord(PostsBase):
+    __tablename__ = "posts"
 
-    publication_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-
-    # Cross-database link — enforced logically in the API, not by an FK,
-    # because users live in a separate Postgres instance.
+    post_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     publisher_user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
 
-    publication_title = Column(String(255), nullable=False)
-    spatial_geometry = Column(
-        Geometry(geometry_type="GEOMETRY", srid=4326), nullable=False
-    )
-    layer_attribute_metadata = Column(JSONB, default=dict)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True) 
+    visual_image_path = Column(String, nullable=True) 
 
-    # URL-safe public share slug (e.g. short nanoid). Default share link = /p/{slug}
     share_slug = Column(String(32), unique=True, index=True, nullable=False)
 
-    # Denormalized engagement counters (source of truth lives here; Redis mirrors)
     total_likes_count = Column(Integer, default=0, nullable=False)
     total_comments_count = Column(Integer, default=0, nullable=False)
 
@@ -114,50 +129,46 @@ class GeographicPublicationRecord(PostsBase):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    likes = relationship("PublicationLikeRecord", back_populates="publication",
-                         cascade="all, delete-orphan")
-    comments = relationship("PublicationCommentRecord", back_populates="publication",
-                            cascade="all, delete-orphan")
-    category_links = relationship("PublicationCategoryLink", back_populates="publication",
-                                  cascade="all, delete-orphan")
+    likes = relationship("PostLikeRecord", back_populates="post", cascade="all, delete-orphan")
+    comments = relationship("PostCommentRecord", back_populates="post", cascade="all, delete-orphan")
+    category_links = relationship("PostCategoryLink", back_populates="post", cascade="all, delete-orphan")
+    keyword_links = relationship("PostKeywordLink", back_populates="post", cascade="all, delete-orphan")
+    reports = relationship("PostReportRecord", back_populates="post", cascade="all, delete-orphan")
 
 
-class PublicationLikeRecord(PostsBase):
-    __tablename__ = "publication_likes"
+class PostLikeRecord(PostsBase):
+    __tablename__ = "post_likes"
 
     like_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    publication_id = Column(
+    post_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("geographic_publications.publication_id", ondelete="CASCADE"),
+        ForeignKey("posts.post_id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
-    user_id = Column(UUID(as_uuid=True), nullable=False, index=True)  # cross-db, logical link
+    user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
-    publication = relationship("GeographicPublicationRecord", back_populates="likes")
+    post = relationship("PostRecord", back_populates="likes")
 
     __table_args__ = (
-        # A user can like a publication at most once
-        UniqueConstraint("publication_id", "user_id", name="uq_like_user_publication"),
+        UniqueConstraint("post_id", "user_id", name="uq_like_user_post"),
     )
 
 
-class PublicationCommentRecord(PostsBase):
-    __tablename__ = "publication_comments"
+class PostCommentRecord(PostsBase):
+    __tablename__ = "post_comments"
 
     comment_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    publication_id = Column(
+    post_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("geographic_publications.publication_id", ondelete="CASCADE"),
+        ForeignKey("posts.post_id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
-    user_id = Column(UUID(as_uuid=True), nullable=False, index=True)  # publisher of the comment
+    user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
 
-    # Self-referencing FK for nested replies (adjacency list).
-    # NULL = top-level comment; otherwise points at the comment being replied to.
     parent_comment_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("publication_comments.comment_id", ondelete="CASCADE"),
+        ForeignKey("post_comments.comment_id", ondelete="CASCADE"),
         nullable=True, index=True,
     )
 
@@ -168,18 +179,15 @@ class PublicationCommentRecord(PostsBase):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    publication = relationship("GeographicPublicationRecord", back_populates="comments")
+    post = relationship("PostRecord", back_populates="comments")
     replies = relationship(
-        "PublicationCommentRecord",
+        "PostCommentRecord",
         backref="parent",
         remote_side=[comment_id],
     )
 
 
 class CategoryRecord(PostsBase):
-    """Approved, canonical keyword list. Publications reference these via the
-    join table instead of storing string arrays — indexed integer joins are
-    far cheaper than scanning text arrays."""
     __tablename__ = "categories"
 
     category_id = Column(Integer, primary_key=True, autoincrement=True)
@@ -188,41 +196,64 @@ class CategoryRecord(PostsBase):
     usage_count = Column(Integer, default=0, nullable=False)
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
-    publication_links = relationship("PublicationCategoryLink", back_populates="category")
+    post_links = relationship("PostCategoryLink", back_populates="category")
 
 
-class PublicationCategoryLink(PostsBase):
-    """Many-to-many join between publications and approved categories."""
-    __tablename__ = "publication_categories"
+class PostCategoryLink(PostsBase):
+    __tablename__ = "post_categories"
 
-    publication_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("geographic_publications.publication_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    category_id = Column(
-        Integer,
-        ForeignKey("categories.category_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
+    post_id = Column(UUID(as_uuid=True), ForeignKey("posts.post_id", ondelete="CASCADE"), primary_key=True)
+    category_id = Column(Integer, ForeignKey("categories.category_id", ondelete="CASCADE"), primary_key=True)
 
-    publication = relationship("GeographicPublicationRecord", back_populates="category_links")
-    category = relationship("CategoryRecord", back_populates="publication_links")
+    post = relationship("PostRecord", back_populates="category_links")
+    category = relationship("CategoryRecord", back_populates="post_links")
 
 
-class PendingTagRecord(PostsBase):
-    """Holding pen for user-suggested keywords awaiting manual approval.
-    Approving a row inserts into `categories` and flips status to 'approved'."""
-    __tablename__ = "pending_tags"
+class KeywordRecord(PostsBase):
+    __tablename__ = "keywords"
+
+    keyword_id = Column(Integer, primary_key=True, autoincrement=True)
+    word = Column(String(80), unique=True, index=True, nullable=False)
+    usage_count = Column(Integer, default=0, nullable=False)
+
+    post_links = relationship("PostKeywordLink", back_populates="keyword")
+
+
+class PostKeywordLink(PostsBase):
+    __tablename__ = "post_keywords"
+
+    post_id = Column(UUID(as_uuid=True), ForeignKey("posts.post_id", ondelete="CASCADE"), primary_key=True)
+    keyword_id = Column(Integer, ForeignKey("keywords.keyword_id", ondelete="CASCADE"), primary_key=True)
+
+    post = relationship("PostRecord", back_populates="keyword_links")
+    keyword = relationship("KeywordRecord", back_populates="post_links")
+
+
+class PendingCategoryRecord(PostsBase):
+    __tablename__ = "pending_categories"
 
     pending_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     label = Column(String(80), nullable=False)
     normalized_slug = Column(String(60), nullable=False, index=True)
     suggested_by_user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
-    status = Column(String(12), default="pending", nullable=False, index=True)  # pending|approved|rejected
+    status = Column(String(12), default="pending", nullable=False, index=True)
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     reviewed_timestamp = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
-        UniqueConstraint("normalized_slug", "status", name="uq_pending_slug_status"),
+        UniqueConstraint("normalized_slug", "status", name="uq_pending_cat_slug_status"),
     )
+
+
+class PostReportRecord(PostsBase):
+    __tablename__ = "post_reports"
+
+    report_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    post_id = Column(UUID(as_uuid=True), ForeignKey("posts.post_id", ondelete="CASCADE"), nullable=False, index=True)
+    reporter_user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    
+    reason = Column(Text, nullable=False)
+    status = Column(String(20), default="open", nullable=False)
+    created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+    post = relationship("PostRecord", back_populates="reports")

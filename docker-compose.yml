@@ -26,7 +26,7 @@ services:
   # 2. Posts DB  (PostGIS 15-3.3)
   # ────────────────────────────────────────────────────────
   posts-db:
-    image: postgis/postgis:15-3.3
+    image: postgres:15-alpine
     container_name: gisviz-posts-db
     restart: always
     environment:
@@ -94,12 +94,19 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # CHANGE THIS TO 'dev' FOR LOCAL TESTING, OR 'prod' FOR IONOS DEPLOYMENT
+      target: dev
     container_name: gisviz-api
     restart: always
     env_file:
       - .env.backend
     ports:
       - "8001:8001"
+    volumes:
+      # If using 'target: dev', uncomment the next line to mount your live code:
+      - ./app:/app/app
+      # This performs the actual mount of the uploads folder to persist images:
+      - uploads-data:/app/uploads
     depends_on:
       users-db:
         condition: service_healthy
@@ -109,6 +116,7 @@ services:
         condition: service_healthy
     networks:
       - gisviz-network
+  
 
 # ──────────────────────────────────────────────────────────
 networks:
@@ -125,3 +133,5 @@ volumes:
     name: gisviz-cache-data
   pgadmin-data:
     name: gisviz-pgadmin-data
+  uploads-data:
+    name: gisviz-uploads-data

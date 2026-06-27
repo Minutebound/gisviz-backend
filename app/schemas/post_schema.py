@@ -1,9 +1,8 @@
 from pydantic import BaseModel, UUID4
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 from datetime import datetime
 
-
-# ----- Categories -----
+# ----- Categories & Keywords -----
 class CategoryData(BaseModel):
     category_id: int
     slug: str
@@ -13,12 +12,17 @@ class CategoryData(BaseModel):
     class Config:
         from_attributes = True
 
+class KeywordData(BaseModel):
+    keyword_id: int
+    word: str
 
-class PendingTagSuggestion(BaseModel):
+    class Config:
+        from_attributes = True
+
+class PendingCategorySuggestion(BaseModel):
     label: str
 
-
-class PendingTagData(BaseModel):
+class PendingCategoryData(BaseModel):
     pending_id: UUID4
     label: str
     normalized_slug: str
@@ -29,25 +33,24 @@ class PendingTagData(BaseModel):
     class Config:
         from_attributes = True
 
-
-# ----- Publications -----
-class GeographicPublicationPayload(BaseModel):
-    publication_title: str
-    # Submit by approved category id; unknown labels go through pending_tags instead.
+# ----- Posts -----
+class PostPayload(BaseModel):
+    title: str
+    description: Optional[str] = None
+    visual_image_path: str 
     category_ids: List[int] = []
-    layer_attribute_metadata: Dict[str, Any] = {}
-    spatial_geometry_geojson: Dict[str, Any]
+    keywords: List[str] = []
 
-
-class GeographicPublicationResponse(BaseModel):
-    publication_id: UUID4
+class PostResponse(BaseModel):
+    post_id: UUID4
     publisher_user_id: UUID4
     publisher_handle: str
-    publisher_avatar_url: Optional[str] = ""
-    publication_title: str
+    publisher_avatar_path: Optional[str] = None
+    title: str
+    description: Optional[str] = None
+    visual_image_path: Optional[str] = None
     categories: List[CategoryData] = []
-    layer_attribute_metadata: Dict[str, Any]
-    spatial_geometry: Dict[str, Any]
+    keywords: List[KeywordData] = []
     share_slug: str
     share_url: str
     total_likes_count: int
@@ -58,27 +61,39 @@ class GeographicPublicationResponse(BaseModel):
     class Config:
         from_attributes = True
 
+# ----- Reports -----
+class PostReportPayload(BaseModel):
+    reason: str
+
+class PostReportResponse(BaseModel):
+    report_id: UUID4
+    post_id: UUID4
+    reporter_user_id: UUID4
+    reason: str
+    status: str
+    created_timestamp: datetime
+
+    class Config:
+        from_attributes = True
 
 # ----- Likes -----
 class LikeResponse(BaseModel):
-    publication_id: UUID4
+    post_id: UUID4
     user_id: UUID4
     liked: bool
     total_likes_count: int
-
 
 # ----- Comments -----
 class CommentPayload(BaseModel):
     content: str
     parent_comment_id: Optional[UUID4] = None
 
-
 class CommentData(BaseModel):
     comment_id: UUID4
-    publication_id: UUID4
+    post_id: UUID4
     user_id: UUID4
     publisher_handle: Optional[str] = None
-    publisher_avatar_url: Optional[str] = None
+    publisher_avatar_path: Optional[str] = None
     parent_comment_id: Optional[UUID4] = None
     content: str
     is_edited: bool = False
@@ -88,6 +103,5 @@ class CommentData(BaseModel):
 
     class Config:
         from_attributes = True
-
 
 CommentData.model_rebuild()

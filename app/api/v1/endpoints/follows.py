@@ -1,47 +1,64 @@
-from fastapi import APIRouter, Depends
+import uuid
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import List
 
 from app.db.database import get_users_db
-from app.db.models import PlatformUserRecord
-from app.schemas.user_schema import FollowEventData
-from app.services.follow_service import follow_service
+from app.db.models import PlatformUserRecord, FollowCurrentRecord, FollowEventRecord
 from app.services.auth_service import get_current_authenticated_user
 
 router = APIRouter()
 
-
 @router.post("/{target_id}/follow")
 def follow_user(
-    target_id: str,
-    users_db: Session = Depends(get_users_db),
-    current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
+    target_id: uuid.UUID,
+    db: Session = Depends(get_users_db),
+    current_user: PlatformUserRecord = Depends(get_current_authenticated_user)
 ):
-    return follow_service.follow(users_db, str(current_user.user_id), target_id)
-
+    if target_id == current_user.user_id:
+        raise HTTPException(status_code=400, detail="Cannot follow yourself")
+        
+    target = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == target_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    current_follow = db.query(FollowCurrentRecord).filter(
+        FollowCurrentRecord.actor_user_id == current_user.user_id,
+        FollowCurrentRecord.target_user_id == target_id
+    ).first()
+    
+    if current_follow:
+        return {"status": "already following"}
+        
+    db.add(FollowCurrentRecord(actor_user_id=current_user.user_id, target_user_id=target_id))
+    db.add(FollowEventRecord(actor_user_id=current_user.user_id, target_user_id=target_id, action="follow"))
+    
+    current_user.following_count += 1
+    target.follower_count += 1
+    db.commit()
+    
+    return {"status": "followed"}
 
 @router.post("/{target_id}/unfollow")
 def unfollow_user(
-    target_id: str,
-    users_db: Session = Depends(get_users_db),
-    current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
+    target_id: uuid.UUID,
+    db: Session = Depends(get_users_db),
+    current_user: PlatformUserRecord = Depends(get_current_authenticated_user)
 ):
-    return follow_service.unfollow(users_db, str(current_user.user_id), target_id)
-
-
-@router.get("/{target_id}/followers")
-def list_followers(target_id: str, users_db: Session = Depends(get_users_db)):
-    rows = follow_service.followers_of(users_db, target_id)
-    return [
-        {"actor_user_id": str(r.actor_user_id), "followed_since": r.followed_since}
-        for r in rows
-    ]
-
-
-@router.get("/{target_id}/history", response_model=List[FollowEventData])
-def follow_history(
-    target_id: str,
-    users_db: Session = Depends(get_users_db),
-    current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
-):
-    return follow_service.follow_history(users_db, str(current_user.user_id), target_id)
+    current_follow = db.query(FollowCurrentRecord).filter(
+        FollowCurrentRecord.actor_user_id == current_user.user_id,
+        FollowCurrentRecord.target_user_id == target_id
+    ).first()
+    
+    if not current_follow:
+        return {"status": "not following"}
+        
+    db.delete(current_follow)
+    db.add(FollowEventRecord(actor_user_id=current_user.user_id, target_user_id=target_id, action="unfollow"))
+    
+    target = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == target_id).first()
+    current_user.following_count = max(0, current_user.following_count - 1)
+    if target:
+        target.follower_count = max(0, target.follower_count - 1)
+        
+    db.commit()
+    return {"status": "unfollowed"}
