@@ -2,7 +2,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.db.database import get_posts_db
 from app.db.models import CategoryRecord, PendingCategoryRecord, PlatformUserRecord
@@ -56,7 +56,7 @@ def approve_pending_category(
     new_cat = CategoryRecord(slug=pending.normalized_slug, label=pending.label)
     db.add(new_cat)
     pending.status = "approved"
-    pending.reviewed_timestamp = datetime.utcnow()
+    pending.reviewed_timestamp = datetime.now(timezone.utc)
     db.commit()
     return {"status": "approved", "category": {"slug": new_cat.slug, "label": new_cat.label}}
 
@@ -71,6 +71,6 @@ def reject_pending_category(
         raise HTTPException(status_code=404, detail="Pending category not found")
         
     pending.status = "rejected"
-    pending.reviewed_timestamp = datetime.utcnow()
+    pending.reviewed_timestamp = datetime.now(timezone.utc)
     db.commit()
     return {"status": "rejected"}

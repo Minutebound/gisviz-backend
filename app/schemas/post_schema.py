@@ -8,16 +8,12 @@ class CategoryData(BaseModel):
     slug: str
     label: str
     usage_count: int = 0
-
-    class Config:
-        from_attributes = True
+    class Config: from_attributes = True
 
 class KeywordData(BaseModel):
     keyword_id: int
     word: str
-
-    class Config:
-        from_attributes = True
+    class Config: from_attributes = True
 
 class PendingCategorySuggestion(BaseModel):
     label: str
@@ -29,15 +25,17 @@ class PendingCategoryData(BaseModel):
     suggested_by_user_id: UUID4
     status: str
     created_timestamp: datetime
-
-    class Config:
-        from_attributes = True
+    class Config: from_attributes = True
 
 # ----- Posts -----
+
 class PostPayload(BaseModel):
     title: str
     description: Optional[str] = None
     visual_image_path: str 
+    note: Optional[str] = None
+    source_name: Optional[str] = None
+    source_url: Optional[str] = None
     category_ids: List[int] = []
     keywords: List[str] = []
 
@@ -49,6 +47,12 @@ class PostResponse(BaseModel):
     title: str
     description: Optional[str] = None
     visual_image_path: Optional[str] = None
+    
+    # NEW FIELDS
+    note: Optional[str] = None
+    source_name: Optional[str] = None
+    source_url: Optional[str] = None
+
     categories: List[CategoryData] = []
     keywords: List[KeywordData] = []
     share_slug: str

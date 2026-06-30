@@ -14,10 +14,11 @@ router = APIRouter()
 # Define base paths
 BASE_UPLOAD_DIR = "uploads"
 AVATAR_DIR = os.path.join(BASE_UPLOAD_DIR, "avatars")
+BANNER_DIR = os.path.join(BASE_UPLOAD_DIR, "banners") # NEW
 VISUAL_DIR = os.path.join(BASE_UPLOAD_DIR, "visuals")
 
-# Ensure directories exist when the app starts
 os.makedirs(AVATAR_DIR, exist_ok=True)
+os.makedirs(BANNER_DIR, exist_ok=True)
 os.makedirs(VISUAL_DIR, exist_ok=True)
 
 @router.post("/avatar")
@@ -124,3 +125,26 @@ async def upload_visual(
     db_path = f"/uploads/visuals/{filename}"
 
     return {"message": "Visual processed and uploaded successfully", "visual_path": db_path}
+
+@router.post("/banner")
+async def upload_banner(
+    file: UploadFile = File(...),
+    current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
+    db: Session = Depends(get_users_db)
+):
+    """Uploads a profile banner image."""
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+    filename = f"banner_{current_user.user_id}_{uuid.uuid4().hex[:8]}.{ext}"
+    file_path = os.path.join(BANNER_DIR, filename)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    db_path = f"/uploads/banners/{filename}"
+    current_user.banner_path = db_path
+    db.commit()
+
+    return {"message": "Banner uploaded successfully", "banner_path": db_path}

@@ -1,12 +1,27 @@
-from pydantic import BaseModel, EmailStr, UUID4, HttpUrl
+import re
+from pydantic import BaseModel, EmailStr, UUID4, validator
 from datetime import datetime
 from typing import Optional, Dict, Any
+
+# Reusable password complexity validator
+def validate_password_complexity(v: str) -> str:
+    if len(v) < 8:
+        raise ValueError('Password must be at least 8 characters long.')
+    if not re.search(r'[A-Za-z]', v):
+        raise ValueError('Password must contain at least one letter.')
+    if not re.search(r'[0-9]', v):
+        raise ValueError('Password must contain at least one number.')
+    return v
 
 # ----- REGISTRATION & AUTH -----
 class UserRegistrationPayload(BaseModel):
     user_handle: str
     email_address: EmailStr
     plaintext_password: str
+
+    @validator('plaintext_password')
+    def validate_password(cls, v):
+        return validate_password_complexity(v)
 
 class UserAuthenticationResponse(BaseModel):
     access_token: str
@@ -26,9 +41,17 @@ class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
     
+    @validator('new_password')
+    def validate_password(cls, v):
+        return validate_password_complexity(v)
+    
 class ResetPasswordPayload(BaseModel):
     token: str
     new_password: str
+
+    @validator('new_password')
+    def validate_password(cls, v):
+        return validate_password_complexity(v)
 
 # ----- PROFILE DATA -----
 class RoleData(BaseModel):

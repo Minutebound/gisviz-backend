@@ -182,11 +182,15 @@ class RoleChecker:
         self.allowed_roles = allowed_roles
 
     def __call__(self, user: PlatformUserRecord = Depends(get_current_authenticated_user)):
+        # Safely determine the role name, defaulting to viewer if none is set
+        role_name = user.role.name if user.role else "viewer"
+        
         # Admin bypasses all role checks
-        if user.role.name == "admin":
+        if role_name == "admin":
             return user
             
-        if user.role.name not in self.allowed_roles:
+        if role_name not in self.allowed_roles:
+            from fastapi import status # Ensure status is available
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Operation not permitted. Requires one of: {self.allowed_roles}"

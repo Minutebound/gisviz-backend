@@ -9,9 +9,10 @@ from app.schemas.user_schema import (
     UserAuthenticationResponse, 
     VerifyEmailPayload,
     ForgotPasswordPayload,
-    ResetPasswordPayload
+    ResetPasswordPayload,
+    ChangePasswordRequest
 )
-from app.services.auth_service import auth_service
+from app.services.auth_service import auth_service, get_current_authenticated_user
 from app.db.models import PlatformUserRecord
 
 router = APIRouter()
@@ -38,7 +39,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
             raise HTTPException(status_code=400, detail="Incorrect username/email or password")
 
     if user.is_verified == 0:
-        # NEW: Return the email so the frontend can use it implicitly without showing an input field
         raise HTTPException(
             status_code=403, 
             detail={"error": "unverified", "email": user.email_address}
@@ -75,3 +75,17 @@ def forgot_password(payload: ForgotPasswordPayload, db: Session = Depends(get_us
 def reset_password(payload: ResetPasswordPayload, db: Session = Depends(get_users_db)):
     return auth_service.execute_password_reset(db=db, token=payload.token, new_password=payload.new_password)
 
+@router.put("/change-password")
+def change_password(
+    payload: ChangePasswordRequest, 
+    db: Session = Depends(get_users_db),
+    current_user: PlatformUserRecord = Depends(get_current_authenticated_user)
+):
+    """Allows an authenticated user to change their password securely."""
+    if not auth_service.verify_password(payload.current_password, current_user.hashed_security_password):
+        raise HTTPException(status_code=400, detail="Incorrect current password. Please try again.")
+    
+    current_user.hashed_security_password = auth_service.get_password_hash(payload.new_password)
+    db.commit()
+    
+    return {"status": "success", "message": "Password updated successfully."}

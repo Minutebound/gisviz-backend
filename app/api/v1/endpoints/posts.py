@@ -66,6 +66,9 @@ def search_post_stream(
             "share_url": f"/p/{p.share_slug}",
             "total_likes_count": p.total_likes_count,
             "total_comments_count": p.total_comments_count,
+            "note": p.note,
+            "source_name": p.source_name,
+            "source_url": p.source_url,
             "created_timestamp": p.created_timestamp
         })
     return feed
@@ -107,6 +110,15 @@ def get_single_post(
         "created_timestamp": post.created_timestamp
     }
 
+@router.put("/{post_id}", response_model=PostResponse)
+def update_existing_post(
+    post_id: uuid.UUID,
+    payload: PostPayload,
+    db: Session = Depends(get_posts_db),
+    current_user: PlatformUserRecord = Depends(get_current_authenticated_user)
+):
+    """Update a post (Must be owner or admin)."""
+    return post_service.update_post(db, post_id, payload, current_user)
 
 # -------------------------------------------------------------------
 #  POST CRUD (Auto-Upgrade RBAC applied)

@@ -8,41 +8,47 @@ from app.db.models import (
     PostRecord, PostCategoryLink, PostKeywordLink, CategoryRecord, KeywordRecord, PlatformUserRecord
 )
 from app.schemas.post_schema import PostPayload
-
-def _make_share_slug() -> str:
-    return uuid.uuid4().hex[:8]
+from app.services.helpers import generate_unique_slug
 
 class PostService:
+    def _format_post_response(self, db: Session, post: PostRecord) -> dict:
+        """Helper to serialize a PostRecord into a Pydantic-compliant dictionary."""
+        publisher = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == post.publisher_user_id).first()
+        return {
+            "post_id": str(post.post_id),
+            "publisher_user_id": str(post.publisher_user_id),
+            "publisher_handle": publisher.user_handle if publisher else "Unknown",
+            "publisher_avatar_path": publisher.avatar_path if publisher else None,
+            "title": post.title,
+            "description": post.description,
+            "visual_image_path": post.visual_image_path,
+            "note": getattr(post, 'note', None),
+            "source_name": getattr(post, 'source_name', None),
+            "source_url": getattr(post, 'source_url', None),
+            "categories": [link.category for link in post.category_links],
+            "keywords": [link.keyword for link in post.keyword_links],
+            "share_slug": post.share_slug,
+            "share_url": f"/p/{post.share_slug}",
+            "total_likes_count": post.total_likes_count,
+            "total_comments_count": post.total_comments_count,
+            "created_timestamp": post.created_timestamp,
+            "updated_timestamp": post.updated_timestamp
+        }
+
     def retrieve_global_stream(self, posts_db: Session, users_db: Session, skip: int = 0, limit: int = 50) -> List[dict]:
         posts = posts_db.query(PostRecord).order_by(desc(PostRecord.created_timestamp)).offset(skip).limit(limit).all()
-        feed = []
-        for p in posts:
-            publisher = users_db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == p.publisher_user_id).first()
-            feed.append({
-                "post_id": p.post_id,
-                "publisher_user_id": p.publisher_user_id,
-                "publisher_handle": publisher.user_handle if publisher else "Unknown",
-                "publisher_avatar_path": publisher.avatar_path if publisher else None,
-                "title": p.title,
-                "description": p.description,
-                "visual_image_path": p.visual_image_path,
-                "categories": [link.category for link in p.category_links],
-                "keywords": [link.keyword for link in p.keyword_links],
-                "share_slug": p.share_slug,
-                "share_url": f"/p/{p.share_slug}",
-                "total_likes_count": p.total_likes_count,
-                "total_comments_count": p.total_comments_count,
-                "created_timestamp": p.created_timestamp
-            })
-        return feed
+        return [self._format_post_response(users_db, p) for p in posts]
 
-    def create_post(self, db: Session, user_id: uuid.UUID, payload: PostPayload) -> PostRecord:
+    def create_post(self, db: Session, user_id: uuid.UUID, payload: PostPayload) -> dict:
         new_post = PostRecord(
             publisher_user_id=user_id,
             title=payload.title,
             description=payload.description,
             visual_image_path=payload.visual_image_path,
-            share_slug=_make_share_slug()
+            note=payload.note,
+            source_name=payload.source_name,
+            source_url=payload.source_url,
+            share_slug=generate_unique_slug(db)
         )
         db.add(new_post)
         db.flush()
@@ -64,9 +70,10 @@ class PostService:
 
         db.commit()
         db.refresh(new_post)
-        return new_post
+        
+        return self._format_post_response(db, new_post)
 
-    def update_post(self, db: Session, post_id: uuid.UUID, payload: PostPayload, current_user: PlatformUserRecord) -> PostRecord:
+    def update_post(self, db: Session, post_id: uuid.UUID, payload: PostPayload, current_user: PlatformUserRecord) -> dict:
         post = db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
         if not post:
             raise HTTPException(status_code=404, detail="Post not found")
@@ -78,6 +85,10 @@ class PostService:
         # Update scalar fields
         post.title = payload.title
         post.description = payload.description
+        post.note = payload.note
+        post.source_name = payload.source_name
+        post.source_url = payload.source_url
+        
         if payload.visual_image_path:
             post.visual_image_path = payload.visual_image_path
 
@@ -88,7 +99,6 @@ class PostService:
                 db.add(PostCategoryLink(post_id=post.post_id, category_id=cat_id))
 
         # Clear existing keyword links and re-insert
-        # Optional: You could decrement the usage_count of old keywords here for absolute precision
         db.query(PostKeywordLink).filter(PostKeywordLink.post_id == post.post_id).delete()
         for kw_str in payload.keywords:
             clean_kw = kw_str.strip().lower()
@@ -103,7 +113,8 @@ class PostService:
 
         db.commit()
         db.refresh(post)
-        return post
+        
+        return self._format_post_response(db, post)
 
     def delete_post(self, db: Session, post_id: uuid.UUID, current_user: PlatformUserRecord):
         post = db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
