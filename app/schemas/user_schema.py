@@ -99,7 +99,6 @@ class UserSettingsUpdatePayload(BaseModel):
     linkedin_url: Optional[str] = None
     medium_url: Optional[str] = None
     website_url: Optional[str] = None
-    
     place: Optional[str] = None
     state: Optional[str] = None
     country: Optional[str] = None

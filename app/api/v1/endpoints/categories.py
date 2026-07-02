@@ -19,7 +19,7 @@ def get_categories(db: Session = Depends(get_posts_db)):
 def suggest_category(
     payload: PendingCategorySuggestion,
     db: Session = Depends(get_posts_db),
-    current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor", "publisher"]))
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor", "publisher","viewer"]))
 ):
     normalized = payload.label.strip().lower().replace(" ", "-")
     existing = db.query(CategoryRecord).filter(CategoryRecord.slug == normalized).first()
@@ -39,7 +39,7 @@ def suggest_category(
 @router.get("/pending", response_model=List[PendingCategoryData])
 def get_pending_categories(
     db: Session = Depends(get_posts_db),
-    current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor"]))
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor","publisher","viewer"]))
 ):
     return db.query(PendingCategoryRecord).filter(PendingCategoryRecord.status == "pending").all()
 

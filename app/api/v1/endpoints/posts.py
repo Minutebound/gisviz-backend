@@ -44,14 +44,22 @@ def search_post_stream(
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
 ):
-    # Basic text search on title or description
+    # 1. Fetch the posts
     posts = posts_db.query(PostRecord).filter(
         (PostRecord.title.ilike(f"%{q}%")) | (PostRecord.description.ilike(f"%{q}%"))
     ).order_by(desc(PostRecord.created_timestamp)).offset(skip).limit(limit).all()
 
+    # 2. Bulk fetch all publishers in ONE query (Fixes N+1 issue)
+    user_ids = list(set([p.publisher_user_id for p in posts]))
+    users = users_db.query(PlatformUserRecord).filter(
+        PlatformUserRecord.user_id.in_(user_ids)
+    ).all()
+    user_map = {u.user_id: u for u in users}
+
+    # 3. Assemble the feed
     feed = []
     for p in posts:
-        publisher = users_db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == p.publisher_user_id).first()
+        publisher = user_map.get(p.publisher_user_id)
         feed.append({
             "post_id": p.post_id,
             "publisher_user_id": p.publisher_user_id,
@@ -73,13 +81,13 @@ def search_post_stream(
         })
     return feed
 
+
 @router.get("/trending", response_model=List[str])
 def trending_posts(n: int = Query(10, ge=1, le=50)):
     trending = cache_service.get("trending_posts")
     # Return cache if available, else empty list until cache is populated
     return trending[:n] if trending else []
 
-# --- NEW: Get Single Post Endpoint ---
 @router.get("/{post_id}")
 def get_single_post(
     post_id: uuid.UUID,
@@ -110,15 +118,6 @@ def get_single_post(
         "created_timestamp": post.created_timestamp
     }
 
-@router.put("/{post_id}", response_model=PostResponse)
-def update_existing_post(
-    post_id: uuid.UUID,
-    payload: PostPayload,
-    db: Session = Depends(get_posts_db),
-    current_user: PlatformUserRecord = Depends(get_current_authenticated_user)
-):
-    """Update a post (Must be owner or admin)."""
-    return post_service.update_post(db, post_id, payload, current_user)
 
 # -------------------------------------------------------------------
 #  POST CRUD (Auto-Upgrade RBAC applied)

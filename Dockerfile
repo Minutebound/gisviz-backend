@@ -35,9 +35,12 @@ RUN pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.t
 # ==========================================
 FROM builder AS dev
 
-# NEW: Install using the pre-compiled wheels from the builder stage! 
-# This is much faster and bypasses compilation errors.
+# Install using the pre-compiled wheels from the builder stage!
 RUN pip install --no-cache /app/wheels/*
+
+# NEW: Copy Alembic configuration and migration scripts into the container
+COPY alembic.ini .
+COPY alembic/ ./alembic/
 
 # Pre-create the uploads directory
 RUN mkdir -p /app/uploads
@@ -60,6 +63,10 @@ RUN pip install --no-cache /wheels/*
 
 # Copy the application code and set ownership
 COPY --chown=gisvizuser:gisvizgroup ./app /app/app
+
+# NEW: Copy Alembic files and set ownership for secure production migrations
+COPY --chown=gisvizuser:gisvizgroup alembic.ini .
+COPY --chown=gisvizuser:gisvizgroup alembic/ ./alembic/
 
 # Pre-create the uploads directory and assign ownership to the secure user
 RUN mkdir -p /app/uploads && chown -R gisvizuser:gisvizgroup /app/uploads

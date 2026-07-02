@@ -2,10 +2,11 @@ services:
 
   # ────────────────────────────────────────────────────────
   # 1. Users DB  (PostgreSQL 15)
-  # Credentials injected from .env via Compose interpolation.
   # ────────────────────────────────────────────────────────
   users-db:
     image: postgres:15-alpine
+    ports:
+      - "5433:5432"
     container_name: gisviz-users-db
     restart: always
     environment:
@@ -23,10 +24,12 @@ services:
       - gisviz-network
 
   # ────────────────────────────────────────────────────────
-  # 2. Posts DB  (PostGIS 15-3.3)
+  # 2. Posts DB   (PostgreSQL 15)
   # ────────────────────────────────────────────────────────
   posts-db:
     image: postgres:15-alpine
+    ports:
+      - "5434:5432"
     container_name: gisviz-posts-db
     restart: always
     environment:
@@ -48,6 +51,8 @@ services:
   # ────────────────────────────────────────────────────────
   cache:
     image: redis:7-alpine
+    ports:
+      - "6379:6379"
     container_name: gisviz-cache
     restart: always
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
@@ -62,9 +67,25 @@ services:
       - gisviz-network
 
   # ────────────────────────────────────────────────────────
-  # 4. pgAdmin 4  — DB management GUI
+  # 4. Redis Insight (Cache GUI)
+  # Access at http://localhost:8002
+  # ────────────────────────────────────────────────────────
+  redis-insight:
+    image: redis/redisinsight:latest
+    container_name: gisviz-redis-insight
+    restart: always
+    ports:
+      - "8002:5540"
+    volumes:
+      - redis-insight-data:/data
+    networks:
+      - gisviz-network
+    depends_on:
+      - cache
+
+  # ────────────────────────────────────────────────────────
+  # 5. pgAdmin 4  — DB management GUI
   # Access at http://localhost:5050
-  # Login with PGADMIN_DEFAULT_EMAIL / PGADMIN_DEFAULT_PASSWORD from .env
   # ────────────────────────────────────────────────────────
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -87,14 +108,12 @@ services:
       - gisviz-network
 
   # ────────────────────────────────────────────────────────
-  # 5. FastAPI backend
-  # All app config read from .env.backend at runtime.
+  # 6. FastAPI backend
   # ────────────────────────────────────────────────────────
   api:
     build:
       context: .
       dockerfile: Dockerfile
-      # CHANGE THIS TO 'dev' FOR LOCAL TESTING, OR 'prod' FOR IONOS DEPLOYMENT
       target: dev
     container_name: gisviz-api
     restart: always
@@ -103,9 +122,7 @@ services:
     ports:
       - "8001:8001"
     volumes:
-      # If using 'target: dev', uncomment the next line to mount your live code:
       - ./app:/app/app
-      # This performs the actual mount of the uploads folder to persist images:
       - uploads-data:/app/uploads
     depends_on:
       users-db:
@@ -116,7 +133,43 @@ services:
         condition: service_healthy
     networks:
       - gisviz-network
+    logging:
+      driver: loki
+      options:
+        # Securely interpolated from the root .env file
+        loki-url: "${LOKI_URL}"
+        mode: "non-blocking"
+        loki-retries: "2"
   
+  # ────────────────────────────────────────────────────────
+  # 7. Loki - Log Aggregation System
+  # ────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:latest
+    container_name: gisviz-loki
+    restart: always
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - gisviz-network
+
+  # ────────────────────────────────────────────────────────
+  # 8. Promtail - Log Shipper
+  # Scrapes Docker stdout logs and sends them to Loki
+  # ────────────────────────────────────────────────────────
+  promtail:
+    image: grafana/promtail:latest
+    container_name: gisviz-promtail
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./promtail-config.yaml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    networks:
+      - gisviz-network
 
 # ──────────────────────────────────────────────────────────
 networks:
@@ -131,6 +184,8 @@ volumes:
     name: gisviz-posts-db-data
   cache-data:
     name: gisviz-cache-data
+  redis-insight-data:
+    name: gisviz-redis-insight-data
   pgadmin-data:
     name: gisviz-pgadmin-data
   uploads-data:

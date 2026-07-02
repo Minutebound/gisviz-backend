@@ -9,13 +9,13 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.database import (
     users_engine, posts_engine, UsersSessionLocal, PostsSessionLocal,
-    UsersBase, PostsBase, get_users_db, get_posts_db
+    UsersBase, PostsBase
 )
 from app.db.models import (
     RoleRecord, PlatformUserRecord, UserLocationRecord, 
-    PostRecord, CategoryRecord, KeywordRecord
+    PostRecord, CategoryRecord, KeywordRecord, PostCategoryLink, PostKeywordLink
 )
-from app.api.v1.endpoints import auth, posts, categories, follows, users, uploads
+from app.api.v1.endpoints import auth, posts, categories, follows, users, uploads, search
 from app.services.auth_service import auth_service
 
 # 1. Database Initialization
@@ -44,12 +44,11 @@ app.include_router(uploads.router, prefix=f"{settings.API_V1_STR}/uploads", tags
 app.include_router(posts.router, prefix=f"{settings.API_V1_STR}/posts", tags=["Posts"])
 app.include_router(categories.router, prefix=f"{settings.API_V1_STR}/categories", tags=["Categories"])
 app.include_router(follows.router, prefix=f"{settings.API_V1_STR}/network", tags=["Social Graph"])
-
+app.include_router(search.router, prefix=f"{settings.API_V1_STR}/search", tags=["Search"])
 
 @app.get("/")
 def root_health_check():
     return {"status": "operational", "engine": "gisviz-api", "version": settings.VERSION}
-
 
 @app.get("/seed")
 def seed_database():
