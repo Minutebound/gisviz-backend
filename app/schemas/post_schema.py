@@ -2,7 +2,6 @@ from pydantic import BaseModel, UUID4
 from typing import List, Optional
 from datetime import datetime
 
-# ----- Categories & Keywords -----
 class CategoryData(BaseModel):
     category_id: int
     slug: str
@@ -27,12 +26,10 @@ class PendingCategoryData(BaseModel):
     created_timestamp: datetime
     class Config: from_attributes = True
 
-# ----- Posts -----
-
 class PostPayload(BaseModel):
     title: str
     description: Optional[str] = None
-    visual_image_path: str 
+    visual_image_path: str
     note: Optional[str] = None
     source_name: Optional[str] = None
     source_url: Optional[str] = None
@@ -47,12 +44,9 @@ class PostResponse(BaseModel):
     title: str
     description: Optional[str] = None
     visual_image_path: Optional[str] = None
-    
-    # NEW FIELDS
     note: Optional[str] = None
     source_name: Optional[str] = None
     source_url: Optional[str] = None
-
     categories: List[CategoryData] = []
     keywords: List[KeywordData] = []
     share_slug: str
@@ -61,11 +55,8 @@ class PostResponse(BaseModel):
     total_comments_count: int
     created_timestamp: datetime
     updated_timestamp: Optional[datetime] = None
+    class Config: from_attributes = True
 
-    class Config:
-        from_attributes = True
-
-# ----- Reports -----
 class PostReportPayload(BaseModel):
     reason: str
 
@@ -76,18 +67,19 @@ class PostReportResponse(BaseModel):
     reason: str
     status: str
     created_timestamp: datetime
+    class Config: from_attributes = True
 
-    class Config:
-        from_attributes = True
-
-# ----- Likes -----
 class LikeResponse(BaseModel):
     post_id: UUID4
     user_id: UUID4
     liked: bool
     total_likes_count: int
 
-# ----- Comments -----
+class BookmarkResponse(BaseModel):
+    post_id: UUID4
+    user_id: UUID4
+    bookmarked: bool
+
 class CommentPayload(BaseModel):
     content: str
     parent_comment_id: Optional[UUID4] = None
@@ -104,8 +96,6 @@ class CommentData(BaseModel):
     created_timestamp: datetime
     updated_timestamp: Optional[datetime] = None
     replies: List["CommentData"] = []
-
-    class Config:
-        from_attributes = True
+    class Config: from_attributes = True
 
 CommentData.model_rebuild()

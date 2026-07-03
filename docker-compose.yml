@@ -114,7 +114,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: dev
+      target: prod
     container_name: gisviz-api
     restart: always
     env_file:

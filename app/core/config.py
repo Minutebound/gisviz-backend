@@ -11,10 +11,10 @@ class PlatformConfigurationSettings(BaseSettings):
     # ----- Auth / JWT -----
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
-    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 43800
 
     # ----- CORS -----
-    BACKEND_CORS_ORIGINS: List[str] = ["http://localhost:3000"]
+    BACKEND_CORS_ORIGINS: List[str] = []
 
     # ----- Databases -----
     # Renamed from AUTH_DATABASE_URL  -> USERS_DATABASE_URL
@@ -24,11 +24,6 @@ class PlatformConfigurationSettings(BaseSettings):
 
     # ----- Cache -----
     REDIS_URL: str
-
-    # ----- Cache tuning -----
-    SEARCH_CACHE_TTL_SECONDS: int = 600          # 10 min freshness window for search
-    TRENDING_REFRESH_SECONDS: int = 300          # how often trending is recomputed
-    COUNTER_FLUSH_SECONDS: int = 30              # how often Redis counters flush to PG
 
     model_config = SettingsConfigDict(
         env_file=".env.backend", case_sensitive=True, extra="ignore"
