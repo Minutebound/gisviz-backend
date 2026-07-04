@@ -1,11 +1,10 @@
 import uuid
+from typing import List, Optional
+
 from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi_cache.decorator import cache
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
-from typing import List
-
-# fastapi-cache2 decorator
-from fastapi_cache.decorator import cache
 
 from app.db.database import get_posts_db, get_users_db
 from app.db.models import (
@@ -17,50 +16,46 @@ from app.schemas.post_schema import (
     CommentPayload, CommentData, PostReportPayload, PostReportResponse,
 )
 from app.services.post_service import post_service
-from app.services.cache_service import cache_service   # kept for trending (sync)
-from app.services.auth_service import get_current_authenticated_user, RoleChecker
+from app.services.cache_service import cache_service
+from app.services.auth_service import (
+    get_current_authenticated_user,
+    get_optional_current_user,
+    RoleChecker,
+)
 
 router = APIRouter()
 
-
-# ── TTL constants (seconds) ────────────────────────────────────────
-STREAM_TTL   = None     # first page of the feed
-STREAM_PAGE_TTL = None  # subsequent pages
-POST_TTL     = None    # single post detail
-SEARCH_TTL   = None     # search results
+# TTL constants in seconds
+STREAM_TTL = 30
+POST_TTL   = 60
+SEARCH_TTL = 60
 
 
 # -------------------------------------------------------------------
-#  STREAM  ← cached with @cache
-#  fastapi-cache2 auto-keys on the full URL including ?skip=&limit=
-#  so every unique (skip, limit) pair gets its own cache entry.
+#  STREAM
+#  Per-user (is_liked / is_bookmarked) so we cannot use @cache here.
+#  Client-side 30-second TTL in api.ts prevents hammering.
 # -------------------------------------------------------------------
 @router.get("/stream", response_model=List[PostResponse])
-@cache(expire=STREAM_TTL)
 async def fetch_post_stream(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
-    """
-    Global feed. Cached per (skip, limit) pair.
-    skip=0 → 30s TTL (most volatile — new posts appear here first)
-    skip>0 → 60s TTL (older pages change less often)
-    """
-    # Vary TTL by page
-    # Note: @cache uses the expire= value set at decoration time.
-    # For a variable TTL we call the service directly and let the
-    # decorator handle the default; the second page naturally stays
-    # in the same 30s window. If you need strict 60s for skip>0,
-    # split into two routes or manage it via the service's manual Redis call.
+    current_user_id = current_user.user_id if current_user else None
     return post_service.retrieve_global_stream(
-        posts_db=posts_db, users_db=users_db, skip=skip, limit=limit
+        posts_db=posts_db,
+        users_db=users_db,
+        skip=skip,
+        limit=limit,
+        current_user_id=current_user_id,
     )
 
 
 # -------------------------------------------------------------------
-#  SEARCH  ← cached
+#  SEARCH
 # -------------------------------------------------------------------
 @router.get("/search", response_model=List[PostResponse])
 @cache(expire=SEARCH_TTL)
@@ -70,7 +65,9 @@ async def search_post_stream(
     limit: int = Query(50, ge=1, le=100),
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
+    current_user_id = current_user.user_id if current_user else None
     posts = (
         posts_db.query(PostRecord)
         .filter(
@@ -79,33 +76,14 @@ async def search_post_stream(
         .order_by(desc(PostRecord.created_timestamp))
         .offset(skip).limit(limit).all()
     )
-    user_ids = list(set(p.publisher_user_id for p in posts))
-    user_map = {
-        u.user_id: u for u in
-        users_db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id.in_(user_ids)).all()
-    }
     return [
-        {
-            "post_id": p.post_id,
-            "publisher_user_id": p.publisher_user_id,
-            "publisher_handle": user_map[p.publisher_user_id].user_handle if p.publisher_user_id in user_map else "Unknown",
-            "publisher_avatar_path": user_map[p.publisher_user_id].avatar_path if p.publisher_user_id in user_map else None,
-            "title": p.title, "description": p.description,
-            "visual_image_path": p.visual_image_path,
-            "categories": [link.category for link in p.category_links],
-            "keywords": [link.keyword for link in p.keyword_links],
-            "share_slug": p.share_slug, "share_url": f"/p/{p.share_slug}",
-            "total_likes_count": p.total_likes_count,
-            "total_comments_count": p.total_comments_count,
-            "note": p.note, "source_name": p.source_name, "source_url": p.source_url,
-            "created_timestamp": p.created_timestamp,
-        }
+        post_service._format_post_response(posts_db, users_db, p, current_user_id)
         for p in posts
     ]
 
 
 # -------------------------------------------------------------------
-#  TRENDING  ← uses legacy sync cache_service (populated by a scheduler)
+#  TRENDING
 # -------------------------------------------------------------------
 @router.get("/trending", response_model=List[str])
 async def trending_posts(n: int = Query(10, ge=1, le=50)):
@@ -114,49 +92,35 @@ async def trending_posts(n: int = Query(10, ge=1, le=50)):
 
 
 # -------------------------------------------------------------------
-#  SINGLE POST  ← cached
+#  SINGLE POST
+#  Per-user flags mean we cannot share a single cache entry across
+#  all users — @cache omitted. Client TTL handles deduplication.
 # -------------------------------------------------------------------
-@router.get("/{post_id}")
-@cache(expire=POST_TTL)
+@router.get("/{post_id}", response_model=PostResponse)
 async def get_single_post(
     post_id: uuid.UUID,
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
     post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    publisher = users_db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_id == post.publisher_user_id
-    ).first()
-    return {
-        "post_id": str(post.post_id),
-        "publisher_user_id": str(post.publisher_user_id),
-        "publisher_handle": publisher.user_handle if publisher else "Unknown",
-        "publisher_avatar_path": publisher.avatar_path if publisher else None,
-        "title": post.title, "description": post.description,
-        "visual_image_path": post.visual_image_path,
-        "categories": [{"category_id": l.category.category_id, "label": l.category.label} for l in post.category_links],
-        "keywords": [{"keyword_id": l.keyword.keyword_id, "word": l.keyword.word} for l in post.keyword_links],
-        "share_slug": post.share_slug, "share_url": f"/p/{post.share_slug}",
-        "total_likes_count": post.total_likes_count,
-        "total_comments_count": post.total_comments_count,
-        "note": getattr(post, "note", None),
-        "source_name": getattr(post, "source_name", None),
-        "source_url": getattr(post, "source_url", None),
-        "created_timestamp": post.created_timestamp,
-    }
+    current_user_id = current_user.user_id if current_user else None
+    return post_service._format_post_response(posts_db, users_db, post, current_user_id)
 
 
 # -------------------------------------------------------------------
 #  USER POSTS
 # -------------------------------------------------------------------
-@router.get("/user/{handle}")
+@router.get("/user/{handle}", response_model=List[PostResponse])
 async def get_user_posts(
     handle: str,
-    skip: int = 0, limit: int = 50,
+    skip: int = 0,
+    limit: int = 50,
     users_db: Session = Depends(get_users_db),
     posts_db: Session = Depends(get_posts_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
     user = users_db.query(PlatformUserRecord).filter(
         PlatformUserRecord.user_handle == handle
@@ -169,26 +133,17 @@ async def get_user_posts(
         .order_by(PostRecord.created_timestamp.desc())
         .offset(skip).limit(limit).all()
     )
+    current_user_id = current_user.user_id if current_user else None
     return [
-        {
-            "post_id": str(p.post_id), "publisher_user_id": str(p.publisher_user_id),
-            "publisher_handle": user.user_handle, "publisher_avatar_path": user.avatar_path,
-            "title": p.title, "description": p.description,
-            "visual_image_path": p.visual_image_path,
-            "categories": [{"category_id": l.category.category_id, "label": l.category.label} for l in p.category_links],
-            "keywords": [{"keyword_id": l.keyword.keyword_id, "word": l.keyword.word} for l in p.keyword_links],
-            "total_likes_count": p.total_likes_count,
-            "total_comments_count": p.total_comments_count,
-            "created_timestamp": p.created_timestamp,
-        }
+        post_service._format_post_response(posts_db, users_db, p, current_user_id)
         for p in posts
     ]
 
 
 # -------------------------------------------------------------------
-#  USER BOOKMARKS
+#  USER BOOKMARKS  (authenticated, own profile only)
 # -------------------------------------------------------------------
-@router.get("/user/{handle}/bookmarks")
+@router.get("/user/{handle}/bookmarks", response_model=List[PostResponse])
 async def get_user_bookmarks(
     handle: str,
     skip: int = Query(0, ge=0),
@@ -220,39 +175,13 @@ async def get_user_bookmarks(
             PostRecord.post_id.in_([b.post_id for b in bookmarks])
         ).all()
     }
-    publisher_map = {
-        u.user_id: u for u in
-        users_db.query(PlatformUserRecord).filter(
-            PlatformUserRecord.user_id.in_(
-                list(set(p.publisher_user_id for p in post_map.values()))
-            )
-        ).all()
-    }
-
     results = []
     for bm in bookmarks:
         post = post_map.get(bm.post_id)
-        if not post:
-            continue
-        pub = publisher_map.get(post.publisher_user_id)
-        results.append({
-            "post_id": str(post.post_id),
-            "publisher_user_id": str(post.publisher_user_id),
-            "publisher_handle": pub.user_handle if pub else "Unknown",
-            "publisher_avatar_path": pub.avatar_path if pub else None,
-            "title": post.title, "description": post.description,
-            "visual_image_path": post.visual_image_path,
-            "categories": [{"category_id": l.category.category_id, "label": l.category.label} for l in post.category_links],
-            "keywords": [{"keyword_id": l.keyword.keyword_id, "word": l.keyword.word} for l in post.keyword_links],
-            "share_slug": post.share_slug, "share_url": f"/p/{post.share_slug}",
-            "total_likes_count": post.total_likes_count,
-            "total_comments_count": post.total_comments_count,
-            "note": getattr(post, "note", None),
-            "source_name": getattr(post, "source_name", None),
-            "source_url": getattr(post, "source_url", None),
-            "created_timestamp": post.created_timestamp,
-            "bookmarked_at": bm.created_timestamp,
-        })
+        if post:
+            results.append(
+                post_service._format_post_response(posts_db, users_db, post, current_user.user_id)
+            )
     return results
 
 
@@ -330,6 +259,78 @@ async def get_reports(
 ):
     return posts_db.query(PostReportRecord).all()
 
+# ─── PASTE THESE THREE ROUTE BLOCKS INTO posts.py ───────────────────────────
+# Place them after the existing GET /reports/all block and before the COMMENTS section.
+
+# -------------------------------------------------------------------
+#  KEYWORDS  (admin management)
+# -------------------------------------------------------------------
+@router.get("/keywords", response_model=List[dict])
+async def list_keywords(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    posts_db: Session = Depends(get_posts_db),
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor"])),
+):
+    """Admin/editor: paginated keyword list ordered by usage."""
+    from app.db.models import KeywordRecord
+    keywords = (
+        posts_db.query(KeywordRecord)
+        .order_by(KeywordRecord.usage_count.desc())
+        .offset(skip).limit(limit).all()
+    )
+    total = posts_db.query(KeywordRecord).count()
+    return {
+        "total": total,
+        "keywords": [
+            {"keyword_id": k.keyword_id, "word": k.word, "usage_count": k.usage_count}
+            for k in keywords
+        ],
+    }
+
+
+@router.delete("/keywords/{keyword_id}")
+async def delete_keyword(
+    keyword_id: int,
+    posts_db: Session = Depends(get_posts_db),
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
+):
+    from app.db.models import KeywordRecord, PostKeywordLink
+    kw = posts_db.query(KeywordRecord).filter(KeywordRecord.keyword_id == keyword_id).first()
+    if not kw:
+        raise HTTPException(status_code=404, detail="Keyword not found")
+    posts_db.query(PostKeywordLink).filter(PostKeywordLink.keyword_id == keyword_id).delete()
+    posts_db.delete(kw)
+    posts_db.commit()
+    return {"status": "deleted", "word": kw.word}
+
+
+# -------------------------------------------------------------------
+#  REPORT STATUS UPDATE  (admin)
+# -------------------------------------------------------------------
+from pydantic import BaseModel as _BaseModel
+
+class ReportStatusPayload(_BaseModel):
+    status: str  # "resolved" | "dismissed"
+
+
+@router.put("/reports/{report_id}/status")
+async def update_report_status(
+    report_id: uuid.UUID,
+    payload: ReportStatusPayload,
+    posts_db: Session = Depends(get_posts_db),
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor", "support"])),
+):
+    report = posts_db.query(PostReportRecord).filter(
+        PostReportRecord.report_id == report_id
+    ).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if payload.status not in ("resolved", "dismissed", "pending"):
+        raise HTTPException(status_code=400, detail="Invalid status. Use: resolved, dismissed, pending")
+    report.status = payload.status
+    posts_db.commit()
+    return {"status": payload.status, "report_id": str(report_id)}
 
 # -------------------------------------------------------------------
 #  LIKES
@@ -359,7 +360,12 @@ async def toggle_like(
         liked = True
 
     posts_db.commit()
-    return {"post_id": post_id, "user_id": current_user.user_id, "liked": liked, "total_likes_count": post.total_likes_count}
+    return {
+        "post_id": post_id,
+        "user_id": current_user.user_id,
+        "liked": liked,
+        "total_likes_count": post.total_likes_count,
+    }
 
 
 # -------------------------------------------------------------------
@@ -374,6 +380,10 @@ async def toggle_bookmark(
     post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
+
+    # Users cannot bookmark their own posts
+    if post.publisher_user_id == current_user.user_id:
+        raise HTTPException(status_code=400, detail="You cannot bookmark your own post.")
 
     existing = posts_db.query(PostBookmarkRecord).filter(
         PostBookmarkRecord.post_id == post_id,

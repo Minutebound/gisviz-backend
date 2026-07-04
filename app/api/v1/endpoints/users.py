@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, validator
-from typing import Optional
+from typing import Optional, List
 
 from app.db.database import get_users_db
 from app.db.models import PlatformUserRecord, RoleRecord, UserLocationRecord, FollowCurrentRecord
@@ -58,6 +58,7 @@ def _full_user_dict(user: PlatformUserRecord) -> dict:
         "user_handle": user.user_handle,
         "email_address": user.email_address,
         "is_verified": bool(user.is_verified),
+        "is_active": bool(user.is_active),
         "avatar_path": user.avatar_path,
         "banner_path": getattr(user, "banner_path", None),
         "title": user.title,
@@ -85,6 +86,31 @@ def get_my_profile(
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
     return _full_user_dict(current_user)
+
+
+# ── GET /all — ADMIN ONLY ────────────────────────────────────────────
+
+@router.get("/all")
+def list_all_users(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    q: Optional[str] = Query(None),
+    db: Session = Depends(get_users_db),
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
+):
+    """Admin-only: paginated list of every user, optionally filtered by handle/email."""
+    query = db.query(PlatformUserRecord)
+    if q:
+        query = query.filter(
+            (PlatformUserRecord.user_handle.ilike(f"%{q}%")) |
+            (PlatformUserRecord.email_address.ilike(f"%{q}%"))
+        )
+    users = query.order_by(PlatformUserRecord.created_timestamp.desc()).offset(skip).limit(limit).all()
+    total = db.query(PlatformUserRecord).count()
+    return {
+        "total": total,
+        "users": [_full_user_dict(u) for u in users],
+    }
 
 
 # ── GET /profile/{handle} ────────────────────────────────────────────
@@ -143,15 +169,16 @@ def get_popular_publishers(
                     FollowCurrentRecord.actor_user_id == uuid_obj,
                     FollowCurrentRecord.target_user_id == u.user_id,
                 ).first()
-                if fr:
-                    is_followed = True
+                is_followed = fr is not None
             except ValueError:
                 pass
         results.append({
             "user_id": str(u.user_id),
             "user_handle": u.user_handle,
             "avatar_path": u.avatar_path,
+            "title": u.title,
             "follower_count": u.follower_count,
+            "post_count": u.post_count,
             "is_followed": is_followed,
         })
     return results
@@ -159,31 +186,35 @@ def get_popular_publishers(
 
 # ── PUT /settings ────────────────────────────────────────────────────
 
-@router.put("/settings", response_model=UserProfileData)
-def update_user_settings(
+@router.put("/settings")
+def update_settings(
     payload: UserSettingsUpdatePayload,
     db: Session = Depends(get_users_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    if payload.title is not None: current_user.title = payload.title
-    if payload.linkedin_url is not None: current_user.linkedin_url = payload.linkedin_url
-    if payload.medium_url is not None: current_user.medium_url = payload.medium_url
-    if payload.website_url is not None: current_user.website_url = payload.website_url
+    current_user.title        = payload.title
+    current_user.linkedin_url = payload.linkedin_url
+    current_user.medium_url   = payload.medium_url
+    current_user.website_url  = payload.website_url
 
-    if any([payload.place, payload.state, payload.country]):
-        if not current_user.location:
-            current_user.location = UserLocationRecord(user_id=current_user.user_id)
-            db.add(current_user.location)
-            db.flush()
-        if payload.place is not None: current_user.location.place = payload.place
-        if payload.state is not None: current_user.location.state = payload.state
-        if payload.country is not None: current_user.location.country = payload.country
-        parts = [p for p in [current_user.location.place, current_user.location.state, current_user.location.country] if p]
-        current_user.location.formatted_string = ", ".join(parts)
-
+    loc = db.query(UserLocationRecord).filter(
+        UserLocationRecord.user_id == current_user.user_id
+    ).first()
+    if loc:
+        loc.place   = payload.place
+        loc.state   = payload.state
+        loc.country = payload.country
+        loc.formatted_string = f"{payload.place}, {payload.state}, {payload.country}".strip(", ")
+    else:
+        db.add(UserLocationRecord(
+            user_id=current_user.user_id,
+            place=payload.place,
+            state=payload.state,
+            country=payload.country,
+            formatted_string=f"{payload.place}, {payload.state}, {payload.country}".strip(", "),
+        ))
     db.commit()
-    db.refresh(current_user)
-    return current_user
+    return _full_user_dict(current_user)
 
 
 # ── PUT /handle ──────────────────────────────────────────────────────
@@ -194,19 +225,14 @@ def update_handle(
     db: Session = Depends(get_users_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    if payload.new_handle == current_user.user_handle:
-        raise HTTPException(status_code=400, detail="That is already your current handle")
-
-    taken = db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_handle == payload.new_handle
-    ).first()
-    if taken:
-        raise HTTPException(status_code=409, detail="Handle already taken by another account")
-
-    old_handle = current_user.user_handle
+    if db.query(PlatformUserRecord).filter(
+        PlatformUserRecord.user_handle == payload.new_handle,
+        PlatformUserRecord.user_id != current_user.user_id,
+    ).first():
+        raise HTTPException(status_code=409, detail="Handle already taken")
     current_user.user_handle = payload.new_handle
     db.commit()
-    return {"message": "Handle updated successfully", "old_handle": old_handle, "new_handle": payload.new_handle}
+    return {"message": "Handle updated", "user_handle": payload.new_handle}
 
 
 # ── POST /email/request ──────────────────────────────────────────────
@@ -219,27 +245,20 @@ def request_email_change(
 ):
     if not auth_service.verify_password(payload.current_password, current_user.hashed_security_password):
         raise HTTPException(status_code=400, detail="Incorrect password")
-    if payload.new_email == current_user.email_address:
-        raise HTTPException(status_code=400, detail="New email is the same as your current email")
 
-    existing = db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.email_address == payload.new_email
-    ).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="That email is already registered to another account")
-
-    otp = auth_service._generate_otp()
-    current_user.verification_otp = otp
-    current_user.otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+    import random, string
+    otp = "".join(random.choices(string.digits, k=6))
+    current_user.verification_otp  = otp
+    current_user.otp_expires_at    = datetime.now(timezone.utc) + timedelta(minutes=15)
     current_user.password_reset_token = f"email_change::{payload.new_email}"
     db.commit()
 
     auth_service.simulate_send_email(
         email=payload.new_email,
-        subject="Verify your new email address",
-        content=f"Your verification code is: {otp}\nIt expires in 15 minutes.",
+        subject="Confirm your new email address",
+        content=f"Your verification code is: {otp}. It expires in 15 minutes.",
     )
-    return {"message": f"Verification code sent to {payload.new_email}", "dev_otp": otp}
+    return {"message": "Verification code sent", "dev_otp": otp}
 
 
 # ── POST /email/verify ───────────────────────────────────────────────
@@ -252,9 +271,9 @@ def verify_email_change(
 ):
     pending_token = current_user.password_reset_token or ""
     if not pending_token.startswith("email_change::"):
-        raise HTTPException(status_code=400, detail="No pending email change found.")
-    pending_email = pending_token.removeprefix("email_change::")
+        raise HTTPException(status_code=400, detail="No email change in progress")
 
+    pending_email = pending_token.removeprefix("email_change::")
     if pending_email != payload.new_email:
         raise HTTPException(status_code=400, detail="Email mismatch. Please start the process again.")
     if current_user.verification_otp != payload.otp:
@@ -262,9 +281,9 @@ def verify_email_change(
     if current_user.otp_expires_at and datetime.now(timezone.utc) > current_user.otp_expires_at:
         raise HTTPException(status_code=400, detail="Code has expired. Please request a new one.")
 
-    current_user.email_address = pending_email
-    current_user.verification_otp = None
-    current_user.otp_expires_at = None
+    current_user.email_address        = pending_email
+    current_user.verification_otp     = None
+    current_user.otp_expires_at       = None
     current_user.password_reset_token = None
     db.commit()
     return {"message": "Email updated successfully", "new_email": pending_email}
@@ -286,8 +305,6 @@ def delete_own_account(
 
 
 # ── PUT /{user_id}/role  — ADMIN ONLY ───────────────────────────────
-# Allows an admin to promote or demote any user's role.
-# This is how you make yourself (or others) an admin/editor.
 
 @router.put("/{user_id}/role")
 def update_user_role(
@@ -296,27 +313,15 @@ def update_user_role(
     db: Session = Depends(get_users_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
 ):
-    """Admin-only: change the role of any user."""
-    user = db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_id == user_id
-    ).first()
+    user = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
     role = db.query(RoleRecord).filter(RoleRecord.name == payload.role_name).first()
     if not role:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown role '{payload.role_name}'. Valid roles: admin, editor, publisher, viewer, support"
-        )
-
+        raise HTTPException(status_code=400, detail=f"Unknown role '{payload.role_name}'.")
     user.role_id = role.role_id
     db.commit()
-    return {
-        "message": f"Role updated successfully",
-        "user_handle": user.user_handle,
-        "new_role": payload.role_name,
-    }
+    return {"message": "Role updated successfully", "user_handle": user.user_handle, "new_role": payload.role_name}
 
 
 # ── PUT /{user_id}/status  — ADMIN/SUPPORT ──────────────────────────
@@ -328,11 +333,27 @@ def set_user_status(
     db: Session = Depends(get_users_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "support"])),
 ):
-    user = db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_id == user_id
-    ).first()
+    user = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     user.is_active = is_active
     db.commit()
     return {"message": f"User status set to {'active' if is_active else 'deactivated'}"}
+
+
+# ── DELETE /{user_id}  — ADMIN ONLY ─────────────────────────────────
+
+@router.delete("/{user_id}")
+def hard_delete_user(
+    user_id: uuid.UUID,
+    db: Session = Depends(get_users_db),
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
+):
+    user = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.user_id == current_user.user_id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account here.")
+    db.delete(user)
+    db.commit()
+    return {"message": f"User {user.user_handle} permanently deleted"}

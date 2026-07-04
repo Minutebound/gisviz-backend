@@ -2,20 +2,28 @@ from pydantic import BaseModel, UUID4
 from typing import List, Optional
 from datetime import datetime
 
+
 class CategoryData(BaseModel):
     category_id: int
-    slug: str
+    slug: str = ""
     label: str
     usage_count: int = 0
-    class Config: from_attributes = True
+
+    class Config:
+        from_attributes = True
+
 
 class KeywordData(BaseModel):
     keyword_id: int
     word: str
-    class Config: from_attributes = True
+
+    class Config:
+        from_attributes = True
+
 
 class PendingCategorySuggestion(BaseModel):
     label: str
+
 
 class PendingCategoryData(BaseModel):
     pending_id: UUID4
@@ -24,7 +32,10 @@ class PendingCategoryData(BaseModel):
     suggested_by_user_id: UUID4
     status: str
     created_timestamp: datetime
-    class Config: from_attributes = True
+
+    class Config:
+        from_attributes = True
+
 
 class PostPayload(BaseModel):
     title: str
@@ -35,6 +46,7 @@ class PostPayload(BaseModel):
     source_url: Optional[str] = None
     category_ids: List[int] = []
     keywords: List[str] = []
+
 
 class PostResponse(BaseModel):
     post_id: UUID4
@@ -55,10 +67,17 @@ class PostResponse(BaseModel):
     total_comments_count: int
     created_timestamp: datetime
     updated_timestamp: Optional[datetime] = None
-    class Config: from_attributes = True
+    # Per-user flags — None when the request is unauthenticated
+    is_liked: Optional[bool] = None
+    is_bookmarked: Optional[bool] = None
+
+    class Config:
+        from_attributes = True
+
 
 class PostReportPayload(BaseModel):
     reason: str
+
 
 class PostReportResponse(BaseModel):
     report_id: UUID4
@@ -67,7 +86,10 @@ class PostReportResponse(BaseModel):
     reason: str
     status: str
     created_timestamp: datetime
-    class Config: from_attributes = True
+
+    class Config:
+        from_attributes = True
+
 
 class LikeResponse(BaseModel):
     post_id: UUID4
@@ -75,14 +97,17 @@ class LikeResponse(BaseModel):
     liked: bool
     total_likes_count: int
 
+
 class BookmarkResponse(BaseModel):
     post_id: UUID4
     user_id: UUID4
     bookmarked: bool
 
+
 class CommentPayload(BaseModel):
     content: str
     parent_comment_id: Optional[UUID4] = None
+
 
 class CommentData(BaseModel):
     comment_id: UUID4
@@ -96,6 +121,9 @@ class CommentData(BaseModel):
     created_timestamp: datetime
     updated_timestamp: Optional[datetime] = None
     replies: List["CommentData"] = []
-    class Config: from_attributes = True
+
+    class Config:
+        from_attributes = True
+
 
 CommentData.model_rebuild()

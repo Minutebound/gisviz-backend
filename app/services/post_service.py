@@ -1,12 +1,13 @@
 import uuid
-from typing import List
+from typing import List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 from fastapi import HTTPException
 
 from app.db.models import (
     PostRecord, PostCategoryLink, PostKeywordLink,
-    CategoryRecord, KeywordRecord, PlatformUserRecord
+    CategoryRecord, KeywordRecord, PlatformUserRecord,
+    PostLikeRecord, PostBookmarkRecord,
 )
 from app.schemas.post_schema import PostPayload
 from app.services.helpers import generate_unique_slug
@@ -21,18 +22,33 @@ class PostService:
     #   posts_db  -> PostsBase session (PostRecord, CategoryRecord, etc.)
     #   users_db  -> UsersBase session (PlatformUserRecord)
     #
-    # platform_users only exists in the users database. Querying it via
-    # a posts_db session causes the 500 "relation does not exist" error.
+    # current_user_id: when provided the dict includes is_liked and
+    # is_bookmarked flags sourced from the DB for that user.
     # ------------------------------------------------------------------
     def _format_post_response(
         self,
         posts_db: Session,
         users_db: Session,
         post: PostRecord,
+        current_user_id: Optional[uuid.UUID] = None,
     ) -> dict:
         publisher = users_db.query(PlatformUserRecord).filter(
             PlatformUserRecord.user_id == post.publisher_user_id
         ).first()
+
+        # Per-user interaction flags — None when not authenticated
+        is_liked: Optional[bool] = None
+        is_bookmarked: Optional[bool] = None
+        if current_user_id is not None:
+            is_liked = posts_db.query(PostLikeRecord).filter(
+                PostLikeRecord.post_id == post.post_id,
+                PostLikeRecord.user_id == current_user_id,
+            ).first() is not None
+
+            is_bookmarked = posts_db.query(PostBookmarkRecord).filter(
+                PostBookmarkRecord.post_id == post.post_id,
+                PostBookmarkRecord.user_id == current_user_id,
+            ).first() is not None
 
         return {
             "post_id": str(post.post_id),
@@ -53,6 +69,8 @@ class PostService:
             "total_comments_count": post.total_comments_count,
             "created_timestamp": post.created_timestamp,
             "updated_timestamp": getattr(post, "updated_timestamp", None),
+            "is_liked": is_liked,
+            "is_bookmarked": is_bookmarked,
         }
 
     # ------------------------------------------------------------------
@@ -64,6 +82,7 @@ class PostService:
         users_db: Session,
         skip: int = 0,
         limit: int = 50,
+        current_user_id: Optional[uuid.UUID] = None,
     ) -> List[dict]:
         posts = (
             posts_db.query(PostRecord)
@@ -72,12 +91,15 @@ class PostService:
             .limit(limit)
             .all()
         )
-        return [self._format_post_response(posts_db, users_db, p) for p in posts]
+        return [
+            self._format_post_response(posts_db, users_db, p, current_user_id)
+            for p in posts
+        ]
 
     # ------------------------------------------------------------------
     # Create
     # ------------------------------------------------------------------
-    def create_post(
+    async def create_post(
         self,
         posts_db: Session,
         users_db: Session,
@@ -120,12 +142,13 @@ class PostService:
 
         posts_db.commit()
         posts_db.refresh(new_post)
-        return self._format_post_response(posts_db, users_db, new_post)
+        # Pass user_id so is_liked/is_bookmarked are correctly false (new post)
+        return self._format_post_response(posts_db, users_db, new_post, user_id)
 
     # ------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------
-    def update_post(
+    async def update_post(
         self,
         posts_db: Session,
         users_db: Session,
@@ -152,7 +175,6 @@ class PostService:
         if payload.visual_image_path:
             post.visual_image_path = payload.visual_image_path
 
-        # Replace category links
         posts_db.query(PostCategoryLink).filter(
             PostCategoryLink.post_id == post.post_id
         ).delete()
@@ -162,7 +184,6 @@ class PostService:
             ).first():
                 posts_db.add(PostCategoryLink(post_id=post.post_id, category_id=cat_id))
 
-        # Replace keyword links
         posts_db.query(PostKeywordLink).filter(
             PostKeywordLink.post_id == post.post_id
         ).delete()
@@ -183,12 +204,12 @@ class PostService:
 
         posts_db.commit()
         posts_db.refresh(post)
-        return self._format_post_response(posts_db, users_db, post)
+        return self._format_post_response(posts_db, users_db, post, current_user.user_id)
 
     # ------------------------------------------------------------------
     # Delete
     # ------------------------------------------------------------------
-    def delete_post(
+    async def delete_post(
         self,
         posts_db: Session,
         post_id: uuid.UUID,

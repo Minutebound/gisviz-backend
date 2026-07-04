@@ -4,6 +4,8 @@ import secrets
 import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
+from typing import Optional
+
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
@@ -16,7 +18,14 @@ from app.schemas.user_schema import UserRegistrationPayload
 from app.db.database import get_users_db
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
+
+# auto_error=False means FastAPI returns None (not 401) when the
+# Authorization header is missing — required for optional auth on
+# public endpoints that annotate per-user state when logged in.
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl=f"{settings.API_V1_STR}/auth/login",
+    auto_error=False,
+)
 
 DEFAULT_ROLE_NAME = "viewer"
 
@@ -106,7 +115,6 @@ class AuthenticationService:
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # If already verified AND active — nothing to do
         if user.is_verified == 1 and user.is_active == 1:
             return {"status": "Already verified"}
 
@@ -117,16 +125,12 @@ class AuthenticationService:
             raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
 
         user.is_verified = 1
-        # Reactivate if this was a deactivated account coming back
         user.is_active = 1
         user.verification_otp = None
         user.otp_expires_at = None
         db.commit()
 
-        return {
-            "status": "Email verified successfully",
-            "reactivated": True,  # frontend can read this to show appropriate message
-        }
+        return {"status": "Email verified successfully", "reactivated": True}
 
     def initiate_password_reset(self, db: Session, email_address: str):
         user = db.query(PlatformUserRecord).filter(
@@ -146,10 +150,7 @@ class AuthenticationService:
             subject="Password Reset Request",
             content=f"Click here to reset your password: {reset_link}\nExpires in 30 minutes.",
         )
-        return {
-            "status": "If the email exists, a reset link has been sent.",
-            "dev_token": token,
-        }
+        return {"status": "If the email exists, a reset link has been sent.", "dev_token": token}
 
     def execute_password_reset(self, db: Session, token: str, new_password: str):
         user = db.query(PlatformUserRecord).filter(
@@ -171,17 +172,18 @@ auth_service = AuthenticationService()
 
 
 def get_current_authenticated_user(
-    token: str = Depends(oauth2_scheme),
+    token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_users_db),
-):
+) -> PlatformUserRecord:
+    """Requires a valid JWT — raises 401 if missing or invalid."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
     )
+    if not token:
+        raise credentials_exception
     try:
-        payload = jwt.decode(
-            token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
-        )
+        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
         user_id: str = payload.get("sub")
         if user_id is None:
             raise credentials_exception
@@ -193,14 +195,38 @@ def get_current_authenticated_user(
     ).first()
     if user is None:
         raise credentials_exception
-
     if user.is_verified == 0:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account email not verified.")
-
-    # Deactivated accounts cannot use existing JWTs
     if user.is_active == 0:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account has been deactivated.")
+    return user
 
+
+def get_optional_current_user(
+    token: Optional[str] = Depends(oauth2_scheme),
+    db: Session = Depends(get_users_db),
+) -> Optional[PlatformUserRecord]:
+    """
+    Same as get_current_authenticated_user but returns None instead of
+    raising 401 when no token is present or the token is invalid.
+    Used by public endpoints (stream, post detail) that annotate
+    is_liked / is_bookmarked only when a user is authenticated.
+    """
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            return None
+    except JWTError:
+        return None
+
+    user = db.query(PlatformUserRecord).filter(
+        PlatformUserRecord.user_id == user_id
+    ).first()
+    if user is None or user.is_verified == 0 or user.is_active == 0:
+        return None
     return user
 
 
