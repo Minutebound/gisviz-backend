@@ -1,51 +1,30 @@
 import uuid
 import os
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI
+from datetime import datetime
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-
-from fastapi_cache import FastAPICache
-from fastapi_cache.backends.redis import RedisBackend
-from redis import asyncio as aioredis
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.database import (
     users_engine, posts_engine, UsersSessionLocal, PostsSessionLocal,
-    UsersBase, PostsBase,
+    UsersBase, PostsBase
 )
 from app.db.models import (
     RoleRecord, PlatformUserRecord, UserLocationRecord,
-    PostRecord, CategoryRecord, KeywordRecord, PostCategoryLink, PostKeywordLink,
+    PostRecord, CategoryRecord, KeywordRecord, PostCategoryLink, PostKeywordLink
 )
 from app.api.v1.endpoints import auth, posts, categories, follows, users, uploads, search
+from app.api.v1.endpoints import admin as admin_endpoints   # ← NEW
 from app.services.auth_service import auth_service
 
-# ── 1. Database initialisation ────────────────────────────────────────────────
+# 1. Database Initialisation
 UsersBase.metadata.create_all(bind=users_engine)
 PostsBase.metadata.create_all(bind=posts_engine)
 
-
-# ── 2. Lifespan — init Redis cache on startup ─────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    redis = aioredis.from_url(
-        settings.REDIS_URL,
-        encoding="utf8",
-        decode_responses=True,
-    )
-    FastAPICache.init(RedisBackend(redis), prefix="gisviz-cache")
-    yield
-    await redis.aclose()
-
-
-# ── 3. Application setup ──────────────────────────────────────────────────────
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    version=settings.VERSION,
-    lifespan=lifespan,
-)
+# 2. Application Setup
+app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,39 +34,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── 4. Static files ───────────────────────────────────────────────────────────
+# 3. Mount Static Uploads Directory
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# ── 5. Routes ─────────────────────────────────────────────────────────────────
-app.include_router(auth.router,       prefix=f"{settings.API_V1_STR}/auth",       tags=["Authentication"])
-app.include_router(users.router,      prefix=f"{settings.API_V1_STR}/users",      tags=["Users"])
-app.include_router(uploads.router,    prefix=f"{settings.API_V1_STR}/uploads",    tags=["Uploads"])
-app.include_router(posts.router,      prefix=f"{settings.API_V1_STR}/posts",      tags=["Posts"])
-app.include_router(categories.router, prefix=f"{settings.API_V1_STR}/categories", tags=["Categories"])
-app.include_router(follows.router,    prefix=f"{settings.API_V1_STR}/network",    tags=["Social Graph"])
-app.include_router(search.router,     prefix=f"{settings.API_V1_STR}/search",     tags=["Search"])
+# 4. Route Registration
+app.include_router(auth.router,             prefix=f"{settings.API_V1_STR}/auth",       tags=["Authentication"])
+app.include_router(users.router,            prefix=f"{settings.API_V1_STR}/users",      tags=["Users"])
+app.include_router(uploads.router,          prefix=f"{settings.API_V1_STR}/uploads",    tags=["Uploads"])
+app.include_router(posts.router,            prefix=f"{settings.API_V1_STR}/posts",      tags=["Posts"])
+app.include_router(categories.router,       prefix=f"{settings.API_V1_STR}/categories", tags=["Categories"])
+app.include_router(follows.router,          prefix=f"{settings.API_V1_STR}/network",    tags=["Social Graph"])
+app.include_router(search.router,           prefix=f"{settings.API_V1_STR}/search",     tags=["Search"])
+app.include_router(admin_endpoints.router,  prefix=f"{settings.API_V1_STR}/admin",      tags=["Admin"])   # ← NEW
 
 
-# ── 6. Health check ───────────────────────────────────────────────────────────
 @app.get("/")
 def root_health_check():
     return {"status": "operational", "engine": "gisviz-api", "version": settings.VERSION}
 
 
-# ── 7. Dev seed ───────────────────────────────────────────────────────────────
 @app.get("/seed")
 def seed_database():
-    """
-    Idempotent development seed.
-    Safe to call multiple times — every insert is guarded by an existence
-    check on ALL unique columns, preventing UniqueViolation errors.
-    """
+    """Development seed — adapted for the new static-image Post schema."""
     users_db = UsersSessionLocal()
     posts_db = PostsSessionLocal()
     try:
-
-        # ── Roles ─────────────────────────────────────────────────────────────
+        # ROLES
         role_defs = [
             {"name": "admin",     "permissions": {"manage_tags": True, "moderate": True, "publish": True, "admin": True}},
             {"name": "editor",    "permissions": {"manage_tags": True, "moderate": True, "publish": True}},
@@ -105,9 +78,7 @@ def seed_database():
                 users_db.refresh(role)
             role_map[rd["name"]] = role
 
-        # ── Admin user ────────────────────────────────────────────────────────
-        # Guard on BOTH unique columns (user_handle and email_address) so a
-        # partial previous seed cannot cause a UniqueViolation on re-run.
+        # ADMIN USER — guard on both unique columns to prevent UniqueViolation on re-run
         ADMIN_HANDLE = "system_admin"
         ADMIN_EMAIL  = "admin@gisviz.com"
 
@@ -135,37 +106,31 @@ def seed_database():
             users_db.commit()
             users_db.refresh(admin_user)
 
-            # Location — only created alongside the user
             loc = UserLocationRecord(
                 user_id=admin_user.user_id,
-                place="Boulder",
-                state="Colorado",
-                country="United States",
+                place="Boulder", state="Colorado", country="United States",
                 formatted_string="Boulder, Colorado, United States",
             )
             users_db.add(loc)
             users_db.commit()
 
-        # ── Seed categories ───────────────────────────────────────────────────
+        # CATEGORIES
         default_categories = [
-            {"slug": "dem",              "label": "DEM"},
-            {"slug": "satellite",        "label": "Satellite"},
-            {"slug": "urban-planning",   "label": "Urban Planning"},
-            {"slug": "climate",          "label": "Climate"},
-            {"slug": "hydrology",        "label": "Hydrology"},
-            {"slug": "land-cover",       "label": "Land Cover"},
-            {"slug": "remote-sensing",   "label": "Remote Sensing"},
-            {"slug": "transportation",   "label": "Transportation"},
+            {"slug": "dem",            "label": "DEM"},
+            {"slug": "satellite",      "label": "Satellite"},
+            {"slug": "urban-planning", "label": "Urban Planning"},
+            {"slug": "climate",        "label": "Climate"},
+            {"slug": "hydrology",      "label": "Hydrology"},
+            {"slug": "land-cover",     "label": "Land Cover"},
+            {"slug": "remote-sensing", "label": "Remote Sensing"},
+            {"slug": "transportation", "label": "Transportation"},
         ]
         for c in default_categories:
             if not posts_db.query(CategoryRecord).filter(CategoryRecord.slug == c["slug"]).first():
                 posts_db.add(CategoryRecord(slug=c["slug"], label=c["label"]))
         posts_db.commit()
 
-        return {
-            "status": "Success",
-            "message": "Database seeded successfully. Safe to call multiple times.",
-        }
+        return {"status": "Success", "message": "Database seeded successfully."}
 
     except Exception as e:
         users_db.rollback()

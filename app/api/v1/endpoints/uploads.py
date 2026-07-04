@@ -28,9 +28,17 @@ async def upload_avatar(
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
     db: Session = Depends(get_users_db),
 ):
-    """Uploads a profile picture and updates the user's database record."""
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
+
+    # ── Delete old avatar ──
+    if current_user.avatar_path:
+        old_relative = current_user.avatar_path.lstrip("/")
+        if os.path.exists(old_relative):
+            try:
+                os.remove(old_relative)
+            except OSError as e:
+                print(f"[uploads] Could not delete old avatar: {e}")
 
     ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
     filename = f"{current_user.user_id}_{uuid.uuid4().hex[:8]}.{ext}"
@@ -44,7 +52,6 @@ async def upload_avatar(
     db.commit()
 
     return {"message": "Avatar uploaded successfully", "avatar_path": db_path}
-
 
 @router.post("/visual")
 async def upload_visual(
@@ -95,9 +102,21 @@ async def upload_banner(
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
     db: Session = Depends(get_users_db),
 ):
-    """Uploads a profile banner image."""
+    """Uploads a profile banner image, deleting the previous one if it exists."""
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
+
+    # ── Delete the old banner file from disk if one exists ──
+    if current_user.banner_path:
+        # banner_path is stored as e.g. /uploads/banners/banner_<uuid>.jpg
+        # Strip the leading slash to get a relative path from the app root
+        old_relative = current_user.banner_path.lstrip("/")
+        old_full_path = os.path.join(old_relative)
+        if os.path.exists(old_full_path):
+            try:
+                os.remove(old_full_path)
+            except OSError as e:
+                print(f"[uploads] Could not delete old banner: {e}")
 
     ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
     filename = f"banner_{current_user.user_id}_{uuid.uuid4().hex[:8]}.{ext}"

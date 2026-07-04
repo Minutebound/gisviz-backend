@@ -42,18 +42,12 @@ def login(
 ):
     # Try handle first, fall back to email
     user = db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_handle == form_data.username
+        PlatformUserRecord.email_address == form_data.username
     ).first()
     if not user or not auth_service.verify_password(
         form_data.password, user.hashed_security_password
     ):
-        user = db.query(PlatformUserRecord).filter(
-            PlatformUserRecord.email_address == form_data.username
-        ).first()
-        if not user or not auth_service.verify_password(
-            form_data.password, user.hashed_security_password
-        ):
-            raise HTTPException(status_code=400, detail="Incorrect username/email or password")
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
 
     # Unverified — redirect to OTP view
     if user.is_verified == 0:

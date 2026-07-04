@@ -90,7 +90,9 @@ class PostReportResponse(BaseModel):
     class Config:
         from_attributes = True
 
-
+class ReportStatusPayload(BaseModel):
+    status: str  # "open" | "resolved" | "dismissed"
+    
 class LikeResponse(BaseModel):
     post_id: UUID4
     user_id: UUID4

@@ -329,17 +329,24 @@ def update_user_role(
 @router.put("/{user_id}/status")
 def set_user_status(
     user_id: uuid.UUID,
-    is_active: bool,
+    is_active: bool,          # FastAPI parses ?is_active=true → Python bool
     db: Session = Depends(get_users_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "support"])),
 ):
-    user = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == user_id).first()
+    user = db.query(PlatformUserRecord).filter(
+        PlatformUserRecord.user_id == user_id
+    ).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    user.is_active = is_active
+ 
+    # ↓ Cast to int so Postgres INTEGER column gets 0 or 1, not True/False
+    user.is_active = int(is_active)
     db.commit()
-    return {"message": f"User status set to {'active' if is_active else 'deactivated'}"}
-
+    return {
+        "message": f"User status set to {'active' if is_active else 'deactivated'}",
+        "is_active": int(is_active),
+    }
+ 
 
 # ── DELETE /{user_id}  — ADMIN ONLY ─────────────────────────────────
 

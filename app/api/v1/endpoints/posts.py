@@ -13,7 +13,7 @@ from app.db.models import (
 )
 from app.schemas.post_schema import (
     PostResponse, PostPayload, LikeResponse, BookmarkResponse,
-    CommentPayload, CommentData, PostReportPayload, PostReportResponse,
+    CommentPayload, CommentData, PostReportPayload, PostReportResponse,ReportStatusPayload
 )
 from app.services.post_service import post_service
 from app.services.cache_service import cache_service
@@ -259,31 +259,34 @@ async def get_reports(
 ):
     return posts_db.query(PostReportRecord).all()
 
-# ─── PASTE THESE THREE ROUTE BLOCKS INTO posts.py ───────────────────────────
-# Place them after the existing GET /reports/all block and before the COMMENTS section.
-
 # -------------------------------------------------------------------
-#  KEYWORDS  (admin management)
+#  KEYWORDS  (admin/editor management)
 # -------------------------------------------------------------------
-@router.get("/keywords", response_model=List[dict])
+@router.get("/keywords")
 async def list_keywords(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
     posts_db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor"])),
 ):
-    """Admin/editor: paginated keyword list ordered by usage."""
+    """Admin/editor: paginated keyword list ordered by usage count."""
     from app.db.models import KeywordRecord
     keywords = (
         posts_db.query(KeywordRecord)
         .order_by(KeywordRecord.usage_count.desc())
-        .offset(skip).limit(limit).all()
+        .offset(skip)
+        .limit(limit)
+        .all()
     )
     total = posts_db.query(KeywordRecord).count()
     return {
         "total": total,
         "keywords": [
-            {"keyword_id": k.keyword_id, "word": k.word, "usage_count": k.usage_count}
+            {
+                "keyword_id":  k.keyword_id,
+                "word":        k.word,
+                "usage_count": k.usage_count,
+            }
             for k in keywords
         ],
     }
@@ -295,39 +298,41 @@ async def delete_keyword(
     posts_db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
 ):
+    """Admin only: delete a keyword and all its post links."""
     from app.db.models import KeywordRecord, PostKeywordLink
     kw = posts_db.query(KeywordRecord).filter(KeywordRecord.keyword_id == keyword_id).first()
     if not kw:
         raise HTTPException(status_code=404, detail="Keyword not found")
-    posts_db.query(PostKeywordLink).filter(PostKeywordLink.keyword_id == keyword_id).delete()
+    posts_db.query(PostKeywordLink).filter(
+        PostKeywordLink.keyword_id == keyword_id
+    ).delete(synchronize_session=False)
     posts_db.delete(kw)
     posts_db.commit()
     return {"status": "deleted", "word": kw.word}
 
 
 # -------------------------------------------------------------------
-#  REPORT STATUS UPDATE  (admin)
+#  REPORT STATUS UPDATE  (admin/editor/support)
 # -------------------------------------------------------------------
-from pydantic import BaseModel as _BaseModel
-
-class ReportStatusPayload(_BaseModel):
-    status: str  # "resolved" | "dismissed"
-
-
 @router.put("/reports/{report_id}/status")
 async def update_report_status(
     report_id: uuid.UUID,
     payload: ReportStatusPayload,
     posts_db: Session = Depends(get_posts_db),
-    current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor", "support"])),
+    current_user: PlatformUserRecord = Depends(
+        RoleChecker(["admin", "editor", "support"])
+    ),
 ):
+    if payload.status not in ("open", "resolved", "dismissed"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid status. Use: open, resolved, dismissed",
+        )
     report = posts_db.query(PostReportRecord).filter(
         PostReportRecord.report_id == report_id
     ).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
-    if payload.status not in ("resolved", "dismissed", "pending"):
-        raise HTTPException(status_code=400, detail="Invalid status. Use: resolved, dismissed, pending")
     report.status = payload.status
     posts_db.commit()
     return {"status": payload.status, "report_id": str(report_id)}
