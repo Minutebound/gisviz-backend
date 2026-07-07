@@ -1,0 +1,37 @@
+# Dagster instance configuration.
+# This file is read from $DAGSTER_HOME/dagster.yaml.
+# The docker volume gisviz-dagster-home is mounted at /opt/dagster/dagster_home.
+# Copy this file into the volume on first boot (handled by the Dockerfile CMD).
+
+run_storage:
+  module: dagster._core.storage.runs
+  class: SqliteRunStorage
+  config:
+    base_dir: /opt/dagster/dagster_home
+
+event_log_storage:
+  module: dagster._core.storage.event_log
+  class: SqliteEventLogStorage
+  config:
+    base_dir: /opt/dagster/dagster_home
+
+schedule_storage:
+  module: dagster._core.storage.schedules
+  class: SqliteScheduleStorage
+  config:
+    base_dir: /opt/dagster/dagster_home
+
+scheduler:
+  module: dagster._core.scheduler
+  class: DagsterDaemonScheduler
+
+run_coordinator:
+  module: dagster._core.run_coordinator
+  class: DefaultRunCoordinator
+
+run_launcher:
+  module: dagster._core.launcher
+  class: DefaultRunLauncher
+
+telemetry:
+  enabled: false

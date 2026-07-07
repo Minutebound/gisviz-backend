@@ -1,30 +1,46 @@
 import uuid
 import os
-from datetime import datetime
-from fastapi import FastAPI, Depends
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.database import (
-    users_engine, posts_engine, UsersSessionLocal, PostsSessionLocal,
-    UsersBase, PostsBase
+    users_engine, posts_engine, analytics_engine, admin_engine,
+    UsersSessionLocal, PostsSessionLocal,
+    UsersBase, PostsBase, AnalyticsBase, AdminBase,
 )
 from app.db.models import (
     RoleRecord, PlatformUserRecord, UserLocationRecord,
-    PostRecord, CategoryRecord, KeywordRecord, PostCategoryLink, PostKeywordLink
+     CategoryRecord, 
 )
+# Registers AnalyticsBase + AdminBase tables before create_all runs
+import app.db.analytics_models  # noqa: F401
+
 from app.api.v1.endpoints import auth, posts, categories, follows, users, uploads, search
-from app.api.v1.endpoints import admin as admin_endpoints   # ← NEW
+from app.api.v1.endpoints import admin as admin_endpoints
+from app.api.v1.endpoints import admin_access
 from app.services.auth_service import auth_service
 
-# 1. Database Initialisation
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield  # Dagster daemon handles scheduling — no in-process scheduler needed
+
+
+# ── Create tables for all four databases on startup ──────────────────
 UsersBase.metadata.create_all(bind=users_engine)
 PostsBase.metadata.create_all(bind=posts_engine)
+AnalyticsBase.metadata.create_all(bind=analytics_engine)
+AdminBase.metadata.create_all(bind=admin_engine)
 
-# 2. Application Setup
-app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
+# ── Application setup ────────────────────────────────────────────────
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version=settings.VERSION,
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,20 +50,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 3. Mount Static Uploads Directory
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# 4. Route Registration
-app.include_router(auth.router,             prefix=f"{settings.API_V1_STR}/auth",       tags=["Authentication"])
-app.include_router(users.router,            prefix=f"{settings.API_V1_STR}/users",      tags=["Users"])
-app.include_router(uploads.router,          prefix=f"{settings.API_V1_STR}/uploads",    tags=["Uploads"])
-app.include_router(posts.router,            prefix=f"{settings.API_V1_STR}/posts",      tags=["Posts"])
-app.include_router(categories.router,       prefix=f"{settings.API_V1_STR}/categories", tags=["Categories"])
-app.include_router(follows.router,          prefix=f"{settings.API_V1_STR}/network",    tags=["Social Graph"])
-app.include_router(search.router,           prefix=f"{settings.API_V1_STR}/search",     tags=["Search"])
-app.include_router(admin_endpoints.router,  prefix=f"{settings.API_V1_STR}/admin",      tags=["Admin"])   # ← NEW
-
+# ── Routes ───────────────────────────────────────────────────────────
+app.include_router(auth.router,            prefix=f"{settings.API_V1_STR}/auth",       tags=["Authentication"])
+app.include_router(users.router,           prefix=f"{settings.API_V1_STR}/users",      tags=["Users"])
+app.include_router(uploads.router,         prefix=f"{settings.API_V1_STR}/uploads",    tags=["Uploads"])
+app.include_router(posts.router,           prefix=f"{settings.API_V1_STR}/posts",      tags=["Posts"])
+app.include_router(categories.router,      prefix=f"{settings.API_V1_STR}/categories", tags=["Categories"])
+app.include_router(follows.router,         prefix=f"{settings.API_V1_STR}/network",    tags=["Social Graph"])
+app.include_router(search.router,          prefix=f"{settings.API_V1_STR}/search",     tags=["Search"])
+app.include_router(admin_endpoints.router, prefix=f"{settings.API_V1_STR}/admin",      tags=["Admin"])
+app.include_router(admin_access.router, prefix=f"{settings.API_V1_STR}/admin", tags=["Admin Access"])
 
 @app.get("/")
 def root_health_check():

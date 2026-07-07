@@ -34,3 +34,7 @@ fastapi-cache2[redis]==0.2.1
 # Media & File Processing
 # ==========================================
 Pillow>=10.3.0
+
+# In-process nightly scheduler (only needed if ENABLE_SCHEDULER=1)
+apscheduler==3.10.4
+ 

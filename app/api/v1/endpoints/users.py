@@ -1,15 +1,16 @@
 import uuid
 import re
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, validator
 from typing import Optional, List
 
-from app.db.database import get_users_db
+from app.db.database import get_users_db, get_admin_db          # ← get_admin_db added
 from app.db.models import PlatformUserRecord, RoleRecord, UserLocationRecord, FollowCurrentRecord
 from app.services.auth_service import get_current_authenticated_user, RoleChecker, auth_service
 from app.schemas.user_schema import UserProfileData, UserSettingsUpdatePayload
+from app.analytics.audit import log_admin_action, log_role_change  # ← audit helpers added
 
 router = APIRouter()
 
@@ -98,7 +99,6 @@ def list_all_users(
     db: Session = Depends(get_users_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
 ):
-    """Admin-only: paginated list of every user, optionally filtered by handle/email."""
     query = db.query(PlatformUserRecord)
     if q:
         query = query.filter(
@@ -248,8 +248,8 @@ def request_email_change(
 
     import random, string
     otp = "".join(random.choices(string.digits, k=6))
-    current_user.verification_otp  = otp
-    current_user.otp_expires_at    = datetime.now(timezone.utc) + timedelta(minutes=15)
+    current_user.verification_otp     = otp
+    current_user.otp_expires_at       = datetime.now(timezone.utc) + timedelta(minutes=15)
     current_user.password_reset_token = f"email_change::{payload.new_email}"
     db.commit()
 
@@ -304,56 +304,82 @@ def delete_own_account(
     return {"message": "Account deactivated successfully"}
 
 
-# ── PUT /{user_id}/role  — ADMIN ONLY ───────────────────────────────
+# ── PUT /{user_id}/role  — ADMIN ONLY  (+ audit log) ────────────────
 
 @router.put("/{user_id}/role")
 def update_user_role(
     user_id: uuid.UUID,
     payload: RoleUpdatePayload,
+    request: Request,
     db: Session = Depends(get_users_db),
+    admin_db: Session = Depends(get_admin_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
 ):
     user = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    old_role = user.role.name if user.role else None
+
     role = db.query(RoleRecord).filter(RoleRecord.name == payload.role_name).first()
     if not role:
         raise HTTPException(status_code=400, detail=f"Unknown role '{payload.role_name}'.")
+
     user.role_id = role.role_id
     db.commit()
+
+    log_role_change(
+        admin_db,
+        subject_user_id=user.user_id,
+        changed_by_user_id=current_user.user_id,
+        old_role=old_role,
+        new_role=payload.role_name,
+    )
     return {"message": "Role updated successfully", "user_handle": user.user_handle, "new_role": payload.role_name}
 
 
-# ── PUT /{user_id}/status  — ADMIN/SUPPORT ──────────────────────────
+# ── PUT /{user_id}/status  — ADMIN/SUPPORT  (+ audit log) ───────────
 
 @router.put("/{user_id}/status")
 def set_user_status(
     user_id: uuid.UUID,
-    is_active: bool,          # FastAPI parses ?is_active=true → Python bool
+    is_active: bool,
+    request: Request,
     db: Session = Depends(get_users_db),
+    admin_db: Session = Depends(get_admin_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "support"])),
 ):
-    user = db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_id == user_id
-    ).first()
+    user = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
- 
-    # ↓ Cast to int so Postgres INTEGER column gets 0 or 1, not True/False
+
     user.is_active = int(is_active)
     db.commit()
+
+    log_admin_action(
+        admin_db,
+        admin_user_id=current_user.user_id,
+        admin_handle=current_user.user_handle,
+        action_type="user.status_change",
+        target_type="user",
+        target_id=str(user_id),
+        payload={"user_handle": user.user_handle, "is_active": int(is_active)},
+        ip_address=request.client.host if request.client else None,
+    )
     return {
         "message": f"User status set to {'active' if is_active else 'deactivated'}",
         "is_active": int(is_active),
     }
- 
 
-# ── DELETE /{user_id}  — ADMIN ONLY ─────────────────────────────────
+
+# ── DELETE /{user_id}  — ADMIN ONLY  (+ audit log) ──────────────────
 
 @router.delete("/{user_id}")
 def hard_delete_user(
     user_id: uuid.UUID,
+    request: Request,
     db: Session = Depends(get_users_db),
+    admin_db: Session = Depends(get_admin_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
 ):
     user = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == user_id).first()
@@ -361,6 +387,24 @@ def hard_delete_user(
         raise HTTPException(status_code=404, detail="User not found")
     if user.user_id == current_user.user_id:
         raise HTTPException(status_code=400, detail="You cannot delete your own account here.")
+
+    # Snapshot before deleting — the source row will be gone after commit
+    snapshot = {
+        "user_handle": user.user_handle,
+        "email": user.email_address,
+        "role": user.role.name if user.role else None,
+    }
     db.delete(user)
     db.commit()
-    return {"message": f"User {user.user_handle} permanently deleted"}
+
+    log_admin_action(
+        admin_db,
+        admin_user_id=current_user.user_id,
+        admin_handle=current_user.user_handle,
+        action_type="user.delete",
+        target_type="user",
+        target_id=str(user_id),
+        payload=snapshot,
+        ip_address=request.client.host if request.client else None,
+    )
+    return {"message": f"User {snapshot['user_handle']} permanently deleted"}

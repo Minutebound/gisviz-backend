@@ -1,0 +1,7 @@
+# workspace.yaml — tells both the webserver and daemon where to find definitions.
+# Placed in DAGSTER_HOME so both services share it via the dagster-home volume.
+load_from:
+  - python_module:
+      module_name: gisviz_dagster
+      attribute: defs
+      working_directory: /opt/dagster/app
