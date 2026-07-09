@@ -1,3 +1,11 @@
+"""
+alembic/env.py
+==============
+Change from previous version:
+  Before: import app.db.models + import app.db.analytics_models
+  After:  import app.db.models   (analytics + admin models now live there)
+"""
+
 import logging
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
@@ -5,8 +13,9 @@ from alembic import context
 
 from app.core.config import settings
 from app.db.database import UsersBase, PostsBase, AnalyticsBase, AdminBase
-import app.db.models           # registers OLTP models
-import app.db.analytics_models  # registers analytics + admin models
+
+# Single import registers all four bases — no separate analytics_models import needed
+import app.db.models  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:
@@ -31,10 +40,12 @@ def run_migrations_offline() -> None:
     for name in config.get_main_option("databases").split(","):
         name = name.strip()
         rec  = config.get_section(name)
-        context.configure(url=rec["sqlalchemy.url"],
-                          target_metadata=target_metadata.get(name),
-                          literal_binds=True,
-                          dialect_opts={"paramstyle": "named"})
+        context.configure(
+            url=rec["sqlalchemy.url"],
+            target_metadata=target_metadata.get(name),
+            literal_binds=True,
+            dialect_opts={"paramstyle": "named"},
+        )
         with context.begin_transaction():
             context.run_migrations(engine_name=name)
 
@@ -42,14 +53,19 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     db_names = [n.strip() for n in config.get_main_option("databases").split(",")]
     engines  = {
-        name: engine_from_config(config.get_section(name, {}),
-                                 prefix="sqlalchemy.", poolclass=pool.NullPool)
+        name: engine_from_config(
+            config.get_section(name, {}),
+            prefix="sqlalchemy.",
+            poolclass=pool.NullPool,
+        )
         for name in db_names
     }
     for name, engine in engines.items():
         with engine.connect() as connection:
-            context.configure(connection=connection,
-                              target_metadata=target_metadata.get(name))
+            context.configure(
+                connection=connection,
+                target_metadata=target_metadata.get(name),
+            )
             with context.begin_transaction():
                 logger.info("Migrating: %s", name)
                 context.run_migrations(engine_name=name)

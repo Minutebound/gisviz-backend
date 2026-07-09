@@ -91,23 +91,6 @@ async def trending_posts(n: int = Query(10, ge=1, le=50)):
     return trending[:n] if trending else []
 
 
-# -------------------------------------------------------------------
-#  SINGLE POST
-#  Per-user flags mean we cannot share a single cache entry across
-#  all users — @cache omitted. Client TTL handles deduplication.
-# -------------------------------------------------------------------
-@router.get("/{post_id}", response_model=PostResponse)
-async def get_single_post(
-    post_id: uuid.UUID,
-    posts_db: Session = Depends(get_posts_db),
-    users_db: Session = Depends(get_users_db),
-    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
-):
-    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    current_user_id = current_user.user_id if current_user else None
-    return post_service._format_post_response(posts_db, users_db, post, current_user_id)
 
 
 # -------------------------------------------------------------------
@@ -184,6 +167,24 @@ async def get_user_bookmarks(
             )
     return results
 
+
+# -------------------------------------------------------------------
+#  SINGLE POST
+#  Per-user flags mean we cannot share a single cache entry across
+#  all users — @cache omitted. Client TTL handles deduplication.
+# -------------------------------------------------------------------
+@router.get("/{post_id}", response_model=PostResponse)
+async def get_single_post(
+    post_id: uuid.UUID,
+    posts_db: Session = Depends(get_posts_db),
+    users_db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
+):
+    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    current_user_id = current_user.user_id if current_user else None
+    return post_service._format_post_response(posts_db, users_db, post, current_user_id)
 
 # -------------------------------------------------------------------
 #  POST CRUD
@@ -457,7 +458,7 @@ async def get_comments(
         commenter = commenter_map.get(c.user_id)
         comments_dict[c.comment_id] = {
             "comment_id": c.comment_id, "post_id": c.post_id, "user_id": c.user_id,
-            "publisher_handle": commenter.user_handle if commenter else "Unknown",
+            "publisher_handle": commenter.user_handle if commenter else "deleted_user",
             "publisher_avatar_path": commenter.avatar_path if commenter else None,
             "parent_comment_id": c.parent_comment_id, "content": c.content,
             "is_edited": bool(getattr(c, "is_edited", False)),

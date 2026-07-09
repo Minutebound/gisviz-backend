@@ -1,18 +1,17 @@
 """
 app/analytics/snapshot.py
+=========================
+Orchestrator-agnostic ETL. Called by:
+  - POST /admin/run-snapshot  (Refresh button on analytics page)
+  - Airflow DAG               (nightly, from your Mac)
+  - CLI: python -m app.analytics.snapshot [YYYY-MM-DD]
 
-Orchestrator-agnostic ETL — called by Dagster, cron, or manual trigger.
-Reads users_db + posts_db, writes one snapshot per day into analytics_db.
-Re-running for the same date is safe (UPSERT on primary key).
+Reads  → users_db + posts_db
+Writes → analytics_db (UPSERT — re-running the same date is safe)
 
-This version populates BOTH:
-  • the daily totals + per-post/per-category facts
-  • the ranked lists (top posts/users/commenters) + weekly deltas,
-    so the ENTIRE analytics page can be served from analytics_db.
-
-CLI:
-    python -m app.analytics.snapshot            # today (UTC)
-    python -m app.analytics.snapshot 2026-07-01 # a specific date
+Import change from old version:
+  Before: from app.db.analytics_models import ...
+  After:  from app.db.models import ...   ← analytics models now live there
 """
 
 from __future__ import annotations
@@ -28,11 +27,11 @@ from sqlalchemy.orm import Session
 
 from app.db.database import UsersSessionLocal, PostsSessionLocal, AnalyticsSessionLocal
 from app.db.models import (
+    # OLTP — source data
     PlatformUserRecord, PostRecord, PostLikeRecord, PostBookmarkRecord,
     PostCommentRecord, CategoryRecord, KeywordRecord,
     FollowCurrentRecord, PostReportRecord,
-)
-from app.db.analytics_models import (
+    # Analytics warehouse — destination tables
     DimDate, DimUser, DimPost, DimCategory,
     FactDailySnapshot, FactPostEngagement, FactCategoryDaily, EtlRunLog,
     FactWeeklyDelta, FactTopPost, FactTopUser, FactTopCommenter,
@@ -70,9 +69,9 @@ def _upsert(a_db: Session, table, values: dict, pk_cols: list) -> None:
 # ── main entry point ─────────────────────────────────────────────────
 
 def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
-    """Build and persist the analytics snapshot for snapshot_date."""
-    snap = snapshot_date or datetime.now(timezone.utc).date()
-    now = datetime.now(timezone.utc)
+    """Build and persist the analytics snapshot for snapshot_date (defaults to today UTC)."""
+    snap         = snapshot_date or datetime.now(timezone.utc).date()
+    now          = datetime.now(timezone.utc)
     window_start = datetime.combine(snap, datetime.min.time(), tzinfo=timezone.utc)
     window_end   = window_start + timedelta(days=1)
 
@@ -101,7 +100,6 @@ def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
         open_reports     = p_db.query(PostReportRecord).filter(
             PostReportRecord.status == "open"
         ).count()
-
         new_users = u_db.query(PlatformUserRecord).filter(
             PlatformUserRecord.created_timestamp >= window_start,
             PlatformUserRecord.created_timestamp <  window_end,
@@ -117,8 +115,7 @@ def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
             "total_likes": total_likes, "total_bookmarks": total_bookmarks,
             "total_comments": total_comments, "total_follows": total_follows,
             "total_categories": total_categories, "total_keywords": total_keywords,
-            "open_reports": open_reports,
-            "new_users": new_users, "new_posts": new_posts,
+            "open_reports": open_reports, "new_users": new_users, "new_posts": new_posts,
         }, pk_cols=["snapshot_date"])
         rows_written += 1
 
@@ -153,8 +150,8 @@ def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
                 "category_id": cat.category_id, "slug": cat.slug, "label": cat.label,
             }, pk_cols=["category_id"])
 
-        # ── user dimension refresh + handle/role lookup ───────────────
-        _all_users = u_db.query(PlatformUserRecord).all()
+        # ── user dimension refresh ────────────────────────────────────
+        _all_users    = u_db.query(PlatformUserRecord).all()
         _handle_by_id = {u.user_id: u.user_handle for u in _all_users}
         _role_by_id   = {u.user_id: (u.role.name if u.role else "viewer") for u in _all_users}
         for usr in _all_users:
@@ -164,15 +161,13 @@ def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
                 "first_seen_date": usr.created_timestamp.date() if usr.created_timestamp else None,
             }, pk_cols=["user_id"])
 
-        # ══════════════════════════════════════════════════════════════
-        #  RANKED LISTS + WEEKLY DELTAS  (so the whole page is DB-backed)
-        # ══════════════════════════════════════════════════════════════
-
-        # weekly deltas
+        # ── weekly deltas ─────────────────────────────────────────────
         _week_ago  = window_start - timedelta(days=7)
         _two_weeks = window_start - timedelta(days=14)
-        tw_users = u_db.query(PlatformUserRecord).filter(PlatformUserRecord.created_timestamp >= _week_ago).count()
-        tw_posts = p_db.query(PostRecord).filter(PostRecord.created_timestamp >= _week_ago).count()
+        tw_users = u_db.query(PlatformUserRecord).filter(
+            PlatformUserRecord.created_timestamp >= _week_ago).count()
+        tw_posts = p_db.query(PostRecord).filter(
+            PostRecord.created_timestamp >= _week_ago).count()
         lw_users = u_db.query(PlatformUserRecord).filter(
             PlatformUserRecord.created_timestamp >= _two_weeks,
             PlatformUserRecord.created_timestamp <  _week_ago).count()
@@ -185,12 +180,9 @@ def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
             "last_week_new_users": lw_users, "last_week_new_posts": lw_posts,
         }, pk_cols=["snapshot_date"])
 
-        # wipe prior ranked rows for this snapshot (idempotent re-run)
+        # ── ranked lists: top posts ───────────────────────────────────
         a_db.query(FactTopPost).filter(FactTopPost.snapshot_date == snap).delete()
-        a_db.query(FactTopUser).filter(FactTopUser.snapshot_date == snap).delete()
-        a_db.query(FactTopCommenter).filter(FactTopCommenter.snapshot_date == snap).delete()
 
-        # top posts by likes / comments
         def _store_top_posts(rank_by, posts):
             for i, p in enumerate(posts, start=1):
                 metric = (p.total_likes_count if rank_by == "likes"
@@ -198,7 +190,7 @@ def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
                 a_db.add(FactTopPost(
                     snapshot_date=snap, rank_by=rank_by, rank=i,
                     post_id=p.post_id, title=p.title,
-                    publisher_handle=_handle_by_id.get(p.publisher_user_id, "unknown"),
+                    publisher_handle=_handle_by_id.get(p.publisher_user_id, "deleted_user"),
                     total_likes_count=p.total_likes_count or 0,
                     total_comments_count=p.total_comments_count or 0,
                     metric_value=metric or 0,
@@ -209,13 +201,13 @@ def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
         _store_top_posts("comments",
             p_db.query(PostRecord).order_by(PostRecord.total_comments_count.desc()).limit(TOP_N).all())
 
-        # top posts by bookmarks
-        _bm_rank = (p_db.query(PostBookmarkRecord.post_id, func.count().label("cnt"))
-                    .group_by(PostBookmarkRecord.post_id)
-                    .order_by(func.count().desc()).limit(TOP_N).all())
+        _bm_rank  = (p_db.query(PostBookmarkRecord.post_id, func.count().label("cnt"))
+                     .group_by(PostBookmarkRecord.post_id)
+                     .order_by(func.count().desc()).limit(TOP_N).all())
         _bm_ids   = [r.post_id for r in _bm_rank]
         _bm_cnt   = {r.post_id: r.cnt for r in _bm_rank}
-        _bm_posts = {p.post_id: p for p in p_db.query(PostRecord).filter(PostRecord.post_id.in_(_bm_ids)).all()}
+        _bm_posts = {p.post_id: p for p in
+                     p_db.query(PostRecord).filter(PostRecord.post_id.in_(_bm_ids)).all()}
         for i, pid in enumerate(_bm_ids, start=1):
             p = _bm_posts.get(pid)
             if not p:
@@ -223,55 +215,69 @@ def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
             a_db.add(FactTopPost(
                 snapshot_date=snap, rank_by="bookmarks", rank=i,
                 post_id=p.post_id, title=p.title,
-                publisher_handle=_handle_by_id.get(p.publisher_user_id, "unknown"),
+                publisher_handle=_handle_by_id.get(p.publisher_user_id, "deleted_user"),
                 total_likes_count=p.total_likes_count or 0,
                 total_comments_count=p.total_comments_count or 0,
                 metric_value=int(_bm_cnt.get(pid, 0)),
             ))
 
-        # top users by followers / posts
+        # ── ranked lists: top users ───────────────────────────────────
+        a_db.query(FactTopUser).filter(FactTopUser.snapshot_date == snap).delete()
+
         def _store_top_users(rank_by, users):
             for i, u in enumerate(users, start=1):
+                metric = u.follower_count if rank_by == "followers" else u.post_count
                 a_db.add(FactTopUser(
                     snapshot_date=snap, rank_by=rank_by, rank=i,
                     user_id=u.user_id, user_handle=u.user_handle,
-                    role_name=_role_by_id.get(u.user_id, "viewer"),
+                    role_name=_role_by_id.get(u.user_id),
                     follower_count=u.follower_count or 0,
                     post_count=u.post_count or 0,
+                    metric_value=metric or 0,
                 ))
 
         _store_top_users("followers",
-            u_db.query(PlatformUserRecord).order_by(PlatformUserRecord.follower_count.desc()).limit(TOP_N).all())
+            u_db.query(PlatformUserRecord).order_by(
+                PlatformUserRecord.follower_count.desc()).limit(TOP_N).all())
         _store_top_users("posts",
-            u_db.query(PlatformUserRecord).order_by(PlatformUserRecord.post_count.desc()).limit(TOP_N).all())
+            u_db.query(PlatformUserRecord).order_by(
+                PlatformUserRecord.post_count.desc()).limit(TOP_N).all())
 
-        # top commenters
-        _cm_rank = (p_db.query(PostCommentRecord.user_id, func.count().label("cnt"))
+        # ── ranked list: top commenters ───────────────────────────────
+        a_db.query(FactTopCommenter).filter(FactTopCommenter.snapshot_date == snap).delete()
+        _cm_rows = (p_db.query(PostCommentRecord.user_id, func.count().label("cnt"))
                     .group_by(PostCommentRecord.user_id)
                     .order_by(func.count().desc()).limit(TOP_N).all())
-        for i, row in enumerate(_cm_rank, start=1):
+        for i, r in enumerate(_cm_rows, start=1):
             a_db.add(FactTopCommenter(
                 snapshot_date=snap, rank=i,
-                user_id=row.user_id,
-                user_handle=_handle_by_id.get(row.user_id, "unknown"),
-                comment_count=int(row.cnt),
+                user_id=r.user_id,
+                user_handle=_handle_by_id.get(r.user_id, "deleted_user"),
+                comment_count=r.cnt,
             ))
 
         a_db.commit()
 
-        run.status        = "success"
-        run.rows_written  = rows_written
+        # ── finalise run log ──────────────────────────────────────────
+        duration = (datetime.now(timezone.utc) - now).total_seconds()
+        run.status           = "success"
+        run.rows_written     = rows_written
         run.finished_timestamp = datetime.now(timezone.utc)
-        run.duration_seconds   = (run.finished_timestamp - now).total_seconds()
+        run.duration_seconds  = duration
         a_db.commit()
 
-        summary = {
-            "snapshot_date": str(snap), "rows_written": rows_written,
-            "totals": {"users": total_users, "posts": total_posts,
-                       "likes": total_likes, "comments": total_comments},
+        result = {
+            "snapshot_date": snap.isoformat(),
+            "rows_written":  rows_written,
+            "status":        "success",
+            "duration_seconds": round(duration, 3),
+            "totals": {
+                "users": total_users, "posts": total_posts,
+                "likes": total_likes, "comments": total_comments,
+            },
         }
-        log.info("snapshot OK: %s", summary)
-        return summary
+        log.info("Snapshot complete: %s", result)
+        return result
 
     except Exception as exc:
         a_db.rollback()
@@ -279,7 +285,7 @@ def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
         run.error_message = str(exc)
         run.finished_timestamp = datetime.now(timezone.utc)
         a_db.commit()
-        log.exception("snapshot FAILED for %s", snap)
+        log.exception("Snapshot FAILED for %s", snap)
         raise
     finally:
         u_db.close()
@@ -287,8 +293,10 @@ def run_daily_snapshot(snapshot_date: date | None = None) -> dict:
         a_db.close()
 
 
+# ── CLI entry point ───────────────────────────────────────────────────
 if __name__ == "__main__":
     target = None
     if len(sys.argv) > 1:
         target = datetime.strptime(sys.argv[1], "%Y-%m-%d").date()
-    run_daily_snapshot(target)
+    result = run_daily_snapshot(target)
+    print(result)

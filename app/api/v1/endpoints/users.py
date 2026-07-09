@@ -8,9 +8,9 @@ from typing import Optional, List
 
 from app.db.database import get_users_db, get_admin_db          # ← get_admin_db added
 from app.db.models import PlatformUserRecord, RoleRecord, UserLocationRecord, FollowCurrentRecord
-from app.services.auth_service import get_current_authenticated_user, RoleChecker, auth_service
-from app.schemas.user_schema import UserProfileData, UserSettingsUpdatePayload
-from app.analytics.audit import log_admin_action, log_role_change  # ← audit helpers added
+from app.services.auth_service import get_current_authenticated_user, RoleChecker, auth_service, get_optional_current_user
+from app.schemas.user_schema import UserSettingsUpdatePayload
+from app.db.models import log_admin_action, log_role_change
 
 router = APIRouter()
 
@@ -408,3 +408,62 @@ def hard_delete_user(
         ip_address=request.client.host if request.client else None,
     )
     return {"message": f"User {snapshot['user_handle']} permanently deleted"}
+
+## --Support Tickets management endpoints ---
+from app.db.models import SupportTicketRecord
+from app.schemas.user_schema import SupportTicketPayload, SupportTicketResponse, SupportStatusPayload
+
+# ── POST /support (Users creating tickets) ───────────────────────────
+@router.post("/support", response_model=SupportTicketResponse)
+def create_support_ticket(
+    payload: SupportTicketPayload,
+    db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
+):
+    ticket = SupportTicketRecord(
+        user_id=current_user.user_id if current_user else None,
+        contact_email=payload.contact_email or (current_user.email_address if current_user else None),
+        category=payload.category,
+        subject=payload.subject,
+        description=payload.description
+    )
+    db.add(ticket)
+    db.commit()
+    db.refresh(ticket)
+    
+    res = SupportTicketResponse.model_validate(ticket)
+    if current_user:
+        res.user_handle = current_user.user_handle
+    return res
+
+# ── GET /support/all (Admins viewing tickets) ────────────────────────
+@router.get("/support/all", response_model=List[SupportTicketResponse])
+def get_all_support_tickets(
+    db: Session = Depends(get_users_db),
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor", "support"])),
+):
+    tickets = db.query(SupportTicketRecord).order_by(SupportTicketRecord.created_timestamp.desc()).all()
+    results = []
+    for t in tickets:
+        dto = SupportTicketResponse.model_validate(t)
+        if t.user:
+            dto.user_handle = t.user.user_handle
+        results.append(dto)
+    return results
+
+# ── PUT /support/{ticket_id}/status (Admins resolving tickets) ───────
+@router.put("/support/{ticket_id}/status")
+def update_support_status(
+    ticket_id: uuid.UUID,
+    payload: SupportStatusPayload,
+    db: Session = Depends(get_users_db),
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor", "support"])),
+):
+    if payload.status not in ("open", "resolved", "dismissed"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+    ticket = db.query(SupportTicketRecord).filter(SupportTicketRecord.ticket_id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    ticket.status = payload.status
+    db.commit()
+    return {"status": payload.status, "ticket_id": str(ticket_id)}

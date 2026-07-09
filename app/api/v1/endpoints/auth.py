@@ -21,11 +21,16 @@ router = APIRouter()
 @router.post("/register")
 def register(payload: UserRegistrationPayload, db: Session = Depends(get_users_db)):
     result = auth_service.register_new_user(db=db, payload=payload)
-    return {
+
+    # dev_otp is None in production (auth_service._expose_dev_field returns None).
+    # Only add the key to the response when it has a value.
+    response = {
         "message": "Registration successful. Please check your email for the verification code.",
         "user_handle": result["user"].user_handle,
-        "dev_otp": result["dev_otp"],
     }
+    if result["dev_otp"] is not None:
+        response["dev_otp"] = result["dev_otp"]
+    return response
 
 
 @router.post("/verify")
@@ -40,7 +45,6 @@ def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_users_db),
 ):
-    # Try handle first, fall back to email
     user = db.query(PlatformUserRecord).filter(
         PlatformUserRecord.email_address == form_data.username
     ).first()
@@ -49,59 +53,58 @@ def login(
     ):
         raise HTTPException(status_code=400, detail="Incorrect email or password")
 
-    # Unverified — redirect to OTP view
+    # ── Unverified account ───────────────────────────────────────────
     if user.is_verified == 0:
-        # Generate a fresh OTP to ensure it isn't expired
         otp = auth_service._generate_otp()
         user.verification_otp = otp
         user.otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
         db.commit()
 
-        auth_service.simulate_send_email(
-            email=user.email_address,
+        # dev  → prints OTP to console
+        # prod → sends real email to the user's inbox
+        auth_service._email(
+            to_email=user.email_address,
             subject="Account Verification Code",
-            content=f"A login attempt was made. Your verification code is {otp}. It expires in 15 minutes.",
+            body=(
+                f"A login attempt was made on your account.\n"
+                f"Your verification code is: {otp}\n"
+                "It expires in 15 minutes."
+            ),
         )
 
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "unverified", 
-                "email": user.email_address,
-                "dev_otp": otp  # Included for dev mode
-            },
-        )
+        # Build the 403 detail — only include dev_otp outside production
+        detail: dict = {"error": "unverified", "email": user.email_address}
+        dev_otp = auth_service._expose_dev_field(otp)
+        if dev_otp is not None:
+            detail["dev_otp"] = dev_otp
 
-    # Deactivated account — reactivate it, generate a fresh OTP, and
-    # send them back through the verification flow. This covers the
-    # "deleted account trying to log back in" case: they verify the OTP,
-    # which re-activates the account and lets them in.
+        raise HTTPException(status_code=403, detail=detail)
+
+    # ── Deactivated account ──────────────────────────────────────────
     if user.is_active == 0:
         otp = auth_service._generate_otp()
         user.verification_otp = otp
         user.otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
         db.commit()
 
-        auth_service.simulate_send_email(
-            email=user.email_address,
+        auth_service._email(
+            to_email=user.email_address,
             subject="Account Reactivation — Verify your identity",
-            content=(
+            body=(
                 f"A login attempt was made on your deactivated account.\n"
-                f"If this was you and you want to reactivate your account, "
-                f"enter this code: {otp}\n"
-                f"It expires in 15 minutes."
+                f"If this was you and you want to reactivate it, enter this code: {otp}\n"
+                "It expires in 15 minutes."
             ),
         )
 
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "deactivated",
-                "email": user.email_address,
-                "dev_otp": otp, # Included for dev mode
-            },
-        )
+        detail = {"error": "deactivated", "email": user.email_address}
+        dev_otp = auth_service._expose_dev_field(otp)
+        if dev_otp is not None:
+            detail["dev_otp"] = dev_otp
 
+        raise HTTPException(status_code=403, detail=detail)
+
+    # ── Happy path ───────────────────────────────────────────────────
     access_token = auth_service.create_access_token(subject=str(user.user_id))
     return {
         "access_token": access_token,
@@ -125,17 +128,26 @@ def resend_otp(payload: ForgotPasswordPayload, db: Session = Depends(get_users_d
     user.otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
     db.commit()
 
-    auth_service.simulate_send_email(
-        email=user.email_address,
+    auth_service._email(
+        to_email=user.email_address,
         subject="New Verification Code",
-        content=f"Your new code is {otp}. It expires in 15 minutes.",
+        body=f"Your new verification code is: {otp}. It expires in 15 minutes.",
     )
-    return {"message": "New OTP sent successfully.", "dev_otp": otp}
+
+    response = {"message": "New OTP sent successfully."}
+    dev_otp = auth_service._expose_dev_field(otp)
+    if dev_otp is not None:
+        response["dev_otp"] = dev_otp
+    return response
 
 
 @router.post("/forgot-password")
 def forgot_password(payload: ForgotPasswordPayload, db: Session = Depends(get_users_db)):
-    return auth_service.initiate_password_reset(db=db, email_address=payload.email_address)
+    # auth_service.initiate_password_reset already calls _email() and
+    # guards dev_token via _expose_dev_field — nothing extra needed here.
+    return auth_service.initiate_password_reset(
+        db=db, email_address=payload.email_address
+    )
 
 
 @router.post("/reset-password")
@@ -156,6 +168,8 @@ def change_password(
     ):
         raise HTTPException(status_code=400, detail="Incorrect current password.")
 
-    current_user.hashed_security_password = auth_service.get_password_hash(payload.new_password)
+    current_user.hashed_security_password = auth_service.get_password_hash(
+        payload.new_password
+    )
     db.commit()
     return {"status": "success", "message": "Password updated successfully."}

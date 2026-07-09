@@ -2,6 +2,7 @@ import re
 from pydantic import BaseModel, EmailStr, UUID4, validator
 from datetime import datetime
 from typing import Optional, Dict, Any
+import uuid
 
 # Reusable password complexity validator
 def validate_password_complexity(v: str) -> str:
@@ -111,3 +112,27 @@ class FollowEventData(BaseModel):
 
     class Config:
         from_attributes = True
+
+# --SUpport Tickets ---
+class SupportTicketPayload(BaseModel):
+    category: str
+    subject: str
+    description: str
+    contact_email: Optional[EmailStr] = None
+
+class SupportTicketResponse(BaseModel):
+    ticket_id: uuid.UUID
+    user_id: Optional[uuid.UUID]
+    contact_email: Optional[str]
+    category: str
+    subject: str
+    description: str
+    status: str
+    created_timestamp: datetime
+    user_handle: Optional[str] = None  # Fetched dynamically for the admin panel
+
+    class Config:
+        from_attributes = True
+
+class SupportStatusPayload(BaseModel):
+    status: str

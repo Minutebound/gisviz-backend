@@ -2,7 +2,6 @@ from pydantic import BaseModel, UUID4
 from typing import List, Optional
 from datetime import datetime
 
-
 class CategoryData(BaseModel):
     category_id: int
     slug: str = ""

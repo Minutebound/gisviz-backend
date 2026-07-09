@@ -192,69 +192,7 @@ services:
         max-file: "3"
 
   # ────────────────────────────────────────────────────────
-  # 9. Dagster webserver (Dagit UI — http://localhost:3030)
-  #
-  # Build context = repo root (.) so COPY app/ and
-  # COPY dagster/ both resolve correctly from one place.
-  # The Dockerfile lives at dagster/Dockerfile.
-  # ────────────────────────────────────────────────────────
-  dagster-webserver:
-    build:
-      context: .
-      dockerfile: dagster/Dockerfile
-    container_name: gisviz-dagster-webserver
-    restart: always
-    ports:
-      - "3030:3000"
-    env_file:
-      - .env.backend
-    environment:
-      DAGSTER_HOME: /opt/dagster/dagster_home
-    volumes:
-      - dagster-home:/opt/dagster/dagster_home
-    depends_on:
-      analytics-db:
-        condition: service_healthy
-      users-db:
-        condition: service_healthy
-      posts-db:
-        condition: service_healthy
-      admin-db:
-        condition: service_healthy
-    networks:
-      - gisviz-network
-
-  # ────────────────────────────────────────────────────────
-  # 10. Dagster daemon (runs schedules + sensors)
-  # Same image, different CMD.
-  # ────────────────────────────────────────────────────────
-  dagster-daemon:
-    build:
-      context: .
-      dockerfile: dagster/Dockerfile
-    container_name: gisviz-dagster-daemon
-    restart: always
-    command: ["dagster-daemon", "run"]
-    env_file:
-      - .env.backend
-    environment:
-      DAGSTER_HOME: /opt/dagster/dagster_home
-    volumes:
-      - dagster-home:/opt/dagster/dagster_home
-    depends_on:
-      analytics-db:
-        condition: service_healthy
-      users-db:
-        condition: service_healthy
-      posts-db:
-        condition: service_healthy
-      admin-db:
-        condition: service_healthy
-    networks:
-      - gisviz-network
-
-  # ────────────────────────────────────────────────────────
-  # 11. Loki
+  # 9. Loki
   # ────────────────────────────────────────────────────────
   loki:
     image: grafana/loki:latest
@@ -267,7 +205,7 @@ services:
       - gisviz-network
 
   # ────────────────────────────────────────────────────────
-  # 12. Promtail
+  # 10. Promtail
   # ────────────────────────────────────────────────────────
   promtail:
     image: grafana/promtail:latest
@@ -305,5 +243,3 @@ volumes:
     name: gisviz-pgadmin-data
   uploads-data:
     name: gisviz-uploads-data
-  dagster-home:
-    name: gisviz-dagster-home

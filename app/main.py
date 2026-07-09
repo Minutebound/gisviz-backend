@@ -1,32 +1,65 @@
-import uuid
+"""
+app/main.py
+─────────────────────────────
+Change from previous version:
+  FastAPICache is now properly initialised in the lifespan so the
+  @cache decorator on any endpoint that still uses it actually works.
+  (Previously the lifespan just yielded with no init, so @cache was
+  a silent no-op and every decorated request hit Postgres directly.)
+
+  The search endpoint no longer uses @cache — it uses CacheService
+  directly so we can invalidate on mutations. But FastAPICache is
+  still init'd here because other future endpoints or libraries may
+  need it, and the cost is zero.
+"""
+
 import os
 from contextlib import asynccontextmanager
+
+import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi_cache import FastAPICache
+from fastapi_cache.backends.redis import RedisBackend
 
 from app.core.config import settings
 from app.db.database import (
-    users_engine, posts_engine, analytics_engine, admin_engine,
-    UsersSessionLocal, PostsSessionLocal,
     UsersBase, PostsBase, AnalyticsBase, AdminBase,
+    users_engine, posts_engine, analytics_engine, admin_engine,UsersSessionLocal, 
+    PostsSessionLocal, 
 )
 from app.db.models import (
-    RoleRecord, PlatformUserRecord, UserLocationRecord,
-     CategoryRecord, 
+    RoleRecord, PlatformUserRecord, UserLocationRecord, CategoryRecord,
 )
-# Registers AnalyticsBase + AdminBase tables before create_all runs
-import app.db.analytics_models  # noqa: F401
 
 from app.api.v1.endpoints import auth, posts, categories, follows, users, uploads, search
 from app.api.v1.endpoints import admin as admin_endpoints
-from app.api.v1.endpoints import admin_access
 from app.services.auth_service import auth_service
-
+import uuid
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield  # Dagster daemon handles scheduling — no in-process scheduler needed
+    # ── Initialise FastAPICache with the Redis backend ────────────────
+    # Uses an async Redis client (required by fastapi-cache2 ≥ 0.2).
+    # The sync CacheService in cache_service.py uses its own separate
+    # sync client — both point to the same Redis instance, which is fine.
+    redis_client = aioredis.from_url(
+        settings.REDIS_URL,
+        encoding="utf-8",
+        decode_responses=True,
+    )
+    FastAPICache.init(
+        RedisBackend(redis_client),
+        prefix="gisviz-cache",   # all @cache keys are namespaced under this prefix
+    )
+    print("[FastAPICache] Redis backend initialised")
+
+    yield  # ← app runs here
+
+    # Graceful shutdown
+    await redis_client.aclose()
+    print("[FastAPICache] Redis connection closed")
 
 
 # ── Create tables for all four databases on startup ──────────────────
@@ -56,13 +89,12 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 # ── Routes ───────────────────────────────────────────────────────────
 app.include_router(auth.router,            prefix=f"{settings.API_V1_STR}/auth",       tags=["Authentication"])
 app.include_router(users.router,           prefix=f"{settings.API_V1_STR}/users",      tags=["Users"])
-app.include_router(uploads.router,         prefix=f"{settings.API_V1_STR}/uploads",    tags=["Uploads"])
 app.include_router(posts.router,           prefix=f"{settings.API_V1_STR}/posts",      tags=["Posts"])
 app.include_router(categories.router,      prefix=f"{settings.API_V1_STR}/categories", tags=["Categories"])
 app.include_router(follows.router,         prefix=f"{settings.API_V1_STR}/network",    tags=["Social Graph"])
+app.include_router(uploads.router,         prefix=f"{settings.API_V1_STR}/uploads",    tags=["Uploads"])
 app.include_router(search.router,          prefix=f"{settings.API_V1_STR}/search",     tags=["Search"])
 app.include_router(admin_endpoints.router, prefix=f"{settings.API_V1_STR}/admin",      tags=["Admin"])
-app.include_router(admin_access.router, prefix=f"{settings.API_V1_STR}/admin", tags=["Admin Access"])
 
 @app.get("/")
 def root_health_check():

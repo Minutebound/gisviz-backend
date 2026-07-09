@@ -53,7 +53,7 @@ class PostService:
         return {
             "post_id": str(post.post_id),
             "publisher_user_id": str(post.publisher_user_id),
-            "publisher_handle": publisher.user_handle if publisher else "Unknown",
+            "publisher_handle": publisher.user_handle if publisher else "deleted_user",
             "publisher_avatar_path": publisher.avatar_path if publisher else None,
             "title": post.title,
             "description": post.description,
@@ -96,7 +96,7 @@ class PostService:
             for p in posts
         ]
 
-    # ------------------------------------------------------------------
+   # ------------------------------------------------------------------
     # Create
     # ------------------------------------------------------------------
     async def create_post(
@@ -120,9 +120,12 @@ class PostService:
         posts_db.flush()
 
         for cat_id in payload.category_ids:
-            if posts_db.query(CategoryRecord).filter(
+            # FIX: Get the category to increment its usage_count
+            cat = posts_db.query(CategoryRecord).filter(
                 CategoryRecord.category_id == cat_id
-            ).first():
+            ).first()
+            if cat:
+                cat.usage_count += 1
                 posts_db.add(PostCategoryLink(post_id=new_post.post_id, category_id=cat_id))
 
         for kw_str in payload.keywords:
@@ -175,18 +178,41 @@ class PostService:
         if payload.visual_image_path:
             post.visual_image_path = payload.visual_image_path
 
+        # FIX: Decrement old categories before deleting links
+        old_cat_links = posts_db.query(PostCategoryLink).filter(
+            PostCategoryLink.post_id == post.post_id
+        ).all()
+        for link in old_cat_links:
+            cat = posts_db.query(CategoryRecord).filter(CategoryRecord.category_id == link.category_id).first()
+            if cat and cat.usage_count > 0:
+                cat.usage_count -= 1
+
         posts_db.query(PostCategoryLink).filter(
             PostCategoryLink.post_id == post.post_id
         ).delete()
+        
         for cat_id in payload.category_ids:
-            if posts_db.query(CategoryRecord).filter(
+            # FIX: Increment new categories
+            cat = posts_db.query(CategoryRecord).filter(
                 CategoryRecord.category_id == cat_id
-            ).first():
+            ).first()
+            if cat:
+                cat.usage_count += 1
                 posts_db.add(PostCategoryLink(post_id=post.post_id, category_id=cat_id))
+
+        # FIX: Decrement old keywords before deleting links
+        old_kw_links = posts_db.query(PostKeywordLink).filter(
+            PostKeywordLink.post_id == post.post_id
+        ).all()
+        for link in old_kw_links:
+            kw = posts_db.query(KeywordRecord).filter(KeywordRecord.keyword_id == link.keyword_id).first()
+            if kw and kw.usage_count > 0:
+                kw.usage_count -= 1
 
         posts_db.query(PostKeywordLink).filter(
             PostKeywordLink.post_id == post.post_id
         ).delete()
+        
         for kw_str in payload.keywords:
             clean_kw = kw_str.strip().lower()
             keyword_record = posts_db.query(KeywordRecord).filter(
@@ -224,6 +250,15 @@ class PostService:
             and current_user.role.name not in ["admin", "editor"]
         ):
             raise HTTPException(status_code=403, detail="Not authorized to delete this post")
+
+        # FIX: Decrement counts before deleting the post
+        for link in post.category_links:
+            if link.category and link.category.usage_count > 0:
+                link.category.usage_count -= 1
+                
+        for link in post.keyword_links:
+            if link.keyword and link.keyword.usage_count > 0:
+                link.keyword.usage_count -= 1
 
         posts_db.delete(post)
         posts_db.commit()
