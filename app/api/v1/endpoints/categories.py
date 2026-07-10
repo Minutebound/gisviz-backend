@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 from app.db.database import get_posts_db
-from app.db.models import CategoryRecord, PendingCategoryRecord, PlatformUserRecord
+from app.db.models import CategoryRecord, PendingCategoryRecord, PlatformUserRecord, PostCategoryLink
 from app.schemas.post_schema import CategoryData, PendingCategoryData, PendingCategorySuggestion
 from app.services.auth_service import get_current_authenticated_user, RoleChecker
 
@@ -159,9 +159,25 @@ def delete_category(
     db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
 ):
-    cat = db.query(CategoryRecord).filter(CategoryRecord.category_id == category_id).first()
+    cat = db.query(CategoryRecord).filter(
+        CategoryRecord.category_id == category_id
+    ).first()
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
+ 
+    label = cat.label   # capture before delete
+ 
+    # 1. Explicitly remove all post→category links for this category.
+    #    synchronize_session=False skips updating the in-session identity map —
+    #    safe here because we're deleting the parent immediately after.
+    db.query(PostCategoryLink).filter(
+        PostCategoryLink.category_id == category_id
+    ).delete(synchronize_session=False)
+ 
+    # 2. Now delete the category row itself.
     db.delete(cat)
+ 
+    # 3. Single commit — both operations land atomically.
     db.commit()
-    return {"status": "deleted", "label": cat.label}
+ 
+    return {"status": "deleted", "label": label}

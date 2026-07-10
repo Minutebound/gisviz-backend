@@ -5,6 +5,8 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi_cache.decorator import cache
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
+import re
+import secrets
 
 from app.db.database import get_posts_db, get_users_db
 from app.db.models import (
@@ -58,7 +60,6 @@ async def fetch_post_stream(
 #  SEARCH
 # -------------------------------------------------------------------
 @router.get("/search", response_model=List[PostResponse])
-@cache(expire=SEARCH_TTL)
 async def search_post_stream(
     q: str = Query(..., min_length=1),
     skip: int = Query(0, ge=0),
@@ -472,3 +473,24 @@ async def get_comments(
         else:
             top_level.append(node)
     return top_level
+
+## Slug-based post retrieval for public sharing (SEO method instead of UUID)
+
+@router.get("/slug/{slug}")
+def get_post_by_slug(slug: str, db: Session = Depends(get_users_db)):
+    # Assuming your model is named PostRecord. Adjust if it is named differently.
+    post = db.query(PostRecord).filter(PostRecord.share_slug == slug).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Return the post along with the publisher's handle
+    return {
+        "post_id": post.post_id,
+        "title": post.title,
+        "share_slug": post.share_slug,
+        "excerpt": post.excerpt, # Ensure your model has an excerpt or description field
+        "visual_image_path": post.visual_image_path,
+        "created_timestamp": post.created_timestamp,
+        "publisher_handle": post.publisher.user_handle if post.publisher else "anonymous",
+        # ... add any other fields your frontend post page requires
+    }

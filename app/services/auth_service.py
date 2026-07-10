@@ -3,6 +3,7 @@ import string
 import secrets
 import smtplib
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -19,9 +20,6 @@ from app.db.database import get_users_db
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# auto_error=False means FastAPI returns None (not 401) when the
-# Authorization header is missing — required for optional auth on
-# public endpoints that annotate per-user state when logged in.
 oauth2_scheme = OAuth2PasswordBearer(
     tokenUrl=f"{settings.API_V1_STR}/auth/login",
     auto_error=False,
@@ -35,7 +33,6 @@ class AuthenticationService:
     # ----------------------------------------------------------------
     # Password helpers
     # ----------------------------------------------------------------
-
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
         return pwd_context.verify(plain_password, hashed_password)
 
@@ -43,9 +40,8 @@ class AuthenticationService:
         return pwd_context.hash(password)
 
     # ----------------------------------------------------------------
-    # JWT
+    # JWT & Roles
     # ----------------------------------------------------------------
-
     def create_access_token(self, subject: str) -> str:
         expire = datetime.now(timezone.utc) + timedelta(
             minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES
@@ -56,17 +52,12 @@ class AuthenticationService:
             algorithm=settings.JWT_ALGORITHM,
         )
 
-    # ----------------------------------------------------------------
-    # Role resolution
-    # ----------------------------------------------------------------
-
     def _resolve_default_role(self, db: Session) -> RoleRecord | None:
         return db.query(RoleRecord).filter(RoleRecord.name == DEFAULT_ROLE_NAME).first()
 
     # ----------------------------------------------------------------
     # Token / OTP generators
     # ----------------------------------------------------------------
-
     def _generate_otp(self) -> str:
         return "".join(random.choices(string.digits, k=6))
 
@@ -74,76 +65,87 @@ class AuthenticationService:
         return secrets.token_urlsafe(32)
 
     # ----------------------------------------------------------------
-    # Environment helpers — driven by APP_ENV baked into the Docker image.
-    #
-    #   target: dev  → ENV APP_ENV=development in Dockerfile
-    #   target: prod → ENV APP_ENV=production  in Dockerfile
-    #
-    # This means the behaviour is tied to the build target, not to any
-    # value in .env.backend, so they can never be out of sync.
+    # Environment & UI helpers
     # ----------------------------------------------------------------
-
     @property
     def _is_prod(self) -> bool:
         """True only when the prod Docker image is running."""
         return settings.APP_ENV == "production"
 
-    def _email(self, to_email: str, subject: str, body: str) -> None:
-        """
-        Central email router.
-        - dev / staging  → simulate_send_email() (prints to console, no SMTP needed)
-        - production     → send_email()           (real SMTP, raises 500 on failure)
-        """
-        if self._is_prod:
-            self.send_email(to_email, subject, body)
-        else:
-            self.simulate_send_email(to_email, subject, body)
-
     def _expose_dev_field(self, value: str) -> Optional[str]:
-        """
-        Returns value in dev/staging so the UI can display it.
-        Returns None in production so it is never included in any response.
-        Callers must check for None before adding the key to a response dict.
-        """
+        """Returns value in dev/staging, None in production."""
         return None if self._is_prod else value
 
     # ----------------------------------------------------------------
-    # Email backends
+    # Email Engine (HTML + Plaintext)
     # ----------------------------------------------------------------
+    def _build_html_email(self, title: str, content_html: str) -> str:
+        """Wraps email content in a branded HTML template."""
+        logo_url = "https://ias.uicdn.net/fileadmin/IONOS/user_upload/shield_user_red.svg?h=75d2ab219a0a2cf21e516a3ac3b905c2c4088523"
+        
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #f9fafb; padding: 40px 20px; margin: 0; }}
+                .container {{ max-width: 600px; margin: 0 auto; background-color: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }}
+                .header {{ background-color: #111827; padding: 20px; text-align: center; color: #ffffff; font-weight: bold; letter-spacing: 1px; font-family: monospace; }}
+                .content {{ padding: 30px; color: #374151; line-height: 1.6; font-size: 16px; }}
+                .footer {{ background-color: #f3f4f6; padding: 30px; text-align: center; border-top: 1px solid #e5e7eb; }}
+                .logo {{ max-width: 40px; height: auto; margin-bottom: 10px; opacity: 0.8; }}
+                .footer-text {{ font-size: 12px; color: #6b7280; font-family: monospace; margin: 0; }}
+                .otp-box {{ display: inline-block; background: #f3f4f6; border: 1px solid #e5e7eb; padding: 15px 30px; font-size: 24px; font-weight: bold; letter-spacing: 5px; font-family: monospace; color: #F54438; border-radius: 6px; margin: 20px 0; }}
+                .btn {{ display: inline-block; background-color: #f3f4f6; color: #F54438; text-decoration: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; margin: 20px 0; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">{title}</div>
+                <div class="content">
+                    {content_html}
+                </div>
+                <div class="footer">
+                   <img src="{logo_url}" alt="Gisviz Logo" class="logo" style="filter: grayscale(100%);" />
+                    <p class="footer-text">© {datetime.now(timezone.utc).year} Gisviz. All rights reserved.</p>
+                    <p class="footer-text">This is an automated system message. Please do not reply.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
 
-    def simulate_send_email(self, email: str, subject: str, content: str) -> None:
-        """Dev-only — prints the email to stdout so you can read OTPs in the logs."""
-        print(f"\n[{datetime.now(timezone.utc)}] EMAIL TO: {email}")
-        print(f"SUBJECT: {subject}")
-        print(f"CONTENT:\n{content}\n")
+    def _email(self, to_email: str, subject: str, plain_body: str, html_body: str) -> None:
+        """Routes to console (dev) or SMTP (prod)."""
+        if self._is_prod:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = f"Gisviz Security <{settings.SMTP_USER}>"
+            msg["To"] = to_email
+            
+            msg.attach(MIMEText(plain_body, "plain"))
+            msg.attach(MIMEText(html_body, "html"))
 
-    def send_email(self, to_email: str, subject: str, body: str) -> None:
-        """Production — real SMTP send. Raises HTTP 500 on failure."""
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = settings.SMTP_USER
-        msg["To"] = to_email
-        try:
-            with smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT) as server:
-                server.login(settings.SMTP_USER, settings.SMTP_PASS)
-                server.sendmail(settings.SMTP_USER, to_email, msg.as_string())
-        except Exception as e:
-            print(f"SMTP Error: {e}")
-            raise HTTPException(status_code=500, detail="Failed to send email")
+            try:
+                with smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT) as server:
+                    server.login(settings.SMTP_USER, settings.SMTP_PASS)
+                    server.sendmail(settings.SMTP_USER, to_email, msg.as_string())
+            except Exception as e:
+                print(f"SMTP Error: {e}")
+                raise HTTPException(status_code=500, detail="Failed to send email")
+        else:
+            print(f"\n[{datetime.now(timezone.utc)}] EMAIL TO: {to_email}")
+            print(f"SUBJECT: {subject}")
+            print(f"CONTENT:\n{plain_body}\n")
 
     # ----------------------------------------------------------------
     # Auth flows
     # ----------------------------------------------------------------
-
     def register_new_user(self, db: Session, payload: UserRegistrationPayload):
-        if db.query(PlatformUserRecord).filter(
-            PlatformUserRecord.email_address == payload.email_address
-        ).first():
+        if db.query(PlatformUserRecord).filter(PlatformUserRecord.email_address == payload.email_address).first():
             raise HTTPException(status_code=400, detail="Email already registered")
-
-        if db.query(PlatformUserRecord).filter(
-            PlatformUserRecord.user_handle == payload.user_handle
-        ).first():
+        if db.query(PlatformUserRecord).filter(PlatformUserRecord.user_handle == payload.user_handle).first():
             raise HTTPException(status_code=400, detail="Handle already taken")
 
         default_role = self._resolve_default_role(db)
@@ -162,35 +164,70 @@ class AuthenticationService:
         db.commit()
         db.refresh(new_user)
 
-        # dev  → prints OTP to console
-        # prod → sends real email, OTP never leaves the server
-        self._email(
-            to_email=payload.email_address,
-            subject="Verify your Account",
-            body=f"Your verification code is: {otp}. It expires in 15 minutes.",
+        html_content = self._build_html_email(
+            title="Account Verification",
+            content_html=f"""
+                <p>Hello <strong>@{payload.user_handle}</strong>,</p>
+                <p>Thank you for registering. Please use the verification code below to activate your account:</p>
+                <div style="text-align: center;"><div class="otp-box">{otp}</div></div>
+                <p><em>This code will expire in 15 minutes.</em></p>
+            """
         )
 
-        # dev_otp is None in prod — the endpoint checks before adding it to the response
+        self._email(
+            to_email=payload.email_address,
+            subject="Verify your Gisviz Account",
+            plain_body=f"Your verification code is: {otp}. It expires in 15 minutes.",
+            html_body=html_content
+        )
+
         return {"user": new_user, "dev_otp": self._expose_dev_field(otp)}
 
+    def resend_verification_otp(self, db: Session, email_address: str):
+        """Generates and sends a fresh OTP for an unverified user."""
+        user = db.query(PlatformUserRecord).filter(PlatformUserRecord.email_address == email_address).first()
+        
+        # Don't reveal if email exists to prevent enumeration
+        if not user or user.is_verified == 1:
+            return {"status": "If the account exists and is unverified, a new code has been sent."}
+
+        otp = self._generate_otp()
+        user.verification_otp = otp
+        user.otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+        db.commit()
+
+        html_content = self._build_html_email(
+            title="New Verification Code",
+            content_html=f"""
+                <p>Hello <strong>@{user.user_handle}</strong>,</p>
+                <p>You requested a new verification code. Please use the code below to activate your account:</p>
+                <div style="text-align: center;"><div class="otp-box">{otp}</div></div>
+                <p><em>This code will expire in 15 minutes.</em></p>
+            """
+        )
+
+        self._email(
+            to_email=email_address,
+            subject="Your new Gisviz Verification Code",
+            plain_body=f"Your new verification code is: {otp}. It expires in 15 minutes.",
+            html_body=html_content
+        )
+
+        return {
+            "status": "If the account exists and is unverified, a new code has been sent.",
+            "dev_otp": self._expose_dev_field(otp)
+        }
+
     def verify_email(self, db: Session, email_address: str, otp: str):
-        user = db.query(PlatformUserRecord).filter(
-            PlatformUserRecord.email_address == email_address
-        ).first()
+        user = db.query(PlatformUserRecord).filter(PlatformUserRecord.email_address == email_address).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-
         if user.is_verified == 1 and user.is_active == 1:
             return {"status": "Already verified"}
-
         if user.verification_otp != otp:
             raise HTTPException(status_code=400, detail="Invalid OTP")
-
         if user.otp_expires_at and datetime.now(timezone.utc) > user.otp_expires_at:
-            raise HTTPException(
-                status_code=400,
-                detail="OTP has expired. Please request a new one.",
-            )
+            raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
 
         user.is_verified = 1
         user.is_active = 1
@@ -201,11 +238,7 @@ class AuthenticationService:
         return {"status": "Email verified successfully", "reactivated": True}
 
     def initiate_password_reset(self, db: Session, email_address: str):
-        user = db.query(PlatformUserRecord).filter(
-            PlatformUserRecord.email_address == email_address
-        ).first()
-
-        # Always return the same message — prevents user enumeration
+        user = db.query(PlatformUserRecord).filter(PlatformUserRecord.email_address == email_address).first()
         if not user:
             return {"status": "If the email exists, a reset link has been sent."}
 
@@ -214,29 +247,32 @@ class AuthenticationService:
         user.reset_token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
         db.commit()
 
-        # dev  → uses localhost:3000 (from FRONTEND_URL default), prints link to console
-        # prod → uses https://yourdomain.com (from FRONTEND_URL in .env.backend), sends real email
         reset_link = f"{settings.FRONTEND_URL}/reset-password?token={token}"
+        
+        html_content = self._build_html_email(
+            title="Password Reset Request",
+            content_html=f"""
+                <p>Hello <strong>@{user.user_handle}</strong>,</p>
+                <p>We received a request to reset your password. Click below to set a new password:</p>
+                <div style="text-align: center;"><a href="{reset_link}" class="btn">Reset Password</a></div>
+                <p>Or paste this link into your browser: <br/><span style="font-size:12px;color:#6b7280;">{reset_link}</span></p>
+            """
+        )
+
         self._email(
             to_email=email_address,
-            subject="Password Reset Request",
-            body=(
-                f"Click here to reset your password:\n{reset_link}\n\n"
-                "This link expires in 30 minutes.\n"
-                "If you did not request this, you can safely ignore this email."
-            ),
+            subject="Gisviz Password Reset Request",
+            plain_body=f"Reset your password here: {reset_link}",
+            html_body=html_content
         )
 
         return {
             "status": "If the email exists, a reset link has been sent.",
-            # dev_token is None in prod — endpoint checks before adding to response
             "dev_token": self._expose_dev_field(token),
         }
 
     def execute_password_reset(self, db: Session, token: str, new_password: str):
-        user = db.query(PlatformUserRecord).filter(
-            PlatformUserRecord.password_reset_token == token
-        ).first()
+        user = db.query(PlatformUserRecord).filter(PlatformUserRecord.password_reset_token == token).first()
         if not user:
             raise HTTPException(status_code=400, detail="Invalid reset token")
         if user.reset_token_expires_at and datetime.now(timezone.utc) > user.reset_token_expires_at:
@@ -256,7 +292,7 @@ auth_service = AuthenticationService()
 
 
 # ----------------------------------------------------------------
-# FastAPI dependencies
+# FastAPI dependencies (THESE WERE MISSING!)
 # ----------------------------------------------------------------
 
 def get_current_authenticated_user(

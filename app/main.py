@@ -35,6 +35,7 @@ from app.db.models import (
 
 from app.api.v1.endpoints import auth, posts, categories, follows, users, uploads, search
 from app.api.v1.endpoints import admin as admin_endpoints
+from app.api.v1.endpoints import support as support_endpoints
 from app.services.auth_service import auth_service
 import uuid
 
@@ -95,7 +96,8 @@ app.include_router(follows.router,         prefix=f"{settings.API_V1_STR}/networ
 app.include_router(uploads.router,         prefix=f"{settings.API_V1_STR}/uploads",    tags=["Uploads"])
 app.include_router(search.router,          prefix=f"{settings.API_V1_STR}/search",     tags=["Search"])
 app.include_router(admin_endpoints.router, prefix=f"{settings.API_V1_STR}/admin",      tags=["Admin"])
-
+app.include_router(support_endpoints.router,  prefix=f"{settings.API_V1_STR}/support", tags=["Support"])
+                   
 @app.get("/")
 def root_health_check():
     return {"status": "operational", "engine": "gisviz-api", "version": settings.VERSION}

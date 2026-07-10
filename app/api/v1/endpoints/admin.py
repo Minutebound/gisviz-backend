@@ -85,14 +85,16 @@ from app.db.models import (
     FollowCurrentRecord, PostReportRecord,
     # Analytics warehouse
     FactDailySnapshot, FactCategoryDaily, DimCategory,
-    EtlRunLog, FactWeeklyDelta, FactTopPost, FactTopUser, FactTopCommenter,
+    EtlRunLog, 
     # Admin audit
-    AdminActionLog, RoleChangeHistory, ReportResolution,
-    # Audit helpers (moved from app/analytics/audit.py)
+    AdminActionLog, RoleChangeHistory, ReportResolution, SupportTicketRecord,
     log_admin_action, log_role_change, log_report_resolution,
 )
 from app.services.auth_service import RoleChecker
 from app.core.page_registry import PAGE_REGISTRY, PERMISSION_CATALOG, role_can_access
+import io
+import csv
+from fastapi.responses import StreamingResponse
 
 log = logging.getLogger("gisviz.admin")
 
@@ -447,43 +449,118 @@ def delete_user(
     return {"message": f"User {snapshot['user_handle']} permanently deleted"}
 
 
+# ════════════════════════════════════════════════════════════════════
+#  UNVERIFIED USERS
+# ════════════════════════════════════════════════════════════════════
+ 
 @router.get("/users/unverified")
 def list_unverified_users(
-    older_than_days: int = Query(7, ge=1),
+    older_than_days: Optional[int] = Query(None, ge=1),   # None = no filter
     users_db: Session = Depends(get_users_db),
     _: PlatformUserRecord = Depends(ADMIN),
 ):
-    cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
-    users  = (users_db.query(PlatformUserRecord)
-              .filter(PlatformUserRecord.is_verified == 0,
-                      PlatformUserRecord.created_timestamp <= cutoff)
-              .order_by(PlatformUserRecord.created_timestamp.asc()).all())
-    return [{"user_id": str(u.user_id), "user_handle": u.user_handle,
-             "email_address": u.email_address, "created_timestamp": u.created_timestamp}
-            for u in users]
-
-
+    """
+    List all unverified accounts.
+    older_than_days is optional — omit it to get the full unverified list.
+    """
+    query = users_db.query(PlatformUserRecord).filter(
+        PlatformUserRecord.is_verified == 0
+    )
+    if older_than_days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+        query = query.filter(PlatformUserRecord.created_timestamp <= cutoff)
+ 
+    users = query.order_by(PlatformUserRecord.created_timestamp.asc()).all()
+ 
+    return [
+        {
+            "user_id":           str(u.user_id),
+            "user_handle":       u.user_handle,
+            "email_address":     u.email_address,
+            "role_name":         u.role.name if u.role else None,
+            "created_timestamp": u.created_timestamp,
+        }
+        for u in users
+    ]
+ 
+ 
+@router.get("/users/unverified/export")
+def export_unverified_csv(
+    older_than_days: Optional[int] = Query(None, ge=1),
+    users_db: Session  = Depends(get_users_db),
+    _: PlatformUserRecord = Depends(ADMIN),
+):
+    """
+    Download all unverified users as a CSV file.
+    Same optional filter as the list endpoint.
+    """
+    query = users_db.query(PlatformUserRecord).filter(
+        PlatformUserRecord.is_verified == 0
+    )
+    if older_than_days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+        query = query.filter(PlatformUserRecord.created_timestamp <= cutoff)
+ 
+    users = query.order_by(PlatformUserRecord.created_timestamp.asc()).all()
+ 
+    # Build CSV in memory
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "user_id", "user_handle", "email_address",
+        "role", "registered_at",
+    ])
+    for u in users:
+        writer.writerow([
+            str(u.user_id),
+            u.user_handle,
+            u.email_address,
+            u.role.name if u.role else "",
+            u.created_timestamp.isoformat() if u.created_timestamp else "",
+        ])
+    output.seek(0)
+ 
+    filename = "unverified_users.csv"
+    if older_than_days:
+        filename = f"unverified_users_older_than_{older_than_days}d.csv"
+ 
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+ 
+ 
 @router.put("/users/{user_id}/verify")
 def manually_verify_user(
-    user_id: uuid.UUID,
-    request: Request,
+    user_id: uuid.UUID, request: Request,
     users_db: Session = Depends(get_users_db),
     admin_db: Session = Depends(get_admin_db),
     admin: PlatformUserRecord = Depends(ADMIN),
 ):
-    user = users_db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == user_id).first()
+    # ← this function is UNCHANGED, keep it as-is
+    user = users_db.query(PlatformUserRecord).filter(
+        PlatformUserRecord.user_id == user_id
+    ).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     user.is_verified = 1
     user.verification_otp = None
     user.otp_expires_at   = None
     users_db.commit()
-    log_admin_action(admin_db, admin_user_id=admin.user_id, admin_handle=admin.user_handle,
-                     action_type="user.verify", target_type="user", target_id=str(user_id),
-                     payload={"user_handle": user.user_handle}, ip_address=_ip(request))
+    log_admin_action(
+        admin_db,
+        admin_user_id = admin.user_id,
+        admin_handle  = admin.user_handle,
+        action_type   = "user.verify",
+        target_type   = "user",
+        target_id     = str(user_id),
+        payload       = {"user_handle": user.user_handle},
+        ip_address    = _ip(request),
+    )
     return {"status": "verified", "user_handle": user.user_handle}
-
-
+ 
+ 
 @router.delete("/users/unverified/bulk")
 def bulk_delete_unverified(
     request: Request,
@@ -492,16 +569,26 @@ def bulk_delete_unverified(
     admin_db: Session = Depends(get_admin_db),
     admin: PlatformUserRecord = Depends(ADMIN),
 ):
+    # ← this function is UNCHANGED, keep it as-is
     cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
-    count  = (users_db.query(PlatformUserRecord)
-              .filter(PlatformUserRecord.is_verified == 0,
-                      PlatformUserRecord.created_timestamp <= cutoff)
-              .delete(synchronize_session=False))
+    count = (
+        users_db.query(PlatformUserRecord)
+        .filter(
+            PlatformUserRecord.is_verified == 0,
+            PlatformUserRecord.created_timestamp <= cutoff,
+        )
+        .delete(synchronize_session=False)
+    )
     users_db.commit()
-    log_admin_action(admin_db, admin_user_id=admin.user_id, admin_handle=admin.user_handle,
-                     action_type="user.bulk_delete_unverified", target_type="user",
-                     payload={"older_than_days": older_than_days, "deleted_count": count},
-                     ip_address=_ip(request))
+    log_admin_action(
+        admin_db,
+        admin_user_id = admin.user_id,
+        admin_handle  = admin.user_handle,
+        action_type   = "user.bulk_delete_unverified",
+        target_type   = "user",
+        payload       = {"older_than_days": older_than_days, "deleted_count": count},
+        ip_address    = _ip(request),
+    )
     return {"status": "deleted", "count": count}
 
 
@@ -994,3 +1081,139 @@ def access_matrix(
             "description": page.description, "access": access,
         })
     return {"roles": role_cols, "pages": rows}
+
+# ════════════════════════════════════════════════════════════════════
+#  SUPPORT TICKETS
+# ════════════════════════════════════════════════════════════════════
+class TicketStatusPayload(BaseModel):
+    status: str   # open | in_progress | resolved | closed
+
+@router.get("/tickets")
+def list_tickets(
+    skip:     int           = Query(0,    ge=0),
+    limit:    int           = Query(50,   ge=1, le=200),
+    status:   Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    q:        Optional[str] = Query(None),
+    users_db: Session       = Depends(get_users_db),
+    _:        PlatformUserRecord = Depends(ADMIN_EDITOR),
+):
+    """
+    Paginated ticket list.
+    Filter by status (open | in_progress | resolved | closed),
+    category (bug | billing | account | feature | other),
+    or free-text search across subject + description.
+    """
+    query = users_db.query(SupportTicketRecord)
+    if status:
+        query = query.filter(SupportTicketRecord.status == status)
+    if category:
+        query = query.filter(SupportTicketRecord.category == category)
+    if q:
+        query = query.filter(
+            SupportTicketRecord.subject.ilike(f"%{q}%") |
+            SupportTicketRecord.description.ilike(f"%{q}%")
+        )
+    total   = query.count()
+    tickets = query.order_by(desc(SupportTicketRecord.created_timestamp)).offset(skip).limit(limit).all()
+ 
+    return {
+        "total": total,
+        "tickets": [
+            {
+                "ticket_id":       str(t.ticket_id),
+                "user_id":         str(t.user_id) if t.user_id else None,
+                "user_handle":     t.user.user_handle if t.user else None,
+                "contact_email":   t.contact_email,
+                "category":        t.category,
+                "subject":         t.subject,
+                "description":     t.description,
+                "status":          t.status,
+                "created_timestamp": t.created_timestamp,
+                "updated_timestamp": t.updated_timestamp,
+            }
+            for t in tickets
+        ],
+    }
+ 
+ 
+@router.put("/tickets/{ticket_id}/status")
+def update_ticket_status(
+    ticket_id: uuid.UUID,
+    payload:   TicketStatusPayload,
+    request:   Request,
+    users_db:  Session = Depends(get_users_db),
+    admin_db:  Session = Depends(get_admin_db),
+    admin:     PlatformUserRecord = Depends(ADMIN_EDITOR),
+):
+    VALID = {"open", "in_progress", "resolved", "closed"}
+    if payload.status not in VALID:
+        raise HTTPException(
+            status_code=400,
+            detail=f"status must be one of: {', '.join(sorted(VALID))}",
+        )
+    ticket = users_db.query(SupportTicketRecord).filter(
+        SupportTicketRecord.ticket_id == ticket_id
+    ).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+ 
+    old_status     = ticket.status
+    ticket.status  = payload.status
+    users_db.commit()
+ 
+    log_admin_action(
+        admin_db,
+        admin_user_id  = admin.user_id,
+        admin_handle   = admin.user_handle,
+        action_type    = "ticket.status_change",
+        target_type    = "ticket",
+        target_id      = str(ticket_id),
+        payload        = {
+            "subject":     ticket.subject,
+            "old_status":  old_status,
+            "new_status":  payload.status,
+        },
+        ip_address = _ip(request),
+    )
+    return {
+        "ticket_id": str(ticket_id),
+        "status":    ticket.status,
+        "subject":   ticket.subject,
+    }
+ 
+ 
+@router.delete("/tickets/{ticket_id}")
+def delete_ticket(
+    ticket_id: uuid.UUID,
+    request:   Request,
+    users_db:  Session = Depends(get_users_db),
+    admin_db:  Session = Depends(get_admin_db),
+    admin:     PlatformUserRecord = Depends(ADMIN),   # admin-only delete
+):
+    ticket = users_db.query(SupportTicketRecord).filter(
+        SupportTicketRecord.ticket_id == ticket_id
+    ).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+ 
+    snapshot = {
+        "subject":  ticket.subject,
+        "category": ticket.category,
+        "status":   ticket.status,
+        "user_id":  str(ticket.user_id) if ticket.user_id else None,
+    }
+    users_db.delete(ticket)
+    users_db.commit()
+ 
+    log_admin_action(
+        admin_db,
+        admin_user_id = admin.user_id,
+        admin_handle  = admin.user_handle,
+        action_type   = "ticket.delete",
+        target_type   = "ticket",
+        target_id     = str(ticket_id),
+        payload       = snapshot,
+        ip_address    = _ip(request),
+    )
+    return {"status": "deleted", "ticket_id": str(ticket_id)}
