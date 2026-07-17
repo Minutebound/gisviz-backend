@@ -25,6 +25,8 @@ ENV/
 !.env.*.example
 *.pem
 *.key
+# Ignore local uploads files (No more in Volume)
+uploads/
 
 # ── FastAPI / app runtime ─────────────────────────────────────────
 *.log

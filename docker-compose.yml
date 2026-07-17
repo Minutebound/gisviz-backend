@@ -168,10 +168,10 @@ services:
     env_file:
       - .env.backend
     ports:
-      - "8000:8000"
+      - "8001:8001"
     volumes:
       - ./app:/app/app
-      - uploads-data:/app/uploads
+      - ./uploads:/app/uploads
     depends_on:
       users-db:
         condition: service_healthy
@@ -241,5 +241,3 @@ volumes:
     name: gisviz-redis-insight-data
   pgadmin-data:
     name: gisviz-pgadmin-data
-  uploads-data:
-    name: gisviz-uploads-data

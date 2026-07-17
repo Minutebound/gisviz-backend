@@ -328,6 +328,7 @@ async def set_post_status(
     posts_db.commit()
     return {"post_id": str(post_id), "is_active": post.is_active}
 
+
 # -------------------------------------------------------------------
 #  MODERATION
 # -------------------------------------------------------------------
@@ -345,6 +346,33 @@ async def report_post(
     posts_db.refresh(report)
     return report
 
+@router.post("/{post_id}/missing-visual")
+def report_missing_visual(post_id: str, db: Session = Depends(get_posts_db)):
+    """
+    Self-healing endpoint triggered by the frontend when an image 404s.
+    Verifies the file is actually missing before deactivating the post.
+    """
+    post = db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    if not post.visual_image_path:
+        return {"status": "ignored", "detail": "Post does not require a visual."}
+
+    # Remove the leading slash to make it a valid local path (e.g., "uploads/visuals/...")
+    local_path = post.visual_image_path.lstrip("/")
+    
+    # SECURITY CHECK: Verify the file is actually missing!
+    if os.path.exists(local_path) and os.path.isfile(local_path):
+        # A user's browser glitched, or someone is trying to maliciously delete posts.
+        return {"status": "ignored", "detail": "Image exists on server, ignoring request."}
+    
+    # If the file is genuinely missing, auto-deactivate
+    post.is_active = 0 # Use False if your DB column is a Boolean
+    db.commit()
+    
+    return {"status": "deactivated", "detail": "Missing visual confirmed, post deactivated."}
 
 @router.get("/reports/all", response_model=List[PostReportResponse])
 async def get_reports(
