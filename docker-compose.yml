@@ -162,7 +162,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: prod
+      target: dev
     container_name: gisviz-api
     restart: always
     env_file:
@@ -219,8 +219,8 @@ services:
       - loki
     networks:
       - gisviz-network
-
-
+    
+  
 networks:
   gisviz-network:
     name: gisviz-network

@@ -2,6 +2,7 @@ import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi_cache import FastAPICache
 from fastapi_cache.decorator import cache
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
@@ -29,8 +30,26 @@ router = APIRouter()
 
 # TTL constants in seconds
 STREAM_TTL = 30
-POST_TTL   = 60
-SEARCH_TTL = 60
+POST_TTL   = 86400
+SEARCH_TTL = 86400
+
+
+# ── Cache helpers ─────────────────────────────────────────────────────────────
+
+async def _invalidate_comments(post_id: str) -> None:
+    try:
+        await FastAPICache.get_backend().clear(key=f"gisviz-cache:posts:comments:{post_id}")
+    except Exception as exc:
+        print(f"[cache] comments invalidation failed for {post_id}: {exc}")
+
+
+async def _invalidate_user_posts(handle: str) -> None:
+    try:
+        backend = FastAPICache.get_backend()
+        for skip in ("0", "50", "100"):
+            await backend.clear(key=f"gisviz-cache:posts:user:{handle.lower()}:{skip}:50")
+    except Exception as exc:
+        print(f"[cache] user posts invalidation failed for {handle}: {exc}")
 
 
 # -------------------------------------------------------------------
@@ -55,6 +74,59 @@ async def fetch_post_stream(
         current_user_id=current_user_id,
     )
 
+# -------------------------------------------------------------------
+#  TRENDING (IDs only — kept for ETL / internal use)
+# -------------------------------------------------------------------
+@router.get("/trending", response_model=List[str])
+async def trending_posts(n: int = Query(10, ge=1, le=50)):
+    trending = cache_service.get("trending_posts")
+    return trending[:n] if trending else []
+
+
+# -------------------------------------------------------------------
+#  TRENDING FULL — returns complete PostResponse[]
+#
+#  Strategy:
+#  1. Try Redis "trending_posts" key (list of post_id strings set by ETL)
+#  2. If cache hit → fetch those specific posts from DB, preserve order
+#  3. If cache miss (ETL hasn't run yet) → fall back to top-N by
+#     total_likes_count directly from DB so the tab is never empty
+#
+#  Per-user is_liked / is_bookmarked included when JWT present.
+#  Client-side 2-minute TTL in api.ts prevents hammering.
+# -------------------------------------------------------------------
+@router.get("/trending-full", response_model=List[PostResponse])
+async def trending_posts_full(
+    n: int = Query(20, ge=1, le=50),
+    posts_db: Session = Depends(get_posts_db),
+    users_db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
+):
+    current_user_id = current_user.user_id if current_user else None
+    trending_ids = cache_service.get("trending_posts")
+
+    if trending_ids:
+        id_list = [uuid.UUID(i) for i in trending_ids[:n]]
+        posts = posts_db.query(PostRecord).filter(
+            PostRecord.post_id.in_(id_list),
+            PostRecord.is_active == 1,   
+        ).all()
+        # preserve Redis order
+        order = {pid: idx for idx, pid in enumerate(id_list)}
+        posts = sorted(posts, key=lambda p: order.get(p.post_id, 999))
+    else:
+        posts = (
+            posts_db.query(PostRecord)
+            .filter(PostRecord.is_active == 1)   
+            .order_by(desc(PostRecord.total_likes_count))
+            .limit(n)
+            .all()
+        )
+
+    return [
+        post_service._format_post_response(posts_db, users_db, p, current_user_id)
+        for p in posts
+    ]
 
 # -------------------------------------------------------------------
 #  SEARCH
@@ -84,17 +156,6 @@ async def search_post_stream(
 
 
 # -------------------------------------------------------------------
-#  TRENDING
-# -------------------------------------------------------------------
-@router.get("/trending", response_model=List[str])
-async def trending_posts(n: int = Query(10, ge=1, le=50)):
-    trending = cache_service.get("trending_posts")
-    return trending[:n] if trending else []
-
-
-
-
-# -------------------------------------------------------------------
 #  USER POSTS
 # -------------------------------------------------------------------
 @router.get("/user/{handle}", response_model=List[PostResponse])
@@ -111,12 +172,21 @@ async def get_user_posts(
     ).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    posts = (
-        posts_db.query(PostRecord)
-        .filter(PostRecord.publisher_user_id == user.user_id)
-        .order_by(PostRecord.created_timestamp.desc())
-        .offset(skip).limit(limit).all()
+
+    query = posts_db.query(PostRecord).filter(
+        PostRecord.publisher_user_id == user.user_id
     )
+
+    # Profile owner sees all their posts (including inactive).
+    # Everyone else only sees active posts.
+    is_own_profile = (
+        current_user is not None
+        and current_user.user_id == user.user_id
+    )
+    if not is_own_profile:
+        query = query.filter(PostRecord.is_active == 1)
+
+    posts = query.order_by(PostRecord.created_timestamp.desc()).offset(skip).limit(limit).all()
     current_user_id = current_user.user_id if current_user else None
     return [
         post_service._format_post_response(posts_db, users_db, p, current_user_id)
@@ -175,7 +245,7 @@ async def get_user_bookmarks(
 #  all users — @cache omitted. Client TTL handles deduplication.
 # -------------------------------------------------------------------
 @router.get("/{post_id}", response_model=PostResponse)
-async def get_single_post(
+async def get_post(
     post_id: uuid.UUID,
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
@@ -184,6 +254,8 @@ async def get_single_post(
     post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
+    if post.is_active != 1:
+        raise HTTPException(status_code=404, detail="Post not found")  # treat inactive as non-existent publicly
     current_user_id = current_user.user_id if current_user else None
     return post_service._format_post_response(posts_db, users_db, post, current_user_id)
 
@@ -209,6 +281,7 @@ async def create_post(
             if not current_user.title:
                 current_user.title = "Platform Publisher"
     users_db.commit()
+    await _invalidate_user_posts(current_user.user_handle)
     return new_post
 
 
@@ -219,22 +292,41 @@ async def update_post(
     users_db: Session = Depends(get_users_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    return await post_service.update_post(
+    result = await post_service.update_post(
         posts_db=posts_db, users_db=users_db,
         post_id=post_id, payload=payload, current_user=current_user,
     )
+    await _invalidate_user_posts(current_user.user_handle)
+    return result
 
 
 @router.delete("/{post_id}")
 async def delete_post(
     post_id: uuid.UUID,
     posts_db: Session = Depends(get_posts_db),
+    users_db: Session = Depends(get_users_db),    # ← ADD this dependency
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
     return await post_service.delete_post(
-        posts_db=posts_db, post_id=post_id, current_user=current_user,
+        posts_db=posts_db,
+        post_id=post_id,
+        current_user=current_user,
+        users_db=users_db,    # ← pass it
     )
 
+@router.put("/{post_id}/status")
+async def set_post_status(
+    post_id: uuid.UUID,
+    is_active: bool,
+    posts_db: Session = Depends(get_posts_db),
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor"])),
+):
+    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    post.is_active = 1 if is_active else 0
+    posts_db.commit()
+    return {"post_id": str(post_id), "is_active": post.is_active}
 
 # -------------------------------------------------------------------
 #  MODERATION
@@ -293,7 +385,6 @@ async def list_keywords(
         ],
     }
 
-
 @router.delete("/keywords/{keyword_id}")
 async def delete_keyword(
     keyword_id: int,
@@ -338,6 +429,7 @@ async def update_report_status(
     report.status = payload.status
     posts_db.commit()
     return {"status": payload.status, "report_id": str(report_id)}
+
 
 # -------------------------------------------------------------------
 #  LIKES
@@ -428,6 +520,7 @@ async def add_comment(
     post.total_comments_count += 1
     posts_db.commit()
     posts_db.refresh(new_comment)
+    await _invalidate_comments(str(post_id))
     return CommentData(
         comment_id=new_comment.comment_id, post_id=new_comment.post_id,
         user_id=new_comment.user_id, publisher_handle=current_user.user_handle,
@@ -454,43 +547,35 @@ async def get_comments(
             PlatformUserRecord.user_id.in_(set(c.user_id for c in all_comments))
         ).all()
     }
-    comments_dict = {}
+
+    def _build(c: PostCommentRecord) -> CommentData:
+        author = commenter_map.get(c.user_id)
+        return CommentData(
+            comment_id=c.comment_id, post_id=c.post_id,
+            user_id=c.user_id,
+            publisher_handle=author.user_handle if author else "deleted_user",
+            publisher_avatar_path=author.avatar_path if author else None,
+            parent_comment_id=c.parent_comment_id, content=c.content,
+            is_edited=c.is_edited, created_timestamp=c.created_timestamp, replies=[],
+        )
+
+    top_level = {c.comment_id: _build(c) for c in all_comments if not c.parent_comment_id}
     for c in all_comments:
-        commenter = commenter_map.get(c.user_id)
-        comments_dict[c.comment_id] = {
-            "comment_id": c.comment_id, "post_id": c.post_id, "user_id": c.user_id,
-            "publisher_handle": commenter.user_handle if commenter else "deleted_user",
-            "publisher_avatar_path": commenter.avatar_path if commenter else None,
-            "parent_comment_id": c.parent_comment_id, "content": c.content,
-            "is_edited": bool(getattr(c, "is_edited", False)),
-            "created_timestamp": c.created_timestamp, "replies": [],
-        }
-    top_level = []
-    for c in all_comments:
-        node = comments_dict[c.comment_id]
-        if c.parent_comment_id and c.parent_comment_id in comments_dict:
-            comments_dict[c.parent_comment_id]["replies"].append(node)
-        else:
-            top_level.append(node)
-    return top_level
+        if c.parent_comment_id and c.parent_comment_id in top_level:
+            top_level[c.parent_comment_id].replies.append(_build(c))
+    return list(top_level.values())
 
 ## Slug-based post retrieval for public sharing (SEO method instead of UUID)
 
-@router.get("/slug/{slug}")
-def get_post_by_slug(slug: str, db: Session = Depends(get_users_db)):
-    # Assuming your model is named PostRecord. Adjust if it is named differently.
-    post = db.query(PostRecord).filter(PostRecord.share_slug == slug).first()
-    if not post:
+@router.get("/slug/{slug}", response_model=PostResponse)
+async def get_post_by_slug(
+    slug: str,
+    posts_db: Session = Depends(get_posts_db),
+    users_db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
+):
+    post = posts_db.query(PostRecord).filter(PostRecord.share_slug == slug).first()
+    if not post or post.is_active != 1:
         raise HTTPException(status_code=404, detail="Post not found")
-    
-    # Return the post along with the publisher's handle
-    return {
-        "post_id": post.post_id,
-        "title": post.title,
-        "share_slug": post.share_slug,
-        "excerpt": post.excerpt, # Ensure your model has an excerpt or description field
-        "visual_image_path": post.visual_image_path,
-        "created_timestamp": post.created_timestamp,
-        "publisher_handle": post.publisher.user_handle if post.publisher else "anonymous",
-        # ... add any other fields your frontend post page requires
-    }
+    current_user_id = current_user.user_id if current_user else None
+    return post_service._format_post_response(posts_db, users_db, post, current_user_id)

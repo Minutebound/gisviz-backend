@@ -1,5 +1,7 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi_cache import FastAPICache
+from fastapi_cache.decorator import cache
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import uuid
@@ -18,10 +20,22 @@ class CategoryUpdatePayload(BaseModel):
     slug: str
 
 
+# ── Cache helpers ─────────────────────────────────────────────────────────────
+_CATEGORY_LIST_KEY = "gisviz-cache:categories:list"
+
+async def _invalidate_category_list() -> None:
+    """Bust the public category list from Redis after any mutation."""
+    try:
+        await FastAPICache.get_backend().clear(key=_CATEGORY_LIST_KEY)
+    except Exception as exc:
+        print(f"[cache] category list invalidation failed: {exc}")
+
+
 # ── GET / ────────────────────────────────────────────────────────────
 
 @router.get("/", response_model=List[CategoryData])
-def get_categories(db: Session = Depends(get_posts_db)):
+@cache(expire=86400 , key_builder=lambda *a, **kw: _CATEGORY_LIST_KEY)
+async def get_categories(db: Session = Depends(get_posts_db)):
     return db.query(CategoryRecord).order_by(CategoryRecord.label).all()
 
 
@@ -71,7 +85,7 @@ def get_pending_categories(
 # ── POST /pending/{id}/approve ───────────────────────────────────────
 
 @router.post("/pending/{pending_id}/approve")
-def approve_pending_category(
+async def approve_pending_category(
     pending_id: uuid.UUID,
     db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor"])),
@@ -92,6 +106,7 @@ def approve_pending_category(
     pending.reviewed_timestamp = datetime.now(timezone.utc)
     db.commit()
     db.refresh(new_cat)
+    await _invalidate_category_list()
     return {"status": "approved", "category": {"category_id": new_cat.category_id, "slug": new_cat.slug, "label": new_cat.label}}
 
 
@@ -117,7 +132,7 @@ def reject_pending_category(
 # ── POST / — admin create category directly ──────────────────────────
 
 @router.post("/", response_model=CategoryData)
-def create_category(
+async def create_category(
     payload: CategoryUpdatePayload,
     db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin", "editor"])),
@@ -129,13 +144,14 @@ def create_category(
     db.add(cat)
     db.commit()
     db.refresh(cat)
+    await _invalidate_category_list()
     return cat
 
 
 # ── PUT /{category_id} — admin rename ───────────────────────────────
 
 @router.put("/{category_id}", response_model=CategoryData)
-def update_category(
+async def update_category(
     category_id: int,
     payload: CategoryUpdatePayload,
     db: Session = Depends(get_posts_db),
@@ -148,13 +164,14 @@ def update_category(
     cat.slug  = payload.slug.strip().lower().replace(" ", "-")
     db.commit()
     db.refresh(cat)
+    await _invalidate_category_list()
     return cat
 
 
 # ── DELETE /{category_id} — admin only ──────────────────────────────
 
 @router.delete("/{category_id}")
-def delete_category(
+async def delete_category(
     category_id: int,
     db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
@@ -179,5 +196,5 @@ def delete_category(
  
     # 3. Single commit — both operations land atomically.
     db.commit()
- 
+    await _invalidate_category_list()
     return {"status": "deleted", "label": label}

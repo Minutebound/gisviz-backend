@@ -5,11 +5,12 @@ from sqlalchemy.orm import Session
 from app.db.database import get_users_db
 from app.db.models import PlatformUserRecord, FollowCurrentRecord, FollowEventRecord
 from app.services.auth_service import get_current_authenticated_user
+from app.api.v0.endpoints.users import _invalidate_popular
 
 router = APIRouter()
 
 @router.post("/{target_id}/follow")
-def follow_user(
+async def follow_user(
     target_id: uuid.UUID,
     db: Session = Depends(get_users_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user)
@@ -35,11 +36,11 @@ def follow_user(
     current_user.following_count += 1
     target.follower_count += 1
     db.commit()
-    
+    await _invalidate_popular()
     return {"status": "followed"}
 
 @router.post("/{target_id}/unfollow")
-def unfollow_user(
+async def unfollow_user(
     target_id: uuid.UUID,
     db: Session = Depends(get_users_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user)
@@ -61,4 +62,5 @@ def unfollow_user(
         target.follower_count = max(0, target.follower_count - 1)
         
     db.commit()
+    await _invalidate_popular()
     return {"status": "unfollowed"}

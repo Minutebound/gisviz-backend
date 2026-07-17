@@ -1,5 +1,6 @@
 <%!
 import re
+from mako.runtime import Undefined
 %>"""${message}
 
 Revision ID: ${up_revision}
@@ -30,14 +31,16 @@ def downgrade(engine_name: str) -> None:
 
 <%
     db_names = config.get_main_option("databases")
+    _upgrades   = {} if isinstance(upgrades,   Undefined) else upgrades
+    _downgrades = {} if isinstance(downgrades, Undefined) else downgrades
 %>
 % for db_name in re.split(r',\s*', db_names):
 
 def upgrade_${db_name}() -> None:
-    ${upgrades[db_name] if db_name in upgrades else "pass"}
+    ${_upgrades.get(db_name, "pass")}
 
 
 def downgrade_${db_name}() -> None:
-    ${downgrades[db_name] if db_name in downgrades else "pass"}
+    ${_downgrades.get(db_name, "pass")}
 
 % endfor

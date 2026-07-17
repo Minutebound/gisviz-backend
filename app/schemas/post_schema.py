@@ -66,7 +66,7 @@ class PostResponse(BaseModel):
     total_comments_count: int
     created_timestamp: datetime
     updated_timestamp: Optional[datetime] = None
-    # Per-user flags — None when the request is unauthenticated
+    is_active: int
     is_liked: Optional[bool] = None
     is_bookmarked: Optional[bool] = None
 

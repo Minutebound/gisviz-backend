@@ -21,7 +21,7 @@ from app.db.database import get_users_db
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 oauth2_scheme = OAuth2PasswordBearer(
-    tokenUrl=f"{settings.API_V1_STR}/auth/login",
+    tokenUrl=f"{settings.API_V0_STR}/auth/login",
     auto_error=False,
 )
 

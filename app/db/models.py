@@ -114,6 +114,7 @@ class PostRecord(PostsBase):
     share_slug      = Column(String(32), unique=True, index=True, nullable=False)
     total_likes_count    = Column(Integer, default=0, nullable=False)
     total_comments_count = Column(Integer, default=0, nullable=False)
+    is_active       = Column(Integer, default=1, nullable=False, index=True) 
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     likes          = relationship("PostLikeRecord",     back_populates="post", cascade="all, delete-orphan")

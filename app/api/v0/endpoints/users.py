@@ -2,15 +2,16 @@ import uuid
 import re
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi_cache import FastAPICache
+from fastapi_cache.decorator import cache
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, validator
 from typing import Optional, List
 
 from app.db.database import get_users_db, get_admin_db          # ← get_admin_db added
-from app.db.models import PlatformUserRecord, RoleRecord, UserLocationRecord, FollowCurrentRecord
+from app.db.models import PlatformUserRecord, RoleRecord, UserLocationRecord, FollowCurrentRecord, SupportTicketRecord, log_admin_action, log_role_change
 from app.services.auth_service import get_current_authenticated_user, RoleChecker, auth_service, get_optional_current_user
-from app.schemas.user_schema import UserSettingsUpdatePayload
-from app.db.models import log_admin_action, log_role_change
+from app.schemas.user_schema import UserSettingsUpdatePayload, SupportTicketPayload, SupportTicketResponse, SupportStatusPayload
 
 router = APIRouter()
 
@@ -49,6 +50,32 @@ class DeleteAccountPayload(BaseModel):
 class RoleUpdatePayload(BaseModel):
     role_name: str  # "admin" | "editor" | "publisher" | "viewer" | "support"
 
+
+# ── Cache helpers ────────────────────────────────────────────────────
+
+async def _invalidate_popular() -> None:
+    """Bust popular-users list after follow/unfollow changes follower counts."""
+    try:
+        backend = FastAPICache.get_backend()
+        for lim in ("15", "50", "100"):
+            await backend.clear(key=f"gisviz-cache:users:popular:{lim}")
+    except Exception as exc:
+        print(f"[cache] popular users invalidation failed: {exc}")
+
+
+async def _invalidate_profile(handle: str) -> None:
+    """Bust a specific user profile after settings update."""
+    try:
+        await FastAPICache.get_backend().clear(
+            key=f"gisviz-cache:users:profile:{handle.lower()}"
+        )
+    except Exception as exc:
+        print(f"[cache] profile invalidation failed for {handle}: {exc}")
+
+
+def _popular_key_builder(func, namespace, *, request, **kwargs):
+    limit = request.query_params.get("limit", "50")
+    return f"gisviz-cache:users:popular:{limit}"
 
 # ── Shared helper ────────────────────────────────────────────────────
 
@@ -116,7 +143,7 @@ def list_all_users(
 # ── GET /profile/{handle} ────────────────────────────────────────────
 
 @router.get("/profile/{handle}")
-def get_user_profile(
+async def get_user_profile(
     handle: str,
     current_user_id: str = Query(None),
     db: Session = Depends(get_users_db),
@@ -148,7 +175,8 @@ def get_user_profile(
 # ── GET /popular ─────────────────────────────────────────────────────
 
 @router.get("/popular")
-def get_popular_publishers(
+@cache(expire=86400, key_builder=_popular_key_builder)
+async def get_popular_publishers(
     limit: int = Query(50, ge=1, le=100),
     current_user_id: str = Query(None),
     db: Session = Depends(get_users_db),
@@ -187,7 +215,7 @@ def get_popular_publishers(
 # ── PUT /settings ────────────────────────────────────────────────────
 
 @router.put("/settings")
-def update_settings(
+async def update_settings(
     payload: UserSettingsUpdatePayload,
     db: Session = Depends(get_users_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
@@ -214,6 +242,7 @@ def update_settings(
             formatted_string=f"{payload.place}, {payload.state}, {payload.country}".strip(", "),
         ))
     db.commit()
+    await _invalidate_profile(current_user.user_handle)
     return _full_user_dict(current_user)
 
 
@@ -387,16 +416,10 @@ def hard_delete_user(
         raise HTTPException(status_code=404, detail="User not found")
     if user.user_id == current_user.user_id:
         raise HTTPException(status_code=400, detail="You cannot delete your own account here.")
-
-    # Snapshot before deleting — the source row will be gone after commit
-    snapshot = {
-        "user_handle": user.user_handle,
-        "email": user.email_address,
-        "role": user.role.name if user.role else None,
-    }
+    snapshot = {"user_handle": user.user_handle, "email": user.email_address,
+                "role": user.role.name if user.role else None}
     db.delete(user)
     db.commit()
-
     log_admin_action(
         admin_db,
         admin_user_id=current_user.user_id,
@@ -409,9 +432,6 @@ def hard_delete_user(
     )
     return {"message": f"User {snapshot['user_handle']} permanently deleted"}
 
-## --Support Tickets management endpoints ---
-from app.db.models import SupportTicketRecord
-from app.schemas.user_schema import SupportTicketPayload, SupportTicketResponse, SupportStatusPayload
 
 # ── POST /support (Users creating tickets) ───────────────────────────
 @router.post("/support", response_model=SupportTicketResponse)

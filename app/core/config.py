@@ -7,7 +7,7 @@ from typing import List, Literal
 class PlatformConfigurationSettings(BaseSettings):
     PROJECT_NAME: str = "Gisviz Enterprise API"
     VERSION: str = "3.1.0"
-    API_V1_STR: str = "/api/v1"
+    API_V0_STR: str = "/api/v0"
 
     # ── Environment gate ──────────────────────────────────────────────
     # DO NOT set this in .env.backend.
@@ -29,13 +29,17 @@ class PlatformConfigurationSettings(BaseSettings):
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int
 
     # ── CORS ──────────────────────────────────────────────────────────
-    BACKEND_CORS_ORIGINS: List[str] = []
+    BACKEND_CORS_ORIGINS: str = ""   # store as raw string, split at use time
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     def _assemble_cors_origins(cls, v):
         if isinstance(v, str):
-            return [item.strip() for item in v.split(",") if item.strip()]
+            return v   # keep as-is, split when needed
         return v
+
+    def get_cors_origins(self) -> list[str]:
+        """Call this where you need the list."""
+        return [o.strip() for o in self.BACKEND_CORS_ORIGINS.split(",") if o.strip()]
 
     # ── Databases ─────────────────────────────────────────────────────
     USERS_DATABASE_URL: str

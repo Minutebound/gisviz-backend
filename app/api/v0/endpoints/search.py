@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, Query
+from fastapi_cache.decorator import cache
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 
@@ -10,9 +11,15 @@ from app.db.models import (
 
 router = APIRouter()
 
-# Notice the path is just "/global" because we will prefix the router with "/search"
+
+def _search_key_builder(func, namespace, *, request, **kwargs):
+    q = request.query_params.get("q", "").lower().strip()
+    return f"gisviz-cache:search:global:{q}"
+
+
 @router.get("/global")
-def global_search(
+@cache(expire=86400, key_builder=_search_key_builder)
+async def global_search(
     q: str = Query(..., min_length=3),
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db)

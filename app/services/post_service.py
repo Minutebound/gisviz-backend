@@ -67,6 +67,7 @@ class PostService:
             "share_url": f"/p/{post.share_slug}",
             "total_likes_count": post.total_likes_count,
             "total_comments_count": post.total_comments_count,
+            "is_active":post.is_active,
             "created_timestamp": post.created_timestamp,
             "updated_timestamp": getattr(post, "updated_timestamp", None),
             "is_liked": is_liked,
@@ -86,6 +87,7 @@ class PostService:
     ) -> List[dict]:
         posts = (
             posts_db.query(PostRecord)
+            .filter(PostRecord.is_active == 1)
             .order_by(desc(PostRecord.created_timestamp))
             .offset(skip)
             .limit(limit)
@@ -99,13 +101,7 @@ class PostService:
    # ------------------------------------------------------------------
     # Create
     # ------------------------------------------------------------------
-    async def create_post(
-        self,
-        posts_db: Session,
-        users_db: Session,
-        user_id: uuid.UUID,
-        payload: PostPayload,
-    ) -> dict:
+    async def create_post(self, posts_db, users_db, user_id, payload):
         new_post = PostRecord(
             publisher_user_id=user_id,
             title=payload.title,
@@ -117,36 +113,35 @@ class PostService:
             share_slug=generate_unique_slug(posts_db),
         )
         posts_db.add(new_post)
-        posts_db.flush()
+        posts_db.flush()  # get post_id without committing
 
         for cat_id in payload.category_ids:
-            # FIX: Get the category to increment its usage_count
+            link = PostCategoryLink(post_id=new_post.post_id, category_id=cat_id)
+            posts_db.add(link)
+            # ← Increment category usage count
             cat = posts_db.query(CategoryRecord).filter(
                 CategoryRecord.category_id == cat_id
             ).first()
             if cat:
-                cat.usage_count += 1
-                posts_db.add(PostCategoryLink(post_id=new_post.post_id, category_id=cat_id))
+                cat.usage_count = (cat.usage_count or 0) + 1
 
-        for kw_str in payload.keywords:
-            clean_kw = kw_str.strip().lower()
-            keyword_record = posts_db.query(KeywordRecord).filter(
-                KeywordRecord.word == clean_kw
+        for word in payload.keywords:
+            word = word.strip().lower()
+            if not word:
+                continue
+            kw = posts_db.query(KeywordRecord).filter(
+                KeywordRecord.word == word
             ).first()
-            if not keyword_record:
-                keyword_record = KeywordRecord(word=clean_kw)
-                posts_db.add(keyword_record)
+            if not kw:
+                kw = KeywordRecord(word=word, usage_count=0)
+                posts_db.add(kw)
                 posts_db.flush()
-            keyword_record.usage_count += 1
-            posts_db.add(PostKeywordLink(
-                post_id=new_post.post_id,
-                keyword_id=keyword_record.keyword_id,
-            ))
+            kw.usage_count = (kw.usage_count or 0) + 1
+            posts_db.add(PostKeywordLink(post_id=new_post.post_id, keyword_id=kw.keyword_id))
 
-        posts_db.commit()
-        posts_db.refresh(new_post)
-        # Pass user_id so is_liked/is_bookmarked are correctly false (new post)
-        return self._format_post_response(posts_db, users_db, new_post, user_id)
+            posts_db.commit()
+            posts_db.refresh(new_post)
+            return self._format_post_response(posts_db, users_db, new_post, user_id)
 
     # ------------------------------------------------------------------
     # Update
@@ -235,12 +230,8 @@ class PostService:
     # ------------------------------------------------------------------
     # Delete
     # ------------------------------------------------------------------
-    async def delete_post(
-        self,
-        posts_db: Session,
-        post_id: uuid.UUID,
-        current_user: PlatformUserRecord,
-    ):
+    
+    async def delete_post(self, posts_db, post_id, current_user, users_db=None):
         post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
         if not post:
             raise HTTPException(status_code=404, detail="Post not found")
@@ -251,17 +242,28 @@ class PostService:
         ):
             raise HTTPException(status_code=403, detail="Not authorized to delete this post")
 
-        # FIX: Decrement counts before deleting the post
+        # Decrement category usage counts
         for link in post.category_links:
             if link.category and link.category.usage_count > 0:
                 link.category.usage_count -= 1
-                
+
+        # Decrement keyword usage counts
         for link in post.keyword_links:
             if link.keyword and link.keyword.usage_count > 0:
                 link.keyword.usage_count -= 1
 
         posts_db.delete(post)
         posts_db.commit()
+
+        # Decrement post_count on the user (users_db is a separate session)
+        if users_db is not None:
+            publisher = users_db.query(PlatformUserRecord).filter(
+                PlatformUserRecord.user_id == post.publisher_user_id
+            ).first()
+            if publisher and publisher.post_count > 0:
+                publisher.post_count -= 1
+                users_db.commit()
+
         return {"status": "deleted"}
 
 

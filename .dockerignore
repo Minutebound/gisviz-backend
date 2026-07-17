@@ -1,0 +1,76 @@
+
+# ── Git ───────────────────────────────────────────────────────────
+.git
+.gitignore
+
+# ── Python cache (rebuilt inside Docker) ──────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ── Virtual environments (not needed, Docker has its own) ─────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ── Environment & secrets (never go into image) ───────────────────
+.env
+.env.*
+.env.backend
+.env.production
+.env.development
+
+# ── Databases & volumes ───────────────────────────────────────────
+*.sqlite3
+*.db
+*.sql
+pg_data/
+postgres-data/
+docker-data/
+
+# ── Logs & test artifacts ─────────────────────────────────────────
+*.log
+logs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.cache/
+.hypothesis/
+junit.xml
+
+# ── IDE / editors ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Docker files (don't need to be inside the image) ──────────────
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# ── Docs & misc ───────────────────────────────────────────────────
+README.md
+*.md
+*.bak
+*.tmp
+*.pem
+*.key
+
+# ── CI ────────────────────────────────────────────────────────────
+.github/

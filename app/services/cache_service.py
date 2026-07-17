@@ -71,6 +71,28 @@ class CacheService:
             print(f"[CacheService] delete({key!r}) failed: {e}")
             return False
 
+    def delete_pattern(self, pattern: str) -> int:
+        """
+        Delete all keys matching a glob pattern (e.g. 'gisviz-cache:search:global:*').
+        Returns the number of keys deleted, or 0 on error / no match.
+        Uses SCAN so it is safe on large keyspaces (no blocking KEYS call).
+        """
+        if self._client is None:
+            return 0
+        try:
+            deleted = 0
+            cursor = 0
+            while True:
+                cursor, keys = self._client.scan(cursor, match=pattern, count=100)
+                if keys:
+                    deleted += self._client.delete(*keys)
+                if cursor == 0:
+                    break
+            return deleted
+        except Exception as e:
+            print(f"[CacheService] delete_pattern({pattern!r}) failed: {e}")
+            return 0
+
     def is_healthy(self) -> bool:
         """Return True if the Redis connection is alive."""
         if self._client is None:

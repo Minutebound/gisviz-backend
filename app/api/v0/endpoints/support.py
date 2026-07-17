@@ -1,8 +1,8 @@
 """
-app/api/v1/endpoints/support.py
+app/api/v0/endpoints/support.py
 ================================
 Public endpoint — no auth required.
-Registered in main.py at /api/v1/support.
+Registered in main.py at /api/v0/support.
 
 POST /support/ticket  — any visitor can submit a support ticket.
 """

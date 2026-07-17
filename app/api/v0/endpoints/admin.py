@@ -1,5 +1,5 @@
 """
-app/api/v1/endpoints/admin.py
+app/api/v0/endpoints/admin.py
 ==============================
 Single file for every admin endpoint. Replaces:
   - admin.py                (control panel, live analytics, audit, roles, comments)
@@ -75,8 +75,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import func, desc
 from sqlalchemy.orm import Session
+from sqlalchemy import inspect as sa_inspect
 
 from app.db.database import get_users_db, get_posts_db, get_admin_db, get_analytics_db
+from app.db.database import (
+    users_engine, posts_engine, analytics_engine, admin_engine,
+    UsersBase, PostsBase, AnalyticsBase, AdminBase,
+)
 from app.db.models import (
     # OLTP
     PlatformUserRecord, RoleRecord,
@@ -622,6 +627,7 @@ def list_all_posts(
                 "publisher_handle": handle_map.get(p.publisher_user_id, "deleted_user"),
                 "total_likes_count": p.total_likes_count,
                 "total_comments_count": p.total_comments_count,
+                "is_active": p.is_active,         
                 "created_timestamp": p.created_timestamp,
             }
             for p in posts
@@ -1217,3 +1223,80 @@ def delete_ticket(
         ip_address    = _ip(request),
     )
     return {"status": "deleted", "ticket_id": str(ticket_id)}
+
+
+
+# ════════════════════════════════════════════════════════════════════
+#  SCHEMA INTROSPECTION  — powers the ERD page
+# ════════════════════════════════════════════════════════════════════
+
+_CROSS_DB_REFS = [
+    {"from_db": "posts_db",     "from_table": "posts",             "from_col": "author_user_id",   "to_db": "users_db",  "to_table": "platform_users", "to_col": "user_id"},
+    {"from_db": "posts_db",     "from_table": "post_likes",        "from_col": "user_id",          "to_db": "users_db",  "to_table": "platform_users", "to_col": "user_id"},
+    {"from_db": "posts_db",     "from_table": "post_bookmarks",    "from_col": "user_id",          "to_db": "users_db",  "to_table": "platform_users", "to_col": "user_id"},
+    {"from_db": "posts_db",     "from_table": "post_comments",     "from_col": "author_user_id",   "to_db": "users_db",  "to_table": "platform_users", "to_col": "user_id"},
+    {"from_db": "posts_db",     "from_table": "post_reports",      "from_col": "reporter_user_id", "to_db": "users_db",  "to_table": "platform_users", "to_col": "user_id"},
+    {"from_db": "analytics_db", "from_table": "dim_user",          "from_col": "user_id",          "to_db": "users_db",  "to_table": "platform_users", "to_col": "user_id"},
+    {"from_db": "analytics_db", "from_table": "dim_post",          "from_col": "post_id",          "to_db": "posts_db",  "to_table": "posts",          "to_col": "post_id"},
+    {"from_db": "admin_db",     "from_table": "admin_action_logs", "from_col": "admin_user_id",    "to_db": "users_db",  "to_table": "platform_users", "to_col": "user_id"},
+]
+
+_SCHEMA_DATABASES = [
+    ("users_db",     users_engine,     UsersBase,     "#2b6cb0"),
+    ("posts_db",     posts_engine,     PostsBase,     "#2f855a"),
+    ("analytics_db", analytics_engine, AnalyticsBase, "#6b46c1"),
+    ("admin_db",     admin_engine,     AdminBase,     "#c05621"),
+]
+
+def _col_type(col) -> str:
+    try:
+        return str(col.type.compile(dialect=None)).upper()
+    except Exception:
+        return type(col.type).__name__.upper()
+
+
+@router.get("/schema")
+def get_schema(_: PlatformUserRecord = Depends(ADMIN)):
+    tables = []
+    relationships = []
+
+    for db_name, engine, base, color in _SCHEMA_DATABASES:
+        for table_name, table in base.metadata.tables.items():
+            pk_cols = {c.name for c in table.primary_key.columns}
+            fk_map  = {
+                fk.parent.name: f"{fk.column.table.name}.{fk.column.name}"
+                for fk in table.foreign_keys
+            }
+            columns = [
+                {
+                    "name":     col.name,
+                    "type":     _col_type(col),
+                    "isPK":     col.name in pk_cols,
+                    "isFK":     col.name in fk_map,
+                    "fkTarget": fk_map.get(col.name),
+                    "nullable": col.nullable,
+                }
+                for col in table.columns
+            ]
+            tables.append({
+                "id":       table_name,
+                "label":    table_name.replace("_", " ").title(),
+                "database": db_name,
+                "dbColor":  color,
+                "columns":  columns,
+            })
+            for fk in table.foreign_keys:
+                relationships.append({
+                    "from":    table_name,
+                    "fromCol": fk.parent.name,
+                    "to":      fk.column.table.name,
+                    "toCol":   fk.column.name,
+                    "type":    "1:N",
+                    "crossDb": False,
+                })
+
+    return {
+        "tables":        tables,
+        "relationships": relationships,
+        "cross_db_refs": _CROSS_DB_REFS,
+    }
