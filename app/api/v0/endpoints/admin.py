@@ -732,23 +732,51 @@ def update_report_status(
 #  CATEGORIES
 # ════════════════════════════════════════════════════════════════════
 
+_ADMIN_CAT_LIST_KEY     = "gisviz-cache:categories:list"
+_ADMIN_CAT_TRENDING_KEY = "gisviz-cache:categories:trending"
+ 
+ 
+async def _bust_category_caches() -> None:
+    """
+    Bust both category Redis keys from the admin router.
+    Called after any create / update / delete so the control page and
+    the Sidebar both reflect changes immediately.
+    """
+    try:
+        backend = FastAPICache.get_backend()
+        await backend.clear(key=_ADMIN_CAT_LIST_KEY)
+        await backend.clear(key=_ADMIN_CAT_TRENDING_KEY)
+    except Exception as exc:
+        print(f"[cache] admin category cache bust failed: {exc}")
+ 
 @router.get("/categories")
-def list_all_categories(
+def list_categories(
     posts_db: Session = Depends(get_posts_db),
     _: PlatformUserRecord = Depends(ADMIN_EDITOR),
 ):
-    cats = posts_db.query(CategoryRecord).order_by(CategoryRecord.usage_count.desc()).all()
-    return [{"category_id": c.category_id, "slug": c.slug,
-             "label": c.label, "usage_count": c.usage_count} for c in cats]
-
-
+    """
+    Returns the full category list with usage counts.
+    This is a live DB read — no cache — so the control page always shows
+    the real current state without needing a page refresh.
+    """
+    cats = (
+        posts_db.query(CategoryRecord)
+        .order_by(CategoryRecord.label.asc())
+        .all()
+    )
+    return [
+        {"category_id": c.category_id, "slug": c.slug, "label": c.label, "usage_count": c.usage_count}
+        for c in cats
+    ]
+ 
+ 
 class CategoryEditPayload(BaseModel):
     label: str
     slug: str
-
-
+ 
+ 
 @router.put("/categories/{category_id}")
-def update_category(
+async def update_category(           # ← was `def`, now `async def`
     category_id: int,
     payload: CategoryEditPayload,
     request: Request,
@@ -759,20 +787,31 @@ def update_category(
     cat = posts_db.query(CategoryRecord).filter(CategoryRecord.category_id == category_id).first()
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
+ 
     old = {"label": cat.label, "slug": cat.slug}
     cat.label = payload.label
     cat.slug  = payload.slug
     posts_db.commit()
-    log_admin_action(admin_db, admin_user_id=admin.user_id, admin_handle=admin.user_handle,
-                     action_type="category.update", target_type="category",
-                     target_id=str(category_id),
-                     payload={"before": old, "after": {"label": cat.label, "slug": cat.slug}},
-                     ip_address=_ip(request))
+ 
+    log_admin_action(
+        admin_db,
+        admin_user_id=admin.user_id,
+        admin_handle=admin.user_handle,
+        action_type="category.update",
+        target_type="category",
+        target_id=str(category_id),
+        payload={"before": old, "after": {"label": cat.label, "slug": cat.slug}},
+        ip_address=_ip(request),
+    )
+ 
+    # Bust both Redis keys so the Sidebar and the control page refresh immediately
+    await _bust_category_caches()
+ 
     return {"category_id": category_id, "label": cat.label, "slug": cat.slug}
-
-
+ 
+ 
 @router.delete("/categories/{category_id}")
-def delete_category(
+async def delete_category(           # ← was `def`, now `async def`
     category_id: int,
     request: Request,
     posts_db: Session = Depends(get_posts_db),
@@ -782,14 +821,26 @@ def delete_category(
     cat = posts_db.query(CategoryRecord).filter(CategoryRecord.category_id == category_id).first()
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
+ 
     snapshot = {"label": cat.label, "slug": cat.slug}
     posts_db.delete(cat)
     posts_db.commit()
-    log_admin_action(admin_db, admin_user_id=admin.user_id, admin_handle=admin.user_handle,
-                     action_type="category.delete", target_type="category",
-                     target_id=str(category_id), payload=snapshot, ip_address=_ip(request))
+ 
+    log_admin_action(
+        admin_db,
+        admin_user_id=admin.user_id,
+        admin_handle=admin.user_handle,
+        action_type="category.delete",
+        target_type="category",
+        target_id=str(category_id),
+        payload=snapshot,
+        ip_address=_ip(request),
+    )
+ 
+    # Bust both Redis keys
+    await _bust_category_caches()
+ 
     return {"status": "deleted", "category_id": category_id}
-
 
 # ════════════════════════════════════════════════════════════════════
 #  KEYWORDS

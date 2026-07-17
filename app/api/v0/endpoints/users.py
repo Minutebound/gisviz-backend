@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, validator
 from typing import Optional, List
 
-from app.db.database import get_users_db, get_admin_db          # ← get_admin_db added
+from app.db.database import get_users_db, get_admin_db
 from app.db.models import PlatformUserRecord, RoleRecord, UserLocationRecord, FollowCurrentRecord, SupportTicketRecord, log_admin_action, log_role_change
 from app.services.auth_service import get_current_authenticated_user, RoleChecker, auth_service, get_optional_current_user
 from app.schemas.user_schema import UserSettingsUpdatePayload, SupportTicketPayload, SupportTicketResponse, SupportStatusPayload
@@ -48,20 +48,38 @@ class DeleteAccountPayload(BaseModel):
 
 
 class RoleUpdatePayload(BaseModel):
-    role_name: str  # "admin" | "editor" | "publisher" | "viewer" | "support"
+    role_name: str  
 
 
 # ── Cache helpers ────────────────────────────────────────────────────
 
 async def _invalidate_popular() -> None:
-    """Bust popular-users list after follow/unfollow changes follower counts."""
-    try:
-        backend = FastAPICache.get_backend()
-        for lim in ("15", "50", "100"):
-            await backend.clear(key=f"gisviz-cache:users:popular:{lim}")
-    except Exception as exc:
-        print(f"[cache] popular users invalidation failed: {exc}")
+    """
+    Bust ALL popular-publisher Redis keys after a follow/unfollow.
 
+    Because the key now includes the user_id we cannot predict every variant,
+    so we SCAN for the prefix and delete whatever we find.
+    SCAN is cursor-based and never blocks Redis — safe on large keyspaces.
+    """
+    try:
+        backend      = FastAPICache.get_backend()
+        redis_client = backend.redis          # async redis-py client
+        pattern      = "gisviz-cache:users:popular:*"
+        cursor       = 0
+        deleted      = 0
+        while True:
+            cursor, keys = await redis_client.scan(
+                cursor=cursor, match=pattern, count=100
+            )
+            if keys:
+                await redis_client.delete(*keys)
+                deleted += len(keys)
+            if cursor == 0:
+                break
+        print(f"[cache] _invalidate_popular: cleared {deleted} key(s)")
+    except Exception as exc:
+        # Never let a cache bust failure crash the follow/unfollow response
+        print(f"[cache] _invalidate_popular failed: {exc}")
 
 async def _invalidate_profile(handle: str) -> None:
     """Bust a specific user profile after settings update."""
@@ -74,8 +92,20 @@ async def _invalidate_profile(handle: str) -> None:
 
 
 def _popular_key_builder(func, namespace, *, request, **kwargs):
+    """
+    Builds a per-(limit, user) Redis key for GET /users/popular.
+
+    Key format:
+      gisviz-cache:users:popular:{limit}:anon          <- unauthenticated
+      gisviz-cache:users:popular:{limit}:{user_id}     <- authenticated
+
+    Including the user_id means each person's is_followed state is cached
+    independently — no cross-user data leaks.
+    _invalidate_popular() uses a SCAN wildcard to clear all variants.
+    """
     limit = request.query_params.get("limit", "50")
-    return f"gisviz-cache:users:popular:{limit}"
+    uid   = request.query_params.get("current_user_id", "") or "anon"
+    return f"gisviz-cache:users:popular:{limit}:{uid}"
 
 # ── Shared helper ────────────────────────────────────────────────────
 
@@ -175,18 +205,44 @@ async def get_user_profile(
 # ── GET /popular ─────────────────────────────────────────────────────
 
 @router.get("/popular")
-@cache(expire=86400, key_builder=_popular_key_builder)
 async def get_popular_publishers(
     limit: int = Query(50, ge=1, le=100),
     current_user_id: str = Query(None),
+    request: Request = None,
     db: Session = Depends(get_users_db),
 ):
+    """
+    Returns top publishers ordered by follower_count.
+
+    Cache strategy — manual Redis via CacheService so we control TTL
+    based on whether results are empty:
+      - Results found  → Redis TTL 24 h (gisviz-cache:users:popular:{limit}:{uid})
+      - Empty result   → Redis TTL  30 s (self-heals as soon as users publish)
+
+    We do NOT filter by post_count > 0 so new users still appear.
+    The Sidebar already filters client-side by follower_count >= 1.
+
+    The @cache decorator is intentionally removed here because it cannot
+    skip caching empty responses — we handle caching manually instead.
+    """
+    from app.services.cache_service import cache_service
+
+    uid       = current_user_id or "anon"
+    cache_key = f"gisviz-cache:users:popular:{limit}:{uid}"
+
+    # ── Cache read ────────────────────────────────────────────────────
+    cached_val = cache_service.get(cache_key)
+    if cached_val is not None:
+        return cached_val
+
+    # ── DB query ──────────────────────────────────────────────────────
     users = (
         db.query(PlatformUserRecord)
-        .filter(PlatformUserRecord.post_count > 0)
         .order_by(PlatformUserRecord.follower_count.desc())
-        .limit(limit).all()
+        .limit(limit)
+        .all()
     )
+
     results = []
     for u in users:
         is_followed = False
@@ -201,14 +257,20 @@ async def get_popular_publishers(
             except ValueError:
                 pass
         results.append({
-            "user_id": str(u.user_id),
-            "user_handle": u.user_handle,
-            "avatar_path": u.avatar_path,
-            "title": u.title,
+            "user_id":        str(u.user_id),
+            "user_handle":    u.user_handle,
+            "avatar_path":    u.avatar_path,
+            "title":          u.title,
             "follower_count": u.follower_count,
-            "post_count": u.post_count,
-            "is_followed": is_followed,
+            "post_count":     u.post_count,
+            "is_followed":    is_followed,
         })
+
+    # ── Cache write ───────────────────────────────────────────────────
+    # Short TTL when empty so the list self-heals as soon as anyone joins
+    ttl = 86400 if results else 30
+    cache_service.set(cache_key, results, ttl_seconds=ttl)
+
     return results
 
 

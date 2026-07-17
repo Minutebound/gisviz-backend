@@ -162,13 +162,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: dev
+      target: prod
     container_name: gisviz-api
     restart: always
     env_file:
       - .env.backend
     ports:
-      - "8001:8001"
+      - "8000:8000"
     volumes:
       - ./app:/app/app
       - uploads-data:/app/uploads
