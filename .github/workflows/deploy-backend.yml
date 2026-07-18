@@ -1,34 +1,167 @@
-name: Deploy Backend to IONOS
+# .github/workflows/deploy-backend.yml
+# ══════════════════════════════════════════════════════════════════════════════
+# GisViz Backend — Production Deploy
+#
+# Trigger: push to `deploy` branch
+#
+# Branch strategy:
+#   feature/* → develop → main → deploy → IONOS VPS
+#
+# What this does on the VPS (in order):
+#   1. Clean fetch + hard reset to deploy branch HEAD
+#   2. Ensure uploads/ dir and .env files exist
+#   3. Stop ONLY the api container (databases + cache stay running)
+#   4. Backup all 4 databases before any schema change
+#   5. Build fresh api image (--no-cache)
+#   6. Run alembic upgrade head via temporary container
+#   7. Start new api container
+#   8. Health check
+#
+# Volume safety:
+#   gisviz-users-db-data      ← NEVER touched
+#   gisviz-posts-db-data      ← NEVER touched
+#   gisviz-analytics-db-data  ← NEVER touched
+#   gisviz-admin-db-data      ← NEVER touched
+#   gisviz-cache-data         ← NEVER touched
+#   gisviz-uploads-data       ← NEVER touched
+#   redis-insight-data        ← NEVER touched
+#   pgadmin-data              ← NEVER touched
+#
+# Only the api container image is rebuilt. No volume flags used.
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: Deploy Backend
 
 on:
   push:
-    branches:
-      - deploy
+    branches: [main]
 
 jobs:
   deploy-backend:
     runs-on: ubuntu-latest
+    environment: production
+
     steps:
-      - name: SSH, Rebuild, and Migrate
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy to VPS
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VPS_HOST }}
+          host:     ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USERNAME }}
-          key: ${{ secrets.VPS_SSH_KEY }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
           script: |
+            set -e
             cd /srv/gisviz/gisviz-backend
-            
-            # Pull the latest deploy branch
+
+            # ── 1. Clean fetch — no leftover local changes can break this ───
+            echo "=== [1/7] Clean fetch of deploy branch ==="
             git fetch origin deploy
             git reset --hard origin/deploy
-            
-            # Rebuild and restart the containers (Volumes/Data are preserved)
-            docker compose down
-            docker-compose up -d --build
-            
-            # Wait a few seconds to ensure the container is fully initialized
-            sleep 5
-            
-            # Run Alembic migrations
-            # NOTE: Replace 'api' with the exact name of your FastAPI service in docker-compose.yml
-            docker-compose exec -T api alembic upgrade head
+            git clean -fd
+            # git clean -fd removes untracked files (compiled .pyc, temp files)
+            # but does NOT touch .env.backend or uploads/ which are gitignored
+
+            # ── 2. Ensure required files and dirs exist ──────────────────────
+            echo "=== [2/7] Ensuring uploads/ and env files exist ==="
+            # uploads/ must exist so the volume mount works on first run
+            mkdir -p uploads/visuals uploads/avatars uploads/banners
+            chmod -R 775 uploads
+            # Verify env file is present — deploy fails loudly if missing
+            if [ ! -f .env.backend ]; then
+              echo "ERROR: .env.backend not found — aborting"
+              echo "Create it at /srv/gisviz/gisviz-backend/.env.backend"
+              exit 1
+            fi
+            # .env is read by docker compose for variable interpolation
+            # it must exist even if empty (backend uses .env.backend for secrets)
+            touch .env
+
+            # ── 3. Stop only the api container ──────────────────────────────
+            echo "=== [3/7] Stopping api container ==="
+            docker compose stop api
+            docker compose rm -f api
+            # databases, cache, loki, pgadmin all keep running
+
+            # ── 4. Backup all databases before migration ─────────────────────
+            echo "=== [4/7] Backing up databases ==="
+            BACKUP_DIR="/srv/gisviz/backups/$(date +%Y-%m-%d_%H-%M-%S)"
+            mkdir -p "$BACKUP_DIR"
+
+            docker compose exec -T users-db \
+              pg_dump -U users_admin gisviz_users_db \
+              > "$BACKUP_DIR/users.sql" && echo "  users OK"
+
+            docker compose exec -T posts-db \
+              pg_dump -U posts_admin gisviz_posts_db \
+              > "$BACKUP_DIR/posts.sql" && echo "  posts OK"
+
+            docker compose exec -T analytics-db \
+              pg_dump -U analytics_user gisviz_analytics_db \
+              > "$BACKUP_DIR/analytics.sql" && echo "  analytics OK"
+
+            docker compose exec -T admin-db \
+              pg_dump -U admin_user gisviz_admin_db \
+              > "$BACKUP_DIR/admin.sql" && echo "  admin OK"
+
+            echo "  Backup saved: $BACKUP_DIR"
+
+            # ── 5. Rebuild api image (no cache) ─────────────────────────────
+            echo "=== [5/7] Building api image ==="
+            docker compose build --no-cache api
+
+            # ── 6. Run Alembic migrations ────────────────────────────────────
+            # 'run --rm' spins up a throwaway container from the new image,
+            # runs migrations against the live databases, then removes it.
+            # The api container is NOT running yet — zero conflict risk.
+            # alembic_version table in all 4 databases is updated here.
+            echo "=== [6/7] Running Alembic migrations ==="
+            docker compose run --rm api alembic upgrade head
+
+            echo "--- Alembic current state ---"
+            docker compose run --rm api alembic current
+
+            # ── 7. Start new api container ───────────────────────────────────
+            echo "=== [7/7] Starting api container ==="
+            docker compose up -d api
+
+            sleep 6
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X GET http://localhost:8001/)
+            if [ "$STATUS" != "200" ]; then
+              echo "HEALTH CHECK FAILED — HTTP $STATUS"
+              docker compose logs api --tail 50
+              exit 1
+            fi
+            echo "Health check passed — HTTP $STATUS"
+
+      - name: Create release branch
+        if: success()
+        run: |
+          BRANCH="release/backend-$(date +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}"
+          git checkout -b "$BRANCH"
+          git push origin "$BRANCH"
+
+      - name: Post success comment
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              commit_sha: context.sha,
+              body: `✅ **Backend deployed** — \`${context.sha.slice(0,7)}\` live on \`api.gisviz.com\``,
+            })
+
+      - name: Post failure comment
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              commit_sha: context.sha,
+              body: `❌ **Backend deploy FAILED** — [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+            })
