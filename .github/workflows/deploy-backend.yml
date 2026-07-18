@@ -112,7 +112,7 @@ jobs:
             # Files written by FastAPI persist here across every redeploy.
             # git clean -fd never touches it because uploads/ is gitignored.
             mkdir -p uploads/visuals uploads/avatars uploads/banners
-            chmod -R 775 uploads
+            chmod -R 777 uploads
             echo "  uploads/ subdirs ready ✓"
 
             # .env must exist (Docker Compose reads it for variable interpolation)
@@ -175,6 +175,10 @@ jobs:
             fi
             echo "Health check passed — HTTP $STATUS ✓"
 
+            # ── Clean up dangling images from this build ──────────────────────
+            docker image prune -f
+            echo "  Unused images pruned ✓"
+            
       - name: Create release branch
         if: success()
         run: |
