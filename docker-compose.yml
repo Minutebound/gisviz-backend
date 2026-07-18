@@ -168,9 +168,15 @@ services:
     env_file:
       - .env.backend
     ports:
+      # Dockerfile CMD: uvicorn ... --port 8001
+      # Caddy: reverse_proxy localhost:8001
+      # Format: "host_port:container_port"
       - "8001:8001"
     volumes:
-      - ./app:/app/app
+      # Bind mount — uploads live in the repo folder on the VPS host at
+      # /srv/gisviz/gisviz-backend/uploads/
+      # No Docker volume used. Files persist across redeploys because
+      # git clean -fd never touches uploads/ (it is gitignored).
       - ./uploads:/app/uploads
     depends_on:
       users-db:
@@ -219,8 +225,7 @@ services:
       - loki
     networks:
       - gisviz-network
-    
-  
+
 networks:
   gisviz-network:
     name: gisviz-network
