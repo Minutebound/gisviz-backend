@@ -1,3 +1,4 @@
+import os
 import uuid
 from typing import List, Optional
 from sqlalchemy.orm import Session
@@ -7,10 +8,11 @@ from fastapi import HTTPException
 from app.db.models import (
     PostRecord, PostCategoryLink, PostKeywordLink,
     CategoryRecord, KeywordRecord, PlatformUserRecord,
-    PostLikeRecord, PostBookmarkRecord,
+    PostLikeRecord, PostBookmarkRecord, DatasetRecord,
 )
 from app.schemas.post_schema import PostPayload
 from app.services.helpers import generate_unique_slug
+from app.services import visual_service, visual_image, duckdb_service
 
 
 class PostService:
@@ -58,6 +60,10 @@ class PostService:
             "title": post.title,
             "description": post.description,
             "visual_image_path": post.visual_image_path,
+            "dataset_id": getattr(post, "dataset_id", None),
+            "visual_spec": getattr(post, "visual_spec", None),
+            "theme_color": getattr(post, "theme_color", None),
+            "dataset": self._dataset_meta(posts_db, getattr(post, "dataset_id", None)),
             "note": getattr(post, "note", None),
             "source_name": getattr(post, "source_name", None),
             "source_url": getattr(post, "source_url", None),
@@ -73,6 +79,34 @@ class PostService:
             "is_liked": is_liked,
             "is_bookmarked": is_bookmarked,
         }
+
+    @staticmethod
+    def _dataset_meta(posts_db: Session, dataset_id: Optional[str]) -> Optional[dict]:
+        """Catalog row for the dataset behind a post (shown on the post page)."""
+        if not dataset_id:
+            return None
+        from app.db.database import DatasetsSessionLocal      # catalog lives in the datasets DB
+        with DatasetsSessionLocal() as ddb:
+            d = ddb.get(DatasetRecord, dataset_id)
+            if not d:
+                return None
+            return {
+                "dataset_id": d.dataset_id, "title": d.title, "description": d.description,
+                "category": d.category, "format": d.format, "source_name": d.source_name,
+                "source_url": d.source_url, "license": d.license, "publisher": d.publisher,
+                "geometry_type": d.geometry_type, "row_count": d.row_count, "crs": d.crs,
+                "status": d.status, "updated_at": d.updated_timestamp.isoformat() if d.updated_timestamp else None,
+            }
+
+    @staticmethod
+    def _delete_preview(path: Optional[str]) -> None:
+        """Remove a generated preview PNG we no longer need. Only touches uploads/visuals/post_*."""
+        if not path or not path.startswith("/uploads/visuals/post_"):
+            return
+        try:
+            os.remove(path.lstrip("/"))
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------
     # Feed
@@ -101,12 +135,50 @@ class PostService:
    # ------------------------------------------------------------------
     # Create
     # ------------------------------------------------------------------
+    def _prepare_dataset_visual(self, payload):
+        """Validate the dataset choice, build the spec, warm the Redis payload cache and
+        render the preview PNG from that same payload (one DuckDB query in total)."""
+        vp = payload.visual_params
+        try:
+            spec = visual_service.build_spec(
+                payload.dataset_id,
+                getattr(vp, "viz", None), getattr(vp, "x", None),
+                getattr(vp, "y", None), getattr(vp, "label_field", None),
+                accent=payload.theme_color,
+                z=getattr(vp, "z", None), size=getattr(vp, "size", None),
+            )
+            data = visual_service.warm(payload.dataset_id, spec)   # readers start on a cache hit
+        except visual_service.VisualError as e:
+            raise HTTPException(status_code=e.status, detail=e.message)
+        except duckdb_service.StoreUnavailable:
+            raise HTTPException(status_code=409, detail="This dataset's data has not been uploaded yet")
+
+        image_path = None
+        try:
+            card = visual_service.get_card(payload.dataset_id)
+            image_path = visual_image.render_thumbnail(
+                title=payload.title, subtitle=f"{card['title']} · {card.get('source_name') or ''}".strip(" ·"),
+                spec=spec, payload=data, accent=spec.get("accent"),
+            )
+        except Exception as exc:   # a preview glitch must not block publishing
+            print(f"[post_service] thumbnail render failed for {payload.dataset_id}: {exc}")
+        return spec, image_path
+
     async def create_post(self, posts_db, users_db, user_id, payload):
+        if not payload.dataset_id:
+            raise HTTPException(status_code=422, detail="Pick a dataset for this post")
+        dataset_id = payload.dataset_id.strip().lower()
+        payload.dataset_id = dataset_id
+        spec, image_path = self._prepare_dataset_visual(payload)
+
         new_post = PostRecord(
             publisher_user_id=user_id,
             title=payload.title,
             description=payload.description,
-            visual_image_path=payload.visual_image_path,
+            visual_image_path=image_path,
+            dataset_id=dataset_id,
+            visual_spec=spec,
+            theme_color=spec.get("accent"),
             note=payload.note,
             source_name=payload.source_name,
             source_url=payload.source_url,
@@ -118,7 +190,6 @@ class PostService:
         for cat_id in payload.category_ids:
             link = PostCategoryLink(post_id=new_post.post_id, category_id=cat_id)
             posts_db.add(link)
-            # ← Increment category usage count
             cat = posts_db.query(CategoryRecord).filter(
                 CategoryRecord.category_id == cat_id
             ).first()
@@ -139,9 +210,11 @@ class PostService:
             kw.usage_count = (kw.usage_count or 0) + 1
             posts_db.add(PostKeywordLink(post_id=new_post.post_id, keyword_id=kw.keyword_id))
 
-            posts_db.commit()
-            posts_db.refresh(new_post)
-            return self._format_post_response(posts_db, users_db, new_post, user_id)
+        # Commit once, after all categories and keywords. (Previously this sat
+        # inside the keyword loop, so only the first keyword was saved.)
+        posts_db.commit()
+        posts_db.refresh(new_post)
+        return self._format_post_response(posts_db, users_db, new_post, user_id)
 
     # ------------------------------------------------------------------
     # Update
@@ -170,8 +243,17 @@ class PostService:
         post.source_name = payload.source_name
         post.source_url = payload.source_url
 
-        if payload.visual_image_path:
-            post.visual_image_path = payload.visual_image_path
+        # Changing the dataset, chart or theme colour rebuilds the spec and the preview PNG.
+        if payload.dataset_id:
+            payload.dataset_id = payload.dataset_id.strip().lower()
+            spec, image_path = self._prepare_dataset_visual(payload)
+            old_image = post.visual_image_path
+            post.dataset_id = payload.dataset_id
+            post.visual_spec = spec
+            post.theme_color = spec.get("accent")
+            if image_path:
+                post.visual_image_path = image_path
+                self._delete_preview(old_image)
 
         # FIX: Decrement old categories before deleting links
         old_cat_links = posts_db.query(PostCategoryLink).filter(

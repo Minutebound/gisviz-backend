@@ -1,4 +1,3 @@
-
 # ── Python ────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
@@ -72,3 +71,11 @@ junit.xml
 # ── Misc ──────────────────────────────────────────────────────────
 *.bak
 *.tmp
+# ── DuckDB serving store (built locally, copied to the VPS) ──────
+data/
+*.duckdb
+*.duckdb.tmp
+*.duckdb.wal
+
+# local-only compose override
+docker-compose.override.yml

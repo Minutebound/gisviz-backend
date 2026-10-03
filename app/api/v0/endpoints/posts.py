@@ -24,6 +24,7 @@ from app.services.auth_service import (
     get_current_authenticated_user,
     get_optional_current_user,
     RoleChecker,
+    require_publisher,
 )
 
 router = APIRouter()
@@ -267,7 +268,7 @@ async def create_post(
     payload: PostPayload,
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
-    current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
+    current_user: PlatformUserRecord = Depends(require_publisher),
 ):
     new_post = await post_service.create_post(
         posts_db=posts_db, users_db=users_db,
@@ -290,7 +291,7 @@ async def update_post(
     post_id: uuid.UUID, payload: PostPayload,
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
-    current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
+    current_user: PlatformUserRecord = Depends(require_publisher),
 ):
     result = await post_service.update_post(
         posts_db=posts_db, users_db=users_db,

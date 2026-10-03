@@ -71,6 +71,8 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload
 FROM base AS prod
 
 ENV APP_ENV=production
+# matplotlib (feed preview images) needs a writable config/cache dir for the non-root user
+ENV MPLCONFIGDIR=/tmp/mpl
 
 RUN addgroup --system gisvizgroup && adduser --system --group gisvizuser
 

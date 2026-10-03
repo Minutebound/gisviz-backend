@@ -32,6 +32,13 @@ class PageDefinition(BaseModel):
 # The canonical list of protected pages. Order here = display order.
 PAGE_REGISTRY: list[PageDefinition] = [
     PageDefinition(
+        key="admin_home",
+        label="Admin Home",
+        path="/admin",
+        required_permission="admin",
+        description="Admin landing page with links to every admin area.",
+    ),
+    PageDefinition(
         key="admin_control",
         label="Control Panel",
         path="/admin/control",
@@ -74,11 +81,32 @@ PAGE_REGISTRY: list[PageDefinition] = [
         description="Approve or reject category suggestions.",
     ),
     PageDefinition(
+        key="admin_erd",
+        label="ERD",
+        path="/admin/erd",
+        required_permission="admin",
+        description="Live entity-relationship diagram of all four databases.",
+    ),
+    PageDefinition(
+        key="admin_architecture",
+        label="Architecture",
+        path="/admin/architecture",
+        required_permission="admin",
+        description="API route map drawn from /openapi.json.",
+    ),
+    PageDefinition(
         key="upload",
         label="Create Publication",
         path="/post/upload",
         required_permission="publish",
         description="Upload and publish a new map/visual.",
+    ),
+    PageDefinition(
+        key="edit_post",
+        label="Edit Publication",
+        path="/post/[id]/edit",
+        required_permission="publish",
+        description="Edit an existing publication (owner, or admin/editor for any post).",
     ),
 ]
 

@@ -1,7 +1,7 @@
 import os
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 
 class PlatformConfigurationSettings(BaseSettings):
@@ -46,6 +46,8 @@ class PlatformConfigurationSettings(BaseSettings):
     POSTS_DATABASE_URL: str
     ANALYTICS_DATABASE_URL: str
     ADMIN_DATABASE_URL: str
+    # Dataset catalog (one row per DuckDB dataset). Falls back to the posts DB when unset.
+    DATASETS_DATABASE_URL: Optional[str] = None
 
     # ── Cache ─────────────────────────────────────────────────────────
     REDIS_URL: str

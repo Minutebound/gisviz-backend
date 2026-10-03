@@ -381,3 +381,12 @@ class RoleChecker:
                 detail=f"Operation not permitted. Requires one of: {self.allowed_roles}",
             )
         return user
+
+
+# Roles allowed to create/edit posts and use the dataset picker. Everyone else (viewer) is read-only.
+PUBLISHING_ROLES = ["admin", "publisher", "editor", "support"]
+require_publisher = RoleChecker(PUBLISHING_ROLES)
+
+# Roles allowed to register datasets and upload their data files (admin always passes).
+DATASET_MANAGER_ROLES = ["admin", "publisher"]
+require_dataset_manager = RoleChecker(DATASET_MANAGER_ROLES)

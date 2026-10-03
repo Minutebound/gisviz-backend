@@ -24,7 +24,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
-from app.db.database import UsersBase, PostsBase, AnalyticsBase, AdminBase
+from app.db.database import UsersBase, PostsBase, AnalyticsBase, AdminBase, DatasetsBase
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -101,6 +101,36 @@ class FollowCurrentRecord(UsersBase):
 #  POSTS DATABASE
 # ════════════════════════════════════════════════════════════════════
 
+class DatasetRecord(DatasetsBase):
+    """
+    Catalog row for one dataset, in the DATASETS database. Created and refreshed automatically by
+    app/services/dataset_sync.py from the published DuckDB files (DATASETS_DIR/<dataset_id>.duckdb);
+    managers edit the descriptive fields and publish it (draft -> active) on /datasets/manage.
+    Posts reference it by dataset_id (different database, so the link is checked in code).
+    """
+    __tablename__ = "datasets"
+    dataset_id    = Column(String(64), primary_key=True)          # == data file name
+    title         = Column(String(255), nullable=False)
+    description   = Column(Text, nullable=True)
+    category      = Column(String(80), nullable=True, index=True)
+    format        = Column(String(20), nullable=True)             # format of the last upload
+    source_name   = Column(String(255), nullable=True)
+    source_url    = Column(String(1024), nullable=True)
+    license       = Column(String(80), nullable=True)
+    publisher     = Column(String(120), nullable=True)
+    geometry_type = Column(String(20), nullable=True)
+    row_count     = Column(BigInteger, default=0, nullable=False)
+    crs           = Column(String(32), nullable=True)
+    bbox          = Column(JSONB, nullable=True)
+    columns       = Column(JSONB, nullable=True)                  # column profile used by the chart suggester
+    keywords      = Column(Text, nullable=True)                   # lowercase search text (id, title, columns...)
+    data_version  = Column(String(32), nullable=True)             # fingerprint of the published data file
+    data_uploaded_at = Column(DateTime(timezone=True), nullable=True)   # when that file was last (re)published
+    status        = Column(String(12), default="draft", nullable=False, index=True)    # draft | active | hidden | retired
+    created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class PostRecord(PostsBase):
     __tablename__   = "posts"
     post_id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -108,6 +138,9 @@ class PostRecord(PostsBase):
     title           = Column(String(255), nullable=False)
     description     = Column(Text, nullable=True)
     visual_image_path = Column(String, nullable=True)
+    dataset_id      = Column(String(64), nullable=True, index=True)  # dataset behind the visual (datasets DB)
+    visual_spec     = Column(JSONB, nullable=True)                     # spec rendered by <InteractiveVisual>
+    theme_color     = Column(String(7), nullable=True)                 # post theme colour, e.g. #06ba24 (also stored in visual_spec.accent)
     note            = Column(Text, nullable=True)
     source_name     = Column(String(255), nullable=True)
     source_url      = Column(String(1024), nullable=True)

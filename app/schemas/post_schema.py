@@ -36,10 +36,22 @@ class PendingCategoryData(BaseModel):
         from_attributes = True
 
 
+class VisualParams(BaseModel):
+    """The viewer's visual choice for a dataset-backed post (validated again on the server)."""
+    viz: Optional[str] = None
+    x: Optional[str] = None
+    y: Optional[str] = None
+    label_field: Optional[str] = None
+
+
 class PostPayload(BaseModel):
     title: str
     description: Optional[str] = None
-    visual_image_path: str
+    # Either an uploaded image path, or a dataset_id (+ visual params) to render from DuckDB.
+    visual_image_path: Optional[str] = None
+    dataset_id: Optional[str] = None
+    visual_params: Optional[VisualParams] = None
+    theme_color: Optional[str] = None      # hex like #06ba24, used to colour the visual
     note: Optional[str] = None
     source_name: Optional[str] = None
     source_url: Optional[str] = None
@@ -55,6 +67,8 @@ class PostResponse(BaseModel):
     title: str
     description: Optional[str] = None
     visual_image_path: Optional[str] = None
+    dataset_id: Optional[str] = None
+    visual_spec: Optional[dict] = None
     note: Optional[str] = None
     source_name: Optional[str] = None
     source_url: Optional[str] = None

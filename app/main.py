@@ -28,19 +28,21 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi_cache import FastAPICache
 from fastapi_cache.backends.redis import RedisBackend
 from app.core.config import settings
 from app.db.database import (
-    UsersBase, PostsBase, AnalyticsBase, AdminBase,
-    users_engine, posts_engine, analytics_engine, admin_engine,
+    UsersBase, PostsBase, AnalyticsBase, AdminBase, DatasetsBase,
+    users_engine, posts_engine, analytics_engine, admin_engine, datasets_engine,
     UsersSessionLocal, PostsSessionLocal,
 )
 from app.db.models import (
     RoleRecord, PlatformUserRecord, UserLocationRecord, CategoryRecord,
 )
 from app.api.v0.endpoints import auth, posts, categories, follows, users, uploads, search, seo
+from app.api.v0.endpoints import visuals as visuals_endpoints
 from app.api.v0.endpoints import admin as admin_endpoints
 from app.api.v0.endpoints import support as support_endpoints
 from app.api.v0.endpoints import legal as legal_endpoints
@@ -103,6 +105,8 @@ async def lifespan(app: FastAPI):
         prefix="gisviz-cache",
     )
     print(f"[FastAPICache] Redis backend initialised  (version={_VERSION})")
+    from app.services import dataset_sync
+    dataset_sync.start_background()     # register/refresh datasets published from the DuckDB workspace
     yield
     await redis_client.aclose()
     print("[FastAPICache] Redis connection closed")
@@ -113,6 +117,34 @@ UsersBase.metadata.create_all(bind=users_engine)
 PostsBase.metadata.create_all(bind=posts_engine)
 AnalyticsBase.metadata.create_all(bind=analytics_engine)
 AdminBase.metadata.create_all(bind=admin_engine)
+DatasetsBase.metadata.create_all(bind=datasets_engine)
+
+
+def _upgrade_schemas() -> None:
+    """create_all() never adds columns to tables that already exist, so columns added later
+    are ensured here (idempotent, safe with several workers starting together)."""
+    from sqlalchemy import text
+    posts_stmts = [
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS dataset_id VARCHAR(64)",
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS visual_spec JSONB",
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS theme_color VARCHAR(7)",
+        "CREATE INDEX IF NOT EXISTS ix_posts_dataset_id ON posts (dataset_id)",
+        # the catalog moved to its own database, so the old same-database foreign key is dropped
+        "ALTER TABLE posts DROP CONSTRAINT IF EXISTS fk_posts_dataset",
+    ]
+    dataset_stmts = [
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS columns JSONB",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS data_uploaded_at TIMESTAMPTZ",
+        "ALTER TABLE datasets ALTER COLUMN status SET DEFAULT 'draft'",
+    ]
+    for engine, stmts in ((posts_engine, posts_stmts), (datasets_engine, dataset_stmts)):
+        with engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(424242)"))
+            for sql in stmts:
+                conn.execute(text(sql))
+
+
+_upgrade_schemas()
 
 
 # ── App — docs disabled at framework level, served manually below ─────────────
@@ -133,6 +165,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Chart/map payloads are large JSON (often 50-500 KB); gzip cuts the transfer ~5-8x.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
@@ -149,6 +183,7 @@ app.include_router(search.router,            prefix=f"{settings.API_V0_STR}/sear
 app.include_router(admin_endpoints.router,   prefix=f"{settings.API_V0_STR}/admin",      tags=["Admin"])
 app.include_router(support_endpoints.router, prefix=f"{settings.API_V0_STR}/support",    tags=["Support"])
 app.include_router(legal_endpoints.router,   prefix=f"{settings.API_V0_STR}/legal",      tags=["Legal"])
+app.include_router(visuals_endpoints.router, prefix=f"{settings.API_V0_STR}/visuals",    tags=["Visuals"])
 app.include_router(seo.router,               prefix=f"{settings.API_V0_STR}/seo",        tags=["SEO"])
 
 # ── Admin-only API docs ───────────────────────────────────────────────────────
@@ -216,7 +251,7 @@ def seed_database():
             {"name": "editor",    "permissions": {"manage_tags": True, "moderate": True, "publish": True}},
             {"name": "publisher", "permissions": {"publish": True}},
             {"name": "viewer",    "permissions": {}},
-            {"name": "support",   "permissions": {"view_reports": True}},
+            {"name": "support",   "permissions": {"view_reports": True, "publish": True}},
         ]
         role_map = {}
         for rd in role_defs:
