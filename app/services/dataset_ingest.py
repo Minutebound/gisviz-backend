@@ -1,13 +1,13 @@
 """
 app/services/dataset_ingest.py
 ==============================
-Turns an uploaded file (Parquet recommended; CSV/TSV/GeoJSON/JSON also accepted) into the
-dataset's DuckDB file DATASETS_DIR/<code>.duckdb (one table `data`), profiles its columns for the
-chart suggester, records that on the Postgres row (which makes the dataset active) and clears
-the dataset's cached charts. Used by the admin upload endpoint.
+Reading uploaded files into DuckDB and profiling them (used inside the DuckDB service), plus the
+API-side ingest() that sends an upload to that service and records the result in Postgres.
 
-Geometry for maps: a `geometry`/`geom` column holding GeoJSON or WKT text (export GEOMETRY/WKB as
-GeoJSON text, e.g. ST_AsGeoJSON, before writing Parquet), or lat/lon (latitude/longitude) columns.
+Accepted uploads: see app/duckstore/convert.py (Parquet/GeoParquet, CSV/TSV, JSON, GeoJSON, Excel,
+ODS, Arrow, Shapefile zip, GeoPackage, KML/KMZ, GPX, FlatGeobuf, GML, TopoJSON, DXF, File Geodatabase);
+non-native formats are converted to Parquet first. Geometry for maps: a geometry column (GeoJSON,
+WKT or WKB; reprojected to WGS84), or lat/lon (latitude/longitude) columns.
 """
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from typing import Optional
 
 import duckdb
 
-from app.services import duckdb_service as store
 
 TIME_NAMES = re.compile(r"(^|_)(year|yr|month|quarter|week|day|date|period|time|timestamp)($|_)")
 LAT = ("latitude", "lat")
@@ -29,7 +28,7 @@ LON = ("longitude", "lon", "lng", "long")
 GEOM_COLS = ("_gv_geom", "geometry", "geom", "geojson")
 NUMERIC = ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "FLOAT", "DOUBLE", "DECIMAL",
            "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "REAL")
-ALLOWED = (".parquet", ".csv", ".tsv", ".geojson", ".json", ".gpkg", ".shp", ".kml")
+from app.duckstore.convert import SUPPORTED as ALLOWED   # every format the upload accepts (converted if needed)
 
 
 class IngestError(Exception):
@@ -65,10 +64,11 @@ def _walk(coords, acc):
 
 # ── readers -> temp table `_stage` (optionally with _gv_geom) ────────
 
-def _stage_geojson(con, path: Path) -> None:
+def _stage_geojson(con, path: Path, tmp_dir: Optional[Path] = None) -> None:
     gj = json.loads(path.read_text(encoding="utf-8"))
     feats = gj["features"] if gj.get("type") == "FeatureCollection" else [gj]
-    with tempfile.NamedTemporaryFile("w", suffix=".ndjson", delete=False, encoding="utf-8") as tmp:
+    with tempfile.NamedTemporaryFile("w", suffix=".ndjson", delete=False, encoding="utf-8",
+                                     dir=str(tmp_dir) if tmp_dir else None) as tmp:
         for f in feats:
             if not f.get("geometry"):
                 continue
@@ -178,7 +178,7 @@ def _stage_tabular(con, path: Path, ext: str) -> None:
     p = str(path).replace("'", "''")
     if ext == ".parquet":
         con.execute(f"CREATE TEMP TABLE _stage AS SELECT * FROM read_parquet('{p}')")
-    elif ext == ".json":
+    elif ext in (".json", ".ndjson", ".jsonl"):
         con.execute(f"CREATE TEMP TABLE _stage AS SELECT * FROM read_json_auto('{p}')")
     else:
         _read_csv(con, p)
@@ -198,16 +198,6 @@ def _stage_tabular(con, path: Path, ext: str) -> None:
             WHERE {q(lat)} IS NOT NULL AND {q(lon)} IS NOT NULL""")
 
 
-def _stage_spatial(con, path: Path, src_crs: Optional[str]) -> None:
-    try:
-        con.execute("INSTALL spatial; LOAD spatial;")
-    except Exception as e:
-        raise IngestError("This format needs DuckDB's spatial extension; upload GeoJSON or Parquet instead") from e
-    p = str(path).replace("'", "''")
-    geom = f"ST_Transform(geom, '{src_crs}', 'EPSG:4326', always_xy := true)" if src_crs else "geom"
-    con.execute(f"CREATE TEMP TABLE _stage AS SELECT * EXCLUDE (geom), ST_AsGeoJSON({geom}) AS _gv_geom FROM ST_Read('{p}')")
-
-
 # ── profile ──────────────────────────────────────────────────────────
 
 def classify(name: str, sql_type: str, n_distinct: int, rows: int) -> str:
@@ -225,8 +215,8 @@ def classify(name: str, sql_type: str, n_distinct: int, rows: int) -> str:
     return "text"
 
 
-def _create_data(con) -> None:
-    """_stage -> table `data` (snake_case unique names, _gv_id row order, optional _gv_geom)."""
+def _create_data(con, table: str = "data") -> None:
+    """_stage -> `table` (snake_case unique names, _gv_id row order, optional _gv_geom)."""
     cols = con.execute("DESCRIBE _stage").fetchall()
     raw = [c[0] for c in cols if c[0] != "_gv_geom"]
     if not raw:
@@ -234,23 +224,24 @@ def _create_data(con) -> None:
     names = unique_names(raw)
     has_geom = any(c[0] == "_gv_geom" for c in cols)
     sel = ", ".join(f"{q(o)} AS {q(n)}" for o, n in zip(raw, names))
-    con.execute("CREATE TABLE data AS SELECT row_number() OVER ()::BIGINT AS _gv_id, " + sel
+    con.execute(f"CREATE TABLE {q(table)} AS SELECT row_number() OVER ()::BIGINT AS _gv_id, " + sel
                 + (", _gv_geom::VARCHAR AS _gv_geom" if has_geom else "") + " FROM _stage")
-    if con.execute("SELECT count(*) FROM data").fetchone()[0] == 0:
+    if con.execute(f"SELECT count(*) FROM {q(table)}").fetchone()[0] == 0:
         raise IngestError("The table has no rows")
 
 
-def profile(con) -> dict:
-    """Profile table `data`: rows, per-column stats + dtype, geometry type and bbox."""
-    schema = [(r[0], r[1]) for r in con.execute("DESCRIBE data").fetchall()]
-    rows = con.execute("SELECT count(*) FROM data").fetchone()[0]
+def profile(con, table: str = "data") -> dict:
+    """Profile `table`: rows, per-column stats + dtype, geometry type and bbox."""
+    T = q(table)
+    schema = [(r[0], r[1]) for r in con.execute(f"DESCRIBE {T}").fetchall()]
+    rows = con.execute(f"SELECT count(*) FROM {T}").fetchone()[0]
     has_geom = any(n == "_gv_geom" for n, _ in schema)
     out = []
     for i, (n, t) in enumerate([c for c in schema if c[0] not in ("_gv_id", "_gv_geom")]):
-        nd, nulls = con.execute(f"SELECT count(DISTINCT {q(n)}), count(*) - count({q(n)}) FROM data").fetchone()
+        nd, nulls = con.execute(f"SELECT count(DISTINCT {q(n)}), count(*) - count({q(n)}) FROM {T}").fetchone()
         mn = mx = None
         if t.split("(")[0] in NUMERIC:
-            mn, mx = con.execute(f"SELECT min({q(n)})::DOUBLE, max({q(n)})::DOUBLE FROM data").fetchone()
+            mn, mx = con.execute(f"SELECT min({q(n)})::DOUBLE, max({q(n)})::DOUBLE FROM {T}").fetchone()
         out.append({"column_name": n, "label": n.replace("_", " "), "dtype": classify(n, t, nd, rows), "sql_type": t,
                     "n_distinct": int(nd), "null_frac": (nulls / rows) if rows else 0.0,
                     "min_val": mn, "max_val": mx, "ordinal": i})
@@ -258,7 +249,7 @@ def profile(con) -> dict:
     geometry_type, bbox = None, None
     if has_geom:
         kinds, pts = set(), []
-        for (g,) in con.execute("SELECT _gv_geom FROM data WHERE _gv_geom IS NOT NULL").fetchall():
+        for (g,) in con.execute(f"SELECT _gv_geom FROM {T} WHERE _gv_geom IS NOT NULL").fetchall():
             try:
                 gj = json.loads(g)
             except (TypeError, ValueError):
@@ -279,70 +270,35 @@ def profile(con) -> dict:
     return {"rows": int(rows), "columns": out, "geometry_type": geometry_type, "bbox": bbox, "crs": "EPSG:4326"}
 
 
-def profile_file(path: Path) -> dict:
-    con = duckdb.connect(str(path), read_only=True)
-    try:
-        return profile(con)
-    finally:
-        con.close()
-
-
-def stage_file(con, src: Path, original_name: str, src_crs: Optional[str] = None) -> str:
+def stage_file(con, src: Path, original_name: str, src_crs: Optional[str] = None,
+               tmp_dir: Optional[Path] = None) -> str:
     """Read a source file into temp table `_stage` (with _gv_geom when it has geometry). Returns the format."""
     ext = Path(original_name).suffix.lower()
-    if ext not in ALLOWED:
-        raise IngestError(f"Unsupported file type '{ext}'. Use one of: {', '.join(ALLOWED)}")
+    if ext not in (".parquet", ".csv", ".tsv", ".txt", ".json", ".ndjson", ".jsonl", ".geojson"):
+        raise IngestError(f"Unsupported file type '{ext}' (convert it first)")
     if ext in (".geojson",) or (ext == ".json" and '"FeatureCollection"' in src.read_text(encoding="utf-8", errors="ignore")[:4000]):
-        _stage_geojson(con, src); return "geojson"
-    if ext in (".gpkg", ".shp", ".kml"):
-        _stage_spatial(con, src, src_crs); return ext[1:]
+        _stage_geojson(con, src, tmp_dir); return "geojson"
     _stage_tabular(con, src, ext); return ext[1:]
 
 
-# ── public API ───────────────────────────────────────────────────────
+# ── API side: upload -> DuckDB service -> Postgres record ─────────────
 
-def build_file(dataset_id: str, src: Path, original_name: str, src_crs: Optional[str] = None) -> dict:
-    """Build <DATASETS_DIR>/<dataset_id>.duckdb from a source file and swap it in atomically."""
-    target = store.path_for(dataset_id)          # validates the id
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f".{dataset_id}.{uuid.uuid4().hex}.tmp")
-    con = duckdb.connect(str(tmp))
-    try:
-        con.execute("SET threads=2")
-        fmt = stage_file(con, src, original_name, src_crs)
-        _create_data(con)
-        info = profile(con)
-        con.execute("DROP TABLE _stage")
-        con.execute("CHECKPOINT")
-    except IngestError:
-        con.close(); tmp.unlink(missing_ok=True); raise
-    except duckdb.Error as e:
-        con.close(); tmp.unlink(missing_ok=True)
-        raise IngestError(f"Could not read the data: {str(e).splitlines()[0][:300]}") from e
-    con.close()
-    os.replace(tmp, target)                      # atomic: API readers switch on their next query
-    return {**info, "format": fmt}
-
-
-def ingest(dataset_id: str, src: Path, original_name: str, src_crs: Optional[str] = None) -> dict:
-    """Build the dataset file, store the profile on its row (-> active) and clear cached charts."""
-    import hashlib
-    from app.services import catalog_service, visual_service
+def ingest(dataset_id: str, src: Path, original_name: str) -> dict:
+    """Send the file to the DuckDB service (table <code> in gisviz.duckdb), store the profile on the
+    dataset's row (which makes it active) and clear the dataset's cached charts."""
+    from app.services import catalog_service, duckdb_service, visual_service
     if not catalog_service.exists(dataset_id):
         raise IngestError(f"Dataset '{dataset_id}' does not exist")
-    info = build_file(dataset_id, src, original_name, src_crs)
-    digest = hashlib.sha1()
-    with open(store.path_for(dataset_id), "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            digest.update(chunk)
-    info["data_version"] = digest.hexdigest()[:16]
-    store.evict(dataset_id)
+    try:
+        info = duckdb_service.load(dataset_id, src, original_name)
+    except duckdb_service.EngineError as e:
+        raise IngestError(str(e)) from e
     catalog_service.record_upload(dataset_id, info)
     visual_service.invalidate(dataset_id)
     return {"dataset_id": dataset_id, "rows": info["rows"], "columns": len(info["columns"]),
             "geometry_type": info["geometry_type"], "format": info["format"], "data_version": info["data_version"]}
 
 
-def remove_file(dataset_id: str) -> None:
-    store.evict(dataset_id)
-    store.path_for(dataset_id).unlink(missing_ok=True)
+def remove(dataset_id: str) -> None:
+    from app.services import duckdb_service
+    duckdb_service.drop(dataset_id)

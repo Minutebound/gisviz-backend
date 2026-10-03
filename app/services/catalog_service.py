@@ -6,7 +6,7 @@ dataset_id; the /datasets page and the post picker list it.
 
 Admins manage it on /admin/datasets:
   create  -> a code is generated (ds_00001, ds_00002, ...) and the row starts `inactive`
-  upload  -> the Parquet file becomes DATASETS_DIR/<code>.duckdb and the row turns `active`
+  upload  -> the Parquet file becomes table <code> in gisviz.duckdb (DuckDB service); row turns `active`
   toggle  -> active / inactive (inactive = hidden from /datasets and the post picker;
              posts already built on it keep working)
   edit    -> title, description, category, source, licence, publisher
@@ -217,3 +217,25 @@ def record_upload(dataset_id: str, info: dict) -> None:
         r.status = "active"
         r.keywords = _keywords(r)
         db.commit()
+
+
+# ── sync with the DuckDB store ────────────────────────────────────────
+
+def data_versions() -> dict[str, dict]:
+    """{code: {status, data_version, has_data}} for every dataset row."""
+    with DatasetsSessionLocal() as db:
+        return {i: {"status": st, "data_version": v, "has_data": bool(c)}
+                for i, st, v, c in db.query(DatasetRecord.dataset_id, DatasetRecord.status,
+                                            DatasetRecord.data_version, DatasetRecord.columns)}
+
+
+def mark_missing(dataset_id: str) -> None:
+    """The store has no table for this row: make it inactive and forget the old profile."""
+    with DatasetsSessionLocal() as db:
+        r = db.get(DatasetRecord, dataset_id)
+        if r is not None:
+            r.status = "inactive"
+            r.columns = None
+            r.row_count = 0
+            r.data_version = None
+            db.commit()

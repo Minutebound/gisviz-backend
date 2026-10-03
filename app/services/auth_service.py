@@ -1,3 +1,4 @@
+import uuid
 import random
 import string
 import secrets
@@ -7,7 +8,7 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from jose import JWTError, jwt
+from jose import ExpiredSignatureError, JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, status, Depends
@@ -42,15 +43,32 @@ class AuthenticationService:
     # ----------------------------------------------------------------
     # JWT & Roles
     # ----------------------------------------------------------------
-    def create_access_token(self, subject: str) -> str:
-        expire = datetime.now(timezone.utc) + timedelta(
-            minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES
-        )
-        return jwt.encode(
-            {"exp": expire, "sub": str(subject)},
-            settings.JWT_SECRET_KEY,
-            algorithm=settings.JWT_ALGORITHM,
-        )
+    def create_access_token(self, subject: str, token_version: int = 0) -> str:
+        """Session token. No expiry when JWT_ACCESS_TOKEN_EXPIRE_MINUTES is 0 (the default): the
+        session lasts until logout (jti revoked) or a password change/reset (token_version bumped)."""
+        now = datetime.now(timezone.utc)
+        claims = {"sub": str(subject), "jti": uuid.uuid4().hex, "tv": int(token_version or 0), "iat": now}
+        if settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES > 0:
+            claims["exp"] = now + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+        return jwt.encode(claims, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+    def revoke_token(self, db: Session, token: str) -> None:
+        """Logout: this one token (device) stops working."""
+        from app.db.models import RevokedTokenRecord
+        try:
+            claims = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM],
+                                options={"verify_exp": False})
+        except JWTError:
+            return
+        jti, sub = claims.get("jti"), claims.get("sub")
+        if jti and sub and db.get(RevokedTokenRecord, jti) is None:
+            db.add(RevokedTokenRecord(jti=jti, user_id=sub))
+            db.commit()
+
+    def end_all_sessions(self, db: Session, user: PlatformUserRecord) -> None:
+        """Password change/reset or 'log out everywhere': every existing token stops working."""
+        user.token_version = (user.token_version or 0) + 1
+        db.commit()
 
     def _resolve_default_role(self, db: Session) -> RoleRecord | None:
         return db.query(RoleRecord).filter(RoleRecord.name == DEFAULT_ROLE_NAME).first()
@@ -281,6 +299,7 @@ class AuthenticationService:
         user.hashed_security_password = self.get_password_hash(new_password)
         user.password_reset_token = None
         user.reset_token_expires_at = None
+        user.token_version = (user.token_version or 0) + 1      # log out every device
         db.commit()
         return {"status": "Password has been successfully reset"}
 
@@ -295,32 +314,52 @@ auth_service = AuthenticationService()
 # FastAPI dependencies (THESE WERE MISSING!)
 # ----------------------------------------------------------------
 
+_REASONS = {
+    "missing": "Not signed in.",
+    "expired": "Your session expired. Please sign in again.",
+    "invalid": "Your session is no longer valid. Please sign in again.",
+    "ended": "You were signed out (logout or password change). Please sign in again.",
+}
+
+
+def _user_from_token(token: Optional[str], db: Session) -> tuple[Optional[PlatformUserRecord], Optional[str]]:
+    """(user, None) for a valid session token, else (None, reason)."""
+    from app.db.models import RevokedTokenRecord
+    if not token:
+        return None, "missing"
+    try:
+        claims = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    except ExpiredSignatureError:
+        return None, "expired"                     # issued with an expiry (JWT_ACCESS_TOKEN_EXPIRE_MINUTES > 0)
+    except JWTError:
+        return None, "invalid"                     # bad signature: JWT_SECRET_KEY changed, or a tampered token
+    user_id = claims.get("sub")
+    if not user_id:
+        return None, "invalid"
+    user = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == user_id).first()
+    if user is None:
+        return None, "invalid"
+    if int(claims.get("tv", 0)) != (user.token_version or 0):
+        return None, "ended"                       # password changed / logged out everywhere
+    jti = claims.get("jti")
+    if jti and db.get(RevokedTokenRecord, jti) is not None:
+        return None, "ended"                       # this device logged out
+    return user, None
+
+
 def get_current_authenticated_user(
     token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_users_db),
 ) -> PlatformUserRecord:
-    """Requires a valid JWT — raises 401 if missing or invalid."""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-    )
-    if not token:
-        raise credentials_exception
-    try:
-        payload = jwt.decode(
-            token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
-        )
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-
-    user = db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_id == user_id
-    ).first()
+    """Requires a valid session token — raises 401 if missing, invalid or logged out."""
+    user, reason = _user_from_token(token, db)
     if user is None:
-        raise credentials_exception
+        if reason != "missing":
+            print(f"[auth] 401 ({reason})", flush=True)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_REASONS.get(reason, "Could not validate credentials"),
+        )
     if user.is_verified == 0:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -344,21 +383,7 @@ def get_optional_current_user(
     Used by public endpoints (stream, post detail) that annotate
     is_liked / is_bookmarked only when a user is authenticated.
     """
-    if not token:
-        return None
-    try:
-        payload = jwt.decode(
-            token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
-        )
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            return None
-    except JWTError:
-        return None
-
-    user = db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_id == user_id
-    ).first()
+    user, _reason = _user_from_token(token, db)
     if user is None or user.is_verified == 0 or user.is_active == 0:
         return None
     return user
@@ -389,5 +414,5 @@ require_publisher = RoleChecker(PUBLISHING_ROLES)
 
 # Roles allowed to manage datasets (create, upload, activate, edit, delete) on /admin/datasets.
 # Add "publisher" here (and in the frontend lib/roles.ts) to let publishers manage datasets too.
-DATASET_MANAGER_ROLES = ["admin"]
+DATASET_MANAGER_ROLES = ["admin","publisher"]
 require_dataset_manager = RoleChecker(DATASET_MANAGER_ROLES)

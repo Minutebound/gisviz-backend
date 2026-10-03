@@ -6,7 +6,7 @@ from typing import List, Literal, Optional
 
 class PlatformConfigurationSettings(BaseSettings):
     PROJECT_NAME: str = "Gisviz Enterprise API"
-    VERSION: str = "3.1.0"
+    VERSION: str = "0.0.0"
     API_V0_STR: str = "/api/v0"
 
     # ── Environment gate ──────────────────────────────────────────────
@@ -26,10 +26,19 @@ class PlatformConfigurationSettings(BaseSettings):
     # ── Auth / JWT ────────────────────────────────────────────────────
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
-    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int
+    # 0 = sessions never expire; they end only on logout (or password change / reset).
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 0
 
     # ── CORS ──────────────────────────────────────────────────────────
     BACKEND_CORS_ORIGINS: str = ""   # store as raw string, split at use time
+
+    @field_validator("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", mode="before")
+    @classmethod
+    def _expiry_blank_means_never(cls, v):
+        # "JWT_ACCESS_TOKEN_EXPIRE_MINUTES=" (left blank) or "never" -> 0 = sessions last until logout
+        if v is None or (isinstance(v, str) and v.strip().lower() in ("", "0", "never", "none")):
+            return 0
+        return v
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     def _assemble_cors_origins(cls, v):

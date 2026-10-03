@@ -65,28 +65,17 @@ async def _require_admin(
     if current_user and getattr(current_user.role, "name", "") == "admin":
         return current_user
 
-    # Path 2 — ?token= query param (browser direct navigation)
+    # Path 2 — ?token= query param (browser direct navigation); same session checks as the header path
     if token_param:
+        from app.db.database import UsersSessionLocal
+        from app.services.auth_service import _user_from_token
+        db = UsersSessionLocal()
         try:
-            payload = jose_jwt.decode(
-                token_param,
-                settings.JWT_SECRET_KEY,
-                algorithms=[settings.JWT_ALGORITHM],
-            )
-            user_id = payload.get("sub")
-            if user_id:
-                from app.db.database import UsersSessionLocal
-                db = UsersSessionLocal()
-                try:
-                    user = db.query(PlatformUserRecord).filter(
-                        PlatformUserRecord.user_id == user_id
-                    ).first()
-                    if user and getattr(user.role, "name", "") == "admin":
-                        return user
-                finally:
-                    db.close()
-        except JWTError:
-            pass
+            user, _ = _user_from_token(token_param, db)
+            if user and user.is_active and getattr(user.role, "name", "") == "admin":
+                return user
+        finally:
+            db.close()
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
@@ -105,6 +94,11 @@ async def lifespan(app: FastAPI):
         prefix="gisviz-cache",
     )
     print(f"[FastAPICache] Redis backend initialised  (version={_VERSION})")
+    try:                                # datasets DB vs gisviz.duckdb (missing tables -> inactive)
+        from app.services import dataset_sync
+        dataset_sync.startup_check()
+    except Exception as e:              # never block start-up on this check
+        print(f"[dataset_sync] start-up check skipped: {type(e).__name__}: {e}", flush=True)
     yield
     await redis_client.aclose()
     print("[FastAPICache] Redis connection closed")
@@ -134,8 +128,27 @@ def _upgrade_schemas() -> None:
         "ALTER TABLE posts ADD COLUMN IF NOT EXISTS visual_spec JSONB",
         "ALTER TABLE posts ADD COLUMN IF NOT EXISTS theme_color VARCHAR(7)",
         "CREATE INDEX IF NOT EXISTS ix_posts_dataset_id ON posts (dataset_id)",
-        # the catalog moved to its own database, so the old same-database foreign key is dropped
-        "ALTER TABLE posts DROP CONSTRAINT IF EXISTS fk_posts_dataset",
+        # the catalog lives in its own database, so any old foreign key from posts.dataset_id to a
+        # datasets table in the posts database is dropped, whatever it was named
+        # (fk_posts_dataset, posts_dataset_id_fkey, ...); the link is checked in code instead
+        """
+        DO $$
+        DECLARE r record;
+        BEGIN
+          FOR r IN
+            SELECT c.conname
+            FROM pg_constraint c
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+            WHERE c.conrelid = 'posts'::regclass AND c.contype = 'f' AND a.attname = 'dataset_id'
+          LOOP
+            EXECUTE format('ALTER TABLE posts DROP CONSTRAINT %I', r.conname);
+          END LOOP;
+        END $$
+        """,
+    ]
+    users_stmts = [
+        # sessions: no expiry, ended by logout (revoked_tokens) or password change (token_version)
+        "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0",
     ]
     dataset_stmts = [
         "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS columns JSONB",
@@ -147,7 +160,7 @@ def _upgrade_schemas() -> None:
         # dataset codes ds_00001, ds_00002, ... continue after the highest existing one
         "CREATE SEQUENCE IF NOT EXISTS dataset_code_seq",
     ]
-    for engine, stmts in ((posts_engine, posts_stmts), (datasets_engine, dataset_stmts)):
+    for engine, stmts in ((users_engine, users_stmts), (posts_engine, posts_stmts), (datasets_engine, dataset_stmts)):
         with engine.begin() as conn:
             conn.execute(text("SELECT pg_advisory_xact_lock(424242)"))
             for sql in stmts:
@@ -174,9 +187,22 @@ app = FastAPI(
     openapi_url="/openapi.json",   # schema still available (needed by the custom UIs)
 )
 
+@app.middleware("http")
+async def _errors_keep_cors(request, call_next):
+    """Turn unexpected exceptions into a JSON 500 *inside* the CORS layer. Without this, a crash returns
+    a bare 500 without CORS headers and the browser only reports "Network Error", hiding the cause."""
+    try:
+        return await call_next(request)
+    except Exception as exc:                       # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": f"Server error: {type(exc).__name__}"}, status_code=500)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.BACKEND_CORS_ORIGINS,
+    allow_origins=settings.get_cors_origins(),      # list of origins (comma-separated in .env.backend)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

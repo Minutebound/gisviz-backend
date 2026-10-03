@@ -61,10 +61,21 @@ class PlatformUserRecord(UsersBase):
     following_count = Column(Integer, default=0, nullable=False)
     post_count      = Column(Integer, default=0, nullable=False)
     is_active       = Column(Integer, default=1, nullable=False)
+    # bumped on password change/reset or "log out everywhere": every older token stops working
+    token_version   = Column(Integer, default=0, server_default="0", nullable=False)
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     role     = relationship("RoleRecord", back_populates="users")
     location = relationship("UserLocationRecord", back_populates="user", uselist=False, cascade="all, delete-orphan")
+
+
+class RevokedTokenRecord(UsersBase):
+    """A session token ended by logout. Tokens have no expiry, so a logged-out token is listed here
+    (by its jti) and rejected from then on."""
+    __tablename__ = "revoked_tokens"
+    jti        = Column(String(32), primary_key=True)
+    user_id    = Column(UUID(as_uuid=True), nullable=False, index=True)
+    revoked_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class UserLocationRecord(UsersBase):
@@ -104,8 +115,9 @@ class FollowCurrentRecord(UsersBase):
 class DatasetRecord(DatasetsBase):
     """
     Catalog row for one dataset, in the DATASETS database. Admins create it on /admin/datasets
-    (dataset_id is a generated code: ds_00001, ds_00002, ...), upload its Parquet file (stored as
-    DATASETS_DIR/<dataset_id>.duckdb; the profile fields below are filled and it becomes active),
+    (dataset_id is a generated code: ds_00001, ds_00002, ...), upload its Parquet file (loaded as
+    table <dataset_id> in gisviz.duckdb by the DuckDB service; the profile fields below are filled
+    and it becomes active),
     activate/deactivate, edit and delete it. Posts reference it by dataset_id (different database,
     so the link is checked in code).
     """

@@ -42,16 +42,18 @@ class VisualParams(BaseModel):
     x: Optional[str] = None
     y: Optional[str] = None
     label_field: Optional[str] = None
+    z: Optional[str] = None        # series / second category (stacked bar, heatmap)
+    size: Optional[str] = None     # numeric column for bubble size
 
 
 class PostPayload(BaseModel):
     title: str
     description: Optional[str] = None
-    # Either an uploaded image path, or a dataset_id (+ visual params) to render from DuckDB.
-    visual_image_path: Optional[str] = None
+    # Posts are built from a dataset: dataset_id (+ visual params) renders from DuckDB.
+    # Required when creating; on edit, omit it to keep the current visual.
     dataset_id: Optional[str] = None
     visual_params: Optional[VisualParams] = None
-    theme_color: Optional[str] = None      # hex like #06ba24, used to colour the visual
+    theme_color: Optional[str] = None      # hex like #06ba24, saved on the post and used to colour the visual
     note: Optional[str] = None
     source_name: Optional[str] = None
     source_url: Optional[str] = None
@@ -69,6 +71,8 @@ class PostResponse(BaseModel):
     visual_image_path: Optional[str] = None
     dataset_id: Optional[str] = None
     visual_spec: Optional[dict] = None
+    theme_color: Optional[str] = None
+    dataset: Optional[dict] = None          # linked dataset metadata (title, source, licence, rows...)
     note: Optional[str] = None
     source_name: Optional[str] = None
     source_url: Optional[str] = None

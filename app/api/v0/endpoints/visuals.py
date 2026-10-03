@@ -1,8 +1,8 @@
 """
 app/api/v0/endpoints/visuals.py
 ===============================
-Dataset catalog, visual suggestions and chart/map data. Each dataset's data is one DuckDB
-file (DATASETS_DIR/<id>.duckdb), read-only for the API.
+Dataset catalog, visual suggestions and chart/map data. Each dataset's data is one table
+(named by its code, ds_00001 ...) in the analytical store gisviz.duckdb, served by the DuckDB service.
 
   GET  /visuals/catalog                       public dataset list (q, category, kind, page) (public)
   GET  /visuals/catalog/{id}                  public dataset card + columns                (public)
@@ -17,8 +17,11 @@ file (DATASETS_DIR/<id>.duckdb), read-only for the API.
   POST   /visuals/manage/datasets                 create -> code ds_00001..., inactive
   PUT    /visuals/manage/datasets/{id}            edit details
   PUT    /visuals/manage/datasets/{id}/status     {"active": true|false}
-  POST   /visuals/manage/datasets/{id}/data       upload the Parquet file -> DuckDB, becomes active
-  DELETE /visuals/manage/datasets/{id}            delete record + file (refused while posts use it)
+  POST   /visuals/manage/datasets/{id}/data       upload the Parquet file -> table <code> in gisviz.duckdb, active
+  DELETE /visuals/manage/datasets/{id}            delete record + table (refused while posts use it)
+  GET    /visuals/manage/datasets/{id}/preview    first rows of the table
+  GET    /visuals/manage/sync                     datasets DB vs gisviz.duckdb consistency
+  POST   /visuals/manage/sync                     fix: missing tables -> inactive; ?drop_orphans=true drops tables without a record
 """
 import os
 import tempfile
@@ -32,7 +35,7 @@ from sqlalchemy.orm import Session
 
 from app.db.database import get_admin_db
 from app.db.models import PlatformUserRecord, log_admin_action
-from app.services import catalog_service, dataset_ingest, duckdb_service, visual_service as vs
+from app.services import catalog_service, dataset_ingest, dataset_sync, duckdb_service, visual_service as vs
 from app.services.auth_service import require_dataset_manager, require_publisher
 from app.services.viz_recommender import VIZ_REGISTRY
 
@@ -47,6 +50,8 @@ def _guard(fn, *a, **kw):
         raise HTTPException(status_code=e.status, detail=e.message)
     except duckdb_service.StoreUnavailable:
         raise HTTPException(status_code=409, detail="This dataset's data has not been uploaded yet")
+    except duckdb_service.EngineError as e:
+        raise HTTPException(status_code=e.status if e.status >= 500 else 400, detail=e.message)
 
 
 def _safe(d: dict) -> dict:
@@ -162,7 +167,7 @@ def _audit(admin_db, user, request: Request, action: str, dataset_id: str, paylo
 
 
 def _row(dataset_id: str, row: dict, status_code: int = 200) -> JSONResponse:
-    row["has_data"] = duckdb_service.has_data(dataset_id)
+    row["has_data"] = bool(row.get("column_count"))
     return JSONResponse(_safe(row), status_code=status_code)
 
 
@@ -171,7 +176,7 @@ def manage_list(q: str = Query("", max_length=80), status: Optional[str] = Query
                 _user: PlatformUserRecord = Depends(require_dataset_manager)):
     rows = catalog_service.list_admin(q, status)
     for r in rows:
-        r["has_data"] = duckdb_service.has_data(r["dataset_id"])
+        r["has_data"] = bool(r.get("column_count"))
     return JSONResponse([_safe(r) for r in rows])
 
 
@@ -221,23 +226,18 @@ def manage_status(dataset_id: str, body: DatasetStatus, request: Request, admin_
 def manage_upload(dataset_id: str, request: Request, file: UploadFile = File(...),
                   admin_db: Session = Depends(get_admin_db),
                   user: PlatformUserRecord = Depends(require_dataset_manager)):
-    """Upload the dataset's Parquet file: written into the gisviz data folder as <code>.duckdb,
-    profiled, and the dataset becomes active. Uploading again replaces the data atomically."""
+    """Upload the dataset's Parquet file: loaded into gisviz.duckdb as table <code> (via the DuckDB
+    service), profiled, and the dataset becomes active. Uploading again replaces the table atomically."""
     dataset_id = _check_id(dataset_id)
     if not catalog_service.exists(dataset_id):
         raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' does not exist")
     name = Path(file.filename or "").name
     ext = Path(name).suffix.lower()
     if ext not in dataset_ingest.ALLOWED:
-        raise HTTPException(status_code=415, detail="Upload a .parquet file (CSV and GeoJSON also work)")
+        raise HTTPException(status_code=415, detail=f"Unsupported file type. Upload one of: {', '.join(dataset_ingest.ALLOWED)}")
 
     limit = MAX_UPLOAD_MB * 1024 * 1024
-    incoming = duckdb_service.DATASETS_DIR / ".incoming"
-    try:
-        incoming.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        raise HTTPException(status_code=500, detail=f"The server cannot write to {duckdb_service.DATASETS_DIR}")
-    fd, tmp_name = tempfile.mkstemp(suffix=ext, dir=incoming)
+    fd, tmp_name = tempfile.mkstemp(suffix=ext)
     tmp = Path(tmp_name)
     try:
         size = 0
@@ -254,9 +254,6 @@ def manage_upload(dataset_id: str, request: Request, file: UploadFile = File(...
         except dataset_ingest.IngestError as e:
             print(f"[datasets] upload rejected for {dataset_id} ({name}): {e}")
             raise HTTPException(status_code=422, detail=str(e))
-        except PermissionError as e:
-            print(f"[datasets] cannot write dataset files: {e}")
-            raise HTTPException(status_code=500, detail=f"The server cannot write to {duckdb_service.DATASETS_DIR}")
         except HTTPException:
             raise
         except Exception as e:
@@ -279,7 +276,39 @@ def manage_delete(dataset_id: str, request: Request, admin_db: Session = Depends
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:
         raise HTTPException(status_code=409, detail=str(e))
-    dataset_ingest.remove_file(dataset_id)
+    try:
+        dataset_ingest.remove(dataset_id)
+    except duckdb_service.EngineError as e:
+        print(f"[datasets] record {dataset_id} deleted but its table could not be dropped: {e.message}")
     vs.invalidate(dataset_id)
     _audit(admin_db, user, request, "dataset.delete", dataset_id)
     return {"deleted": dataset_id}
+
+
+def _store_guard(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except duckdb_service.StoreUnavailable as e:
+        raise HTTPException(status_code=404, detail=str(e) or "No data loaded for this dataset")
+    except duckdb_service.EngineError as e:
+        raise HTTPException(status_code=e.status, detail=e.message)
+
+
+@router.get("/manage/datasets/{dataset_id}/preview")
+def manage_preview(dataset_id: str, limit: int = Query(50, ge=1, le=500),
+                   _user: PlatformUserRecord = Depends(require_dataset_manager)):
+    return JSONResponse(_store_guard(duckdb_service.preview, _check_id(dataset_id), limit))
+
+
+@router.get("/manage/sync")
+def manage_sync_status(_user: PlatformUserRecord = Depends(require_dataset_manager)):
+    return JSONResponse(_store_guard(dataset_sync.status))
+
+
+@router.post("/manage/sync")
+def manage_sync_fix(request: Request, drop_orphans: bool = Query(False), admin_db: Session = Depends(get_admin_db),
+                    user: PlatformUserRecord = Depends(require_dataset_manager)):
+    result = _store_guard(dataset_sync.fix, drop_orphans)
+    _audit(admin_db, user, request, "dataset.sync_fix", "*",
+           {"fixed_missing": result["fixed_missing"], "dropped_orphans": result["dropped_orphans"]})
+    return JSONResponse(result)

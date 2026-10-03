@@ -1,109 +1,120 @@
 """
 app/services/duckdb_service.py
 ==============================
-Read-only access to the per-dataset DuckDB files.
+The API's client for the analytical store (gisviz.duckdb, one table per dataset code).
 
-Layout:  $DATASETS_DIR/<dataset_id>.duckdb   (the gisviz data folder, default /app/data/gisviz)
-         each file holds ONE table, `data` (columns + _gv_id row order + optional _gv_geom GeoJSON)
+* DUCKDB_SERVICE_URL set (Docker / production): every call goes over HTTP to the `duckdb`
+  container, the only process that opens gisviz.duckdb. Any number of API workers can share it.
+* DUCKDB_SERVICE_URL unset (local dev without Docker, tests): the same engine runs embedded in
+  this process. Use ONE worker in that mode.
 
-* Files are written only by dataset_ingest (the admin upload endpoint): it builds a
-  temp file and swaps it in with os.replace, so readers never see a half-written file.
-* Each API worker keeps a small LRU of read-only connections, one per dataset file.
-  When a file's mtime changes (new upload) the next query reopens it transparently.
-* One cursor per query keeps concurrent requests thread-safe.
+Chart/map SQL refers to the dataset as `data`; the store maps it to the dataset's table.
 """
 from __future__ import annotations
 
 import os
-import re
-import threading
-from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Sequence
 
-import duckdb
+SERVICE_URL = os.getenv("DUCKDB_SERVICE_URL", "").rstrip("/")
+TOKEN = os.getenv("DUCKDB_SERVICE_TOKEN", "")
+TIMEOUT = float(os.getenv("DUCKDB_SERVICE_TIMEOUT", "60"))
+UPLOAD_TIMEOUT = float(os.getenv("DUCKDB_UPLOAD_TIMEOUT", "1800"))
 
-DATASETS_DIR = Path(os.getenv("DATASETS_DIR", "data/gisviz"))
-MAX_OPEN = int(os.getenv("DATASETS_MAX_OPEN", "64"))
-_ID_RE = re.compile(r"^[a-z0-9_]{1,64}$")
-
-_lock = threading.Lock()
-_cons: "OrderedDict[str, tuple[duckdb.DuckDBPyConnection, float]]" = OrderedDict()
+_client = None
 
 
 class StoreUnavailable(RuntimeError):
-    """The dataset's data file has not been uploaded yet."""
+    """The dataset has no table in the store (not uploaded yet, or dropped)."""
 
 
-def path_for(dataset_id: str) -> Path:
-    if not _ID_RE.match(dataset_id or ""):
-        raise ValueError("invalid dataset id")
-    return DATASETS_DIR / f"{dataset_id}.duckdb"
+class EngineError(RuntimeError):
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.message, self.status = message, status
 
 
-def has_data(dataset_id: str) -> bool:
+def _http():
+    global _client
+    if _client is None:
+        import httpx
+        _client = httpx.Client(base_url=SERVICE_URL, timeout=TIMEOUT,
+                               headers={"X-Duckdb-Token": TOKEN} if TOKEN else {},
+                               limits=httpx.Limits(max_connections=50, max_keepalive_connections=20))
+    return _client
+
+
+def _call(method: str, path: str, *, timeout: float | None = None, **kw):
+    import httpx
     try:
-        return path_for(dataset_id).exists()
-    except ValueError:
-        return False
+        r = _http().request(method, path, timeout=timeout or TIMEOUT, **kw)
+    except httpx.HTTPError as e:
+        raise EngineError(f"The DuckDB service is not reachable ({type(e).__name__})", 503)
+    if r.status_code >= 400:
+        try:
+            detail = r.json().get("detail")
+        except Exception:
+            detail = r.text[:300]
+        if r.status_code == 404 and detail == "Not Found":
+            # the route itself is missing: wrong DUCKDB_SERVICE_URL, or the duckdb container runs old code
+            raise EngineError(f"The DuckDB service at {SERVICE_URL} has no {path} endpoint; check "
+                              "DUCKDB_SERVICE_URL points to the duckdb container and rebuild it", 502)
+        if r.status_code == 404:
+            raise StoreUnavailable(detail or "No data loaded")
+        raise EngineError(str(detail), r.status_code)
+    return r.json()
 
 
-def _connection(dataset_id: str) -> duckdb.DuckDBPyConnection:
-    p = path_for(dataset_id)
+def _embedded():
+    from app.duckstore.engine import get_engine
+    return get_engine()
+
+
+def _wrap(fn, *a, **kw):
+    from app.duckstore.engine import EngineError as _EE
     try:
-        mtime = p.stat().st_mtime
-    except FileNotFoundError as exc:
-        raise StoreUnavailable(f"No data uploaded for {dataset_id}") from exc
-    with _lock:
-        hit = _cons.get(dataset_id)
-        if hit and hit[1] == mtime:
-            _cons.move_to_end(dataset_id)
-            return hit[0]
-        if hit:                                   # file was replaced by a new upload
-            _close(hit[0])
-        con = duckdb.connect(str(p), read_only=True)
-        con.execute("SET memory_limit='768MB'")
-        con.execute("SET threads=2")
-        _cons[dataset_id] = (con, mtime)
-        while len(_cons) > MAX_OPEN:              # keep the most recently used files open
-            _close(_cons.popitem(last=False)[1][0])
-        return con
+        return fn(*a, **kw)
+    except _EE as e:
+        if e.status == 404:
+            raise StoreUnavailable(e.message)
+        raise EngineError(e.message, e.status)
 
 
-def _close(con) -> None:
-    try:
-        con.close()
-    except Exception:
-        pass
-
+# ── public API ───────────────────────────────────────────────────────
 
 def query(dataset_id: str, sql: str, params: Sequence[Any] = ()) -> list[dict]:
-    """Run SQL against one dataset file. The table is always called `data`."""
-    for attempt in (1, 2):
-        cur = _connection(dataset_id).cursor()
-        try:
-            res = cur.execute(sql, list(params))
-            cols = [d[0] for d in res.description]
-            return [dict(zip(cols, row)) for row in res.fetchall()]
-        except duckdb.ConnectionException:
-            # another thread swapped in a newer upload between cursor() and execute(): retry once
-            if attempt == 2:
-                raise
-        finally:
-            _close(cur)
+    if SERVICE_URL:
+        return _call("POST", f"/tables/{dataset_id}/query", json={"sql": sql, "params": list(params)})
+    return _wrap(_embedded().query, dataset_id, sql, params)
+
+
+def load(dataset_id: str, src: Path, original_name: str) -> dict:
+    """Create/replace the dataset's table from an uploaded file; returns its profile + version."""
+    if SERVICE_URL:
+        with open(src, "rb") as fh:
+            return _call("POST", f"/tables/{dataset_id}", timeout=UPLOAD_TIMEOUT,
+                         files={"file": (Path(original_name).name, fh)}, data={"name": Path(original_name).name})
+    return _wrap(_embedded().load, dataset_id, Path(src), original_name)
+
+
+def drop(dataset_id: str) -> bool:
+    if SERVICE_URL:
+        return bool(_call("DELETE", f"/tables/{dataset_id}").get("dropped"))
+    return _wrap(_embedded().drop, dataset_id)
+
+
+def tables() -> list[dict]:
+    if SERVICE_URL:
+        return _call("GET", "/tables")
+    return _wrap(_embedded().tables)
+
+
+def preview(dataset_id: str, limit: int = 50) -> dict:
+    if SERVICE_URL:
+        return _call("GET", f"/tables/{dataset_id}/preview", params={"limit": limit})
+    return _wrap(_embedded().preview, dataset_id, limit)
 
 
 def evict(dataset_id: str) -> None:
-    with _lock:
-        hit = _cons.pop(dataset_id, None)
-    if hit:
-        _close(hit[0])
-
-
-def reset() -> None:
-    """Close every cached connection (tests, shutdown)."""
-    with _lock:
-        items = list(_cons.values())
-        _cons.clear()
-    for con, _ in items:
-        _close(con)
+    """Kept for compatibility (nothing is cached per dataset any more)."""
+    return None

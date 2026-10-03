@@ -1,7 +1,7 @@
 """
 app/services/visual_image.py
 ============================
-Renders the static preview image (1200x630 JPEG) that the feed card and share
+Renders the static preview image (1200x630 PNG) that the feed card and share
 previews use. Runs on the server at publish time, so it needs no browser and
 the image always matches the interactive visual stored in the post.
 """
@@ -68,33 +68,162 @@ def _style(ax):
     ax.set_axisbelow(True)
 
 
+PALETTE = ["#3b7ea1", "#d4a017", "#5b8c5a", "#8e5ea2", "#c0504d", "#2a9d8f", "#e76f51", "#6d6875"]   # keep in sync with D3Chart.tsx
+
+
+def _series_colors(accent: str, n: int) -> list[str]:
+    return ([accent] + PALETTE)[:max(1, n)] if n <= len(PALETTE) + 1 else [_mix(accent, "#ffffff", i / n * 0.7) for i in range(n)]
+
+
+def _squarify(values: list[float], x: float, y: float, w: float, h: float):
+    """Squarified treemap: returns one (x, y, w, h) rectangle per value (values sorted high to low)."""
+    total = sum(values) or 1.0
+    areas = [v / total * w * h for v in values]
+    rects, rest = [], list(zip(range(len(values)), areas))
+    out = {}
+
+    def worst(row, side):
+        s_ = sum(a for _, a in row)
+        return max(max(side * side * a / (s_ * s_), (s_ * s_) / (side * side * a)) for _, a in row)
+
+    while rest:
+        side = min(w, h)
+        row = [rest[0]]
+        i = 1
+        while i < len(rest) and worst(row + [rest[i]], side) <= worst(row, side):
+            row.append(rest[i]); i += 1
+        rest = rest[i:]
+        s_ = sum(a for _, a in row)
+        if w >= h:
+            cw = s_ / h
+            yy = y
+            for idx, a in row:
+                out[idx] = (x, yy, cw, a / cw); yy += a / cw
+            x += cw; w -= cw
+        else:
+            ch = s_ / w
+            xx = x
+            for idx, a in row:
+                out[idx] = (xx, y, a / ch, ch); xx += a / ch
+            y += ch; h -= ch
+    return [out[i] for i in range(len(values))]
+
+
 def _draw_chart(fig, spec: dict, rows: list[dict], accent: str):
     x, y, kind = spec["x"], spec["y"], spec["chart_type"]
-    pts = [(r.get(x), _num(r.get(y))) for r in rows if _num(r.get(y)) is not None]
     ax = fig.add_axes([0.08, 0.14, 0.88, 0.66])
     _style(ax)
+    if not rows:
+        ax.text(0.5, 0.5, "No data", ha="center", color=SOFT, transform=ax.transAxes)
+        return
+    ylab = lambda: (ax.set_ylabel(y, color=SOFT, fontsize=10), ax.yaxis.set_major_formatter(lambda v, _p: _fmt(v)))
+
+    if kind in ("stacked", "heatmap"):
+        z = spec["z"]
+        xs = list(dict.fromkeys(str(r.get(x)) for r in rows))
+        zs = list(dict.fromkeys(str(r.get(z)) for r in rows))
+        cell = {(str(r.get(x)), str(r.get(z))): _num(r.get(y)) or 0 for r in rows}
+        if kind == "stacked":
+            cols = _series_colors(accent, len(zs))
+            bottoms = [0.0] * len(xs)
+            for zi, zv in enumerate(zs):
+                vals = [cell.get((xv, zv), 0) for xv in xs]
+                ax.bar(range(len(xs)), vals, bottom=bottoms, color=cols[zi], width=0.7, label=zv[:16])
+                bottoms = [b + v for b, v in zip(bottoms, vals)]
+            ax.legend(frameon=False, fontsize=8, ncol=min(len(zs), 4), loc="upper left", labelcolor=SOFT)
+            ylab()
+        else:
+            ax.grid(False)
+            mat = [[cell.get((xv, zv)) for xv in xs] for zv in zs]
+            cmap = LinearSegmentedColormap.from_list("gv", [_mix(accent, "#ffffff", 0.9), accent, _mix(accent, "#000000", 0.45)])
+            ax.imshow([[v if v is not None else float("nan") for v in r] for r in mat], cmap=cmap, aspect="auto")
+            ax.set_yticks(range(len(zs))); ax.set_yticklabels([z_[:14] for z_ in zs])
+            for s_ in ("left", "bottom"):
+                ax.spines[s_].set_visible(False)
+        step = max(1, len(xs) // 12)
+        ax.set_xticks(range(0, len(xs), step))
+        ax.set_xticklabels([l[:12] for l in xs[::step]], rotation=30, ha="right")
+        return
+
+    if kind == "histogram":
+        vals = [_num(r.get("count")) or 0 for r in rows]
+        lefts = [_num(r.get("x0")) or 0 for r in rows]
+        widths = [(_num(r.get("x1")) or 0) - (_num(r.get("x0")) or 0) for r in rows]
+        ax.bar(lefts, vals, width=widths, align="edge", color=accent, edgecolor=BG, linewidth=1)
+        ax.set_xlabel(y, color=SOFT, fontsize=10); ax.set_ylabel("count", color=SOFT, fontsize=10)
+        return
+
+    if kind == "bubble":
+        s_key = spec["size"]
+        pts = [(_num(r.get(x)), _num(r.get(y)), _num(r.get(s_key))) for r in rows]
+        pts = [p for p in pts if None not in p]
+        if pts:
+            lo, hi = min(p[2] for p in pts), max(p[2] for p in pts)
+            sizes = [40 + 900 * ((p[2] - lo) / ((hi - lo) or 1)) for p in pts]
+            ax.scatter([p[0] for p in pts], [p[1] for p in pts], s=sizes, color=accent, alpha=0.55, edgecolors=accent)
+        ax.set_xlabel(f"{x}  (bubble size = {s_key})", color=SOFT, fontsize=10); ylab()
+        return
+
+    pts = [(r.get(x), _num(r.get(y))) for r in rows if _num(r.get(y)) is not None]
     if not pts:
         ax.text(0.5, 0.5, "No data", ha="center", color=SOFT, transform=ax.transAxes)
         return
+
     if kind == "scatter":
-        xs = [_num(p[0]) for p in pts]
-        ax.scatter(xs, [p[1] for p in pts], s=28, color=accent, alpha=0.75, edgecolors="none")
-        ax.set_xlabel(x, color=SOFT, fontsize=10)
+        ax.scatter([_num(p[0]) for p in pts], [p[1] for p in pts], s=28, color=accent, alpha=0.75, edgecolors="none")
+        ax.set_xlabel(x, color=SOFT, fontsize=10); ylab()
+        return
+
+    labels = [str(p[0]) for p in pts]
+    vals = [p[1] for p in pts]
+    idx = list(range(len(pts)))
+
+    if kind == "donut":
+        ax.set_visible(False)
+        pax = fig.add_axes([0.06, 0.08, 0.5, 0.74])
+        cols = _series_colors(accent, len(vals))
+        pax.pie(vals, colors=cols, startangle=90, counterclock=False, wedgeprops={"width": 0.38, "edgecolor": BG, "linewidth": 2})
+        total = sum(vals) or 1
+        fig.legend(pax.patches, [f"{l[:22]}  {v / total:.0%}" for l, v in zip(labels, vals)],
+                   loc="center left", bbox_to_anchor=(0.6, 0.45), frameon=False, fontsize=11, labelcolor=INK)
+        return
+
+    if kind == "treemap":
+        ax.set_visible(False)
+        tax = fig.add_axes([0.04, 0.08, 0.92, 0.74]); tax.axis("off")
+        order = sorted(zip(labels, vals), key=lambda t: -t[1])[:40]
+        order = [o for o in order if o[1] > 0]
+        if order:
+            rects = _squarify([o[1] for o in order], 0, 0, 100, 60)
+            hi = max(o[1] for o in order)
+            for (lab, v), (rx, ry, rw, rh) in zip(order, rects):
+                tax.add_patch(PathPatch(Path([(rx, ry), (rx + rw, ry), (rx + rw, ry + rh), (rx, ry + rh), (rx, ry)],
+                                             [Path.MOVETO, Path.LINETO, Path.LINETO, Path.LINETO, Path.CLOSEPOLY]),
+                                        facecolor=_mix(accent, "#ffffff", 0.75 - 0.6 * (v / hi)), edgecolor=BG, linewidth=2))
+                if rw > 6 and rh > 4:
+                    tax.text(rx + 0.8, ry + rh - 1.0, lab[:int(rw * 0.9)], fontsize=9, color=INK, va="top", fontweight="bold")
+            tax.set_xlim(0, 100); tax.set_ylim(0, 60); tax.invert_yaxis()
+        return
+
+    step = max(1, len(labels) // 12)
+    if kind == "hbar":
+        ax.grid(axis="y", visible=False); ax.grid(axis="x", color=GRID, linewidth=0.8)
+        ax.barh(range(len(vals)), list(reversed(vals)), color=accent, height=0.7)
+        ax.set_yticks(range(len(vals))); ax.set_yticklabels([l[:22] for l in reversed(labels)])
+        ax.xaxis.set_major_formatter(lambda v, _p: _fmt(v)); ax.set_xlabel(y, color=SOFT, fontsize=10)
+        return
+    if kind == "bar":
+        ax.bar(idx, vals, color=accent, width=0.7)
+    elif kind == "area":
+        ax.fill_between(idx, vals, color=accent, alpha=0.22); ax.plot(idx, vals, color=accent, linewidth=2.4)
     else:
-        labels = [str(p[0]) for p in pts]
-        idx = list(range(len(pts)))
-        vals = [p[1] for p in pts]
-        if kind == "bar":
-            ax.bar(idx, vals, color=accent, width=0.7)
-        else:
-            ax.plot(idx, vals, color=accent, linewidth=2.6)
-            if len(pts) <= 40:
-                ax.scatter(idx, vals, s=22, color=accent, zorder=3)
-        step = max(1, len(labels) // 12)
-        ax.set_xticks(idx[::step])
-        ax.set_xticklabels([l[:12] for l in labels[::step]], rotation=30 if kind == "bar" else 0, ha="right" if kind == "bar" else "center")
-    ax.set_ylabel(y, color=SOFT, fontsize=10)
-    ax.yaxis.set_major_formatter(lambda v, _p: _fmt(v))
+        ax.plot(idx, vals, color=accent, linewidth=2.6)
+        if len(pts) <= 40:
+            ax.scatter(idx, vals, s=22, color=accent, zorder=3)
+    ax.set_xticks(idx[::step])
+    rot = 30 if kind == "bar" else 0
+    ax.set_xticklabels([l[:12] for l in labels[::step]], rotation=rot, ha="right" if rot else "center")
+    ylab()
 
 
 def _rings(geom: dict):
@@ -135,6 +264,15 @@ def _draw_map(fig, spec: dict, fc: dict, accent: str):
     ax = fig.add_axes([0.04, 0.06, 0.92, 0.78])
     ax.set_facecolor(BG)
     ax.axis("off")
+    if spec.get("map_style") == "heat":
+        px = [f["geometry"]["coordinates"][0] for f in feats if f.get("geometry") and f["geometry"].get("type") == "Point"]
+        py = [f["geometry"]["coordinates"][1] for f in feats if f.get("geometry") and f["geometry"].get("type") == "Point"]
+        if px:
+            ax.hexbin(px, py, gridsize=40, cmap=cmap, mincnt=1, linewidths=0.2, edgecolors=BG)
+            import math
+            ax.set_aspect(1 / max(0.2, math.cos(math.radians((max(py) + min(py)) / 2))))
+            fig.text(0.70, 0.115, "point density", fontsize=9, color=SOFT)
+        return
     xs, ys, pts = [], [], []
     for f, v in zip(feats, vals):
         g = f.get("geometry")
@@ -180,7 +318,7 @@ def _draw_map(fig, spec: dict, fc: dict, accent: str):
 
 def render_thumbnail(title: str, subtitle: str, spec: dict, payload: Any, out_dir: str = VISUAL_DIR,
                      accent: str | None = None) -> str:
-    """Render and save the preview. Returns the DB path, e.g. /uploads/visuals/post_<hex>.jpg"""
+    """Render and save the preview. Returns the DB path, e.g. /uploads/visuals/post_<hex>.png"""
     os.makedirs(out_dir, exist_ok=True)
     accent = accent or ACCENT
     fig = _frame(title, subtitle, accent)
@@ -188,7 +326,7 @@ def render_thumbnail(title: str, subtitle: str, spec: dict, payload: Any, out_di
         _draw_map(fig, spec, payload, accent)
     else:
         _draw_chart(fig, spec, payload, accent)
-    name = f"post_{uuid.uuid4().hex}.jpg"
-    fig.savefig(os.path.join(out_dir, name), format="jpg", dpi=DPI, facecolor=BG,
-                pil_kwargs={"quality": 88, "optimize": True})
+    name = f"post_{uuid.uuid4().hex}.png"
+    fig.savefig(os.path.join(out_dir, name), format="png", dpi=DPI, facecolor=BG,
+                pil_kwargs={"optimize": True})
     return f"/uploads/visuals/{name}"

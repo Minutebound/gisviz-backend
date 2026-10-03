@@ -257,11 +257,6 @@ services:
       # No Docker volume used. Files persist across redeploys because
       # git clean -fd never touches uploads/ (it is gitignored).
       - ./uploads:/app/uploads
-      # gisviz data folder: one DuckDB file per dataset (/app/data/gisviz/ds_00001.duckdb ...),
-      # written when an admin uploads a dataset's Parquet file on /admin/datasets. Named volume, so the
-      # files survive rebuilds and are owned by the container user. Back up with:
-      #   docker run --rm -v gisviz-datasets:/d -v "$PWD":/b alpine tar czf /b/gisviz-datasets.tgz -C /d .
-      - datasets-data:/app/data
     depends_on:
       users-db:
         condition: service_healthy
@@ -272,6 +267,8 @@ services:
       admin-db:
         condition: service_healthy
       datasets-db:
+        condition: service_healthy
+      duckdb:
         condition: service_healthy
       cache:
         condition: service_healthy
@@ -312,6 +309,42 @@ services:
     networks:
       - gisviz-network
 
+  # ────────────────────────────────────────────────────────
+  # 9. DuckDB analytical store (gisviz.duckdb: one table per dataset, ds_00001, ds_00002, ...)
+  #    The ONLY process that opens gisviz.duckdb (one worker), so there are no file-lock conflicts.
+  #    The API reaches it at http://duckdb:8100 with the shared DUCKDB_SERVICE_TOKEN (.env.backend).
+  #    Not published to the host. Inspect data from /admin/datasets (preview + SQL console).
+  #    Backup (consistent copy): docker compose stop duckdb && \
+  #      docker run --rm -v gisviz-duckdb-data:/d -v "$PWD":/b alpine tar czf /b/gisviz-duckdb.tgz -C /d . && \
+  #      docker compose start duckdb
+  # ────────────────────────────────────────────────────────
+  duckdb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    container_name: gisviz-duckdb
+    restart: always
+    command: ["uvicorn", "app.duckstore.server:app", "--host", "0.0.0.0", "--port", "8100", "--workers", "1"]
+    env_file:
+      - path: .env.backend
+        required: true
+    environment:
+      DUCKDB_PATH: /app/duckdb/gisviz.duckdb
+      DUCKDB_THREADS: "4"
+      DUCKDB_MEMORY_LIMIT: 2GB
+    volumes:
+      - ./app:/app/app
+      - duckdb-data:/app/duckdb
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    networks:
+      - gisviz-network
+
 networks:
   gisviz-network:
     name: gisviz-network
@@ -332,7 +365,7 @@ volumes:
     name: gisviz-redis-insight-data
   pgadmin-data:
     name: gisviz-pgadmin-data
-  datasets-data:
-    name: gisviz-datasets
+  duckdb-data:
+    name: gisviz-duckdb-data
   datasets-db-data:
     name: gisviz-datasets-db-data

@@ -153,6 +153,8 @@ class PostService:
             raise HTTPException(status_code=e.status, detail=e.message)
         except duckdb_service.StoreUnavailable:
             raise HTTPException(status_code=409, detail="This dataset's data has not been uploaded yet")
+        except duckdb_service.EngineError as e:
+            raise HTTPException(status_code=503 if e.status >= 500 else 400, detail=e.message)
 
         image_path = None
         try:

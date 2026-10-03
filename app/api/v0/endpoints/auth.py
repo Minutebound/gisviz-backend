@@ -13,7 +13,7 @@ from app.schemas.user_schema import (
     ResetPasswordPayload,
     ChangePasswordRequest,
 )
-from app.services.auth_service import auth_service, get_current_authenticated_user
+from app.services.auth_service import auth_service, get_current_authenticated_user, oauth2_scheme
 from app.db.models import PlatformUserRecord
 
 router = APIRouter()
@@ -123,7 +123,7 @@ def login(
             },
         )
 
-    access_token = auth_service.create_access_token(subject=str(user.user_id))
+    access_token = auth_service.create_access_token(subject=str(user.user_id), token_version=user.token_version)
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -163,5 +163,23 @@ def change_password(
         raise HTTPException(status_code=400, detail="Incorrect current password.")
 
     current_user.hashed_security_password = auth_service.get_password_hash(payload.new_password)
-    db.commit()
-    return {"status": "success", "message": "Password updated successfully."}
+    auth_service.end_all_sessions(db, current_user)          # other devices are logged out
+    # this device keeps working with a fresh token
+    access_token = auth_service.create_access_token(str(current_user.user_id), current_user.token_version)
+    return {"status": "success", "message": "Password updated successfully.", "access_token": access_token}
+
+
+@router.post("/logout")
+def logout(token: str = Depends(oauth2_scheme), db: Session = Depends(get_users_db)):
+    """End this session: the token stops working on the server (sessions otherwise never expire)."""
+    if token:
+        auth_service.revoke_token(db, token)
+    return {"status": "logged_out"}
+
+
+@router.post("/logout-all")
+def logout_all(db: Session = Depends(get_users_db),
+               current_user: PlatformUserRecord = Depends(get_current_authenticated_user)):
+    """End every session of this account on every device."""
+    auth_service.end_all_sessions(db, current_user)
+    return {"status": "logged_out_everywhere"}
