@@ -135,7 +135,7 @@ class PostService:
    # ------------------------------------------------------------------
     # Create
     # ------------------------------------------------------------------
-    def _prepare_dataset_visual(self, payload):
+    def _prepare_dataset_visual(self, payload, allow_inactive: bool = False):
         """Validate the dataset choice, build the spec, warm the Redis payload cache and
         render the preview PNG from that same payload (one DuckDB query in total)."""
         vp = payload.visual_params
@@ -146,8 +146,9 @@ class PostService:
                 getattr(vp, "y", None), getattr(vp, "label_field", None),
                 accent=payload.theme_color,
                 z=getattr(vp, "z", None), size=getattr(vp, "size", None),
+                allow_inactive=allow_inactive,
             )
-            data = visual_service.warm(payload.dataset_id, spec)   # readers start on a cache hit
+            data = visual_service.warm(payload.dataset_id, spec, allow_inactive)   # readers start on a cache hit
         except visual_service.VisualError as e:
             raise HTTPException(status_code=e.status, detail=e.message)
         except duckdb_service.StoreUnavailable:
@@ -155,7 +156,7 @@ class PostService:
 
         image_path = None
         try:
-            card = visual_service.get_card(payload.dataset_id)
+            card = visual_service.get_card(payload.dataset_id, allow_inactive)
             image_path = visual_image.render_thumbnail(
                 title=payload.title, subtitle=f"{card['title']} · {card.get('source_name') or ''}".strip(" ·"),
                 spec=spec, payload=data, accent=spec.get("accent"),
@@ -246,7 +247,9 @@ class PostService:
         # Changing the dataset, chart or theme colour rebuilds the spec and the preview PNG.
         if payload.dataset_id:
             payload.dataset_id = payload.dataset_id.strip().lower()
-            spec, image_path = self._prepare_dataset_visual(payload)
+            # a post may keep (and re-chart) its own dataset even after that dataset was deactivated
+            spec, image_path = self._prepare_dataset_visual(
+                payload, allow_inactive=(payload.dataset_id == post.dataset_id))
             old_image = post.visual_image_path
             post.dataset_id = payload.dataset_id
             post.visual_spec = spec

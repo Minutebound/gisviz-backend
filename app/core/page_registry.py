@@ -81,6 +81,13 @@ PAGE_REGISTRY: list[PageDefinition] = [
         description="Approve or reject category suggestions.",
     ),
     PageDefinition(
+        key="admin_datasets",
+        label="Datasets",
+        path="/admin/datasets",
+        required_permission="admin",
+        description="Create datasets (ds_ codes), upload their Parquet files, activate/deactivate, edit, delete.",
+    ),
+    PageDefinition(
         key="admin_erd",
         label="ERD",
         path="/admin/erd",

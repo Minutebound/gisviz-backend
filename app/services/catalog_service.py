@@ -4,17 +4,13 @@ app/services/catalog_service.py
 Dataset catalog in Postgres (the DATASETS database, table `datasets`). Posts link to it by
 dataset_id; the /datasets page and the post picker list it.
 
-Rows are created and refreshed by dataset_sync from the published DuckDB files; managers
-edit the descriptive fields and the status on /datasets/manage.
-
-Lifecycle of a row
-  draft   - found in DuckDB, not published yet (title = id until edited) -> hidden from readers/pickers
-  active  - published by a manager                                       -> listed everywhere
-  hidden  - temporarily hidden, or its DuckDB table was removed; existing posts keep their PNG
-  retired - no longer offered; existing posts keep working
-
-The column profile the chart suggester needs is stored on the row (`columns`, JSONB),
-so listing/searching never opens DuckDB files.
+Admins manage it on /admin/datasets:
+  create  -> a code is generated (ds_00001, ds_00002, ...) and the row starts `inactive`
+  upload  -> the Parquet file becomes DATASETS_DIR/<code>.duckdb and the row turns `active`
+  toggle  -> active / inactive (inactive = hidden from /datasets and the post picker;
+             posts already built on it keep working)
+  edit    -> title, description, category, source, licence, publisher
+  delete  -> only when no post uses it (otherwise deactivate it)
 """
 from __future__ import annotations
 
@@ -26,7 +22,8 @@ from sqlalchemy import case, func, or_
 from app.db.database import DatasetsSessionLocal, PostsSessionLocal
 from app.db.models import DatasetRecord
 
-STATUSES = ("draft", "active", "hidden", "retired")
+STATUSES = ("inactive", "active")
+CODE_PREFIX = "ds_"
 META_FIELDS = ("title", "description", "category", "source_name", "source_url", "license", "publisher")
 _FIELDS = ("dataset_id", "title", "description", "category", "format", "source_name", "source_url",
            "license", "publisher", "geometry_type", "row_count", "crs", "bbox", "data_version", "updated_timestamp")
@@ -66,11 +63,14 @@ def search(term: str, limit: int) -> list[dict]:
         return [_card(r) for r in q.limit(limit).all()]
 
 
-def get(dataset_id: str) -> Optional[dict]:
+def get(dataset_id: str, include_inactive: bool = False) -> Optional[dict]:
+    """Active dataset card; include_inactive=True also returns deactivated ones that still have data
+    (used to keep existing posts working after a dataset is deactivated)."""
     with DatasetsSessionLocal() as db:
-        r = db.query(DatasetRecord).filter(
-            DatasetRecord.dataset_id == dataset_id, DatasetRecord.status == "active").first()
-        return _card(r) if r else None
+        r = db.get(DatasetRecord, dataset_id)
+        if r is None or (r.status != "active" and not (include_inactive and r.columns)):
+            return None
+        return _card(r)
 
 
 def get_columns(dataset_id: str) -> list[dict]:
@@ -115,7 +115,7 @@ def post_count(dataset_id: str) -> int:
             PostRecord.dataset_id == dataset_id, PostRecord.is_active == 1).scalar() or 0
 
 
-# ── dataset managers (admin / publisher) ─────────────────────────────
+# ── dataset managers (admin) ──────────────────────────────────────────
 
 def exists(dataset_id: str) -> bool:
     with DatasetsSessionLocal() as db:
@@ -131,67 +131,89 @@ def list_admin(term: str = "", status: Optional[str] = None) -> list[dict]:
         if term:
             like = f"%{term}%"
             q = q.filter(or_(DatasetRecord.dataset_id.ilike(like), DatasetRecord.title.ilike(like)))
-        return [_admin_card(r) for r in q.order_by(DatasetRecord.updated_timestamp.desc()).limit(500).all()]
+        return [_admin_card(r) for r in q.order_by(DatasetRecord.created_timestamp.desc()).limit(1000).all()]
+
+
+def _clean(meta: dict) -> dict:
+    return {k: ((meta[k] or "").strip() or None) for k in META_FIELDS if k in meta and meta[k] is not None}
+
+
+def next_code(db) -> str:
+    from sqlalchemy import text
+    n = db.execute(text("SELECT nextval('dataset_code_seq')")).scalar()
+    return f"{CODE_PREFIX}{int(n):05d}"
+
+
+def create(meta: dict) -> dict:
+    """New dataset record with a generated code; inactive until its file is uploaded."""
+    fields = _clean(meta)
+    if not fields.get("title"):
+        raise ValueError("A title is required")
+    with DatasetsSessionLocal() as db:
+        r = DatasetRecord(dataset_id=next_code(db), status="inactive", row_count=0, **fields)
+        r.keywords = _keywords(r)
+        db.add(r)
+        db.commit()
+        db.refresh(r)
+        return _admin_card(r)
 
 
 def update_meta(dataset_id: str, meta: dict) -> dict:
-    """Edit a dataset's descriptive fields and/or status (rows are created by the sync, not here)."""
-    status = meta.get("status")
+    """Edit a dataset's descriptive fields."""
     with DatasetsSessionLocal() as db:
         r = db.get(DatasetRecord, dataset_id)
         if r is None:
             raise LookupError(f"Dataset '{dataset_id}' does not exist")
-        for k in META_FIELDS:
-            if k in meta and meta[k] is not None:
-                setattr(r, k, (meta[k] or "").strip() or None)
-        if not r.title:
+        for k, v in _clean(meta).items():
+            setattr(r, k, v)
+        if "title" in meta and not (meta["title"] or "").strip():
             raise ValueError("A title is required")
-        if status:
-            if status not in STATUSES:
-                raise ValueError(f"status must be one of {', '.join(STATUSES)}")
-            if status == "active" and not r.columns:
-                raise ValueError("This dataset has no data in DuckDB yet")
-            r.status = status
         r.keywords = _keywords(r)
         db.commit()
         db.refresh(r)
         return _admin_card(r)
 
 
-def versions() -> dict[str, tuple[Optional[str], str]]:
-    """{dataset_id: (data_version, status)} for the sync."""
-    with DatasetsSessionLocal() as db:
-        return {i: (v, s) for i, v, s in db.query(DatasetRecord.dataset_id, DatasetRecord.data_version, DatasetRecord.status)}
-
-
-def record_data(dataset_id: str, info: dict) -> bool:
-    """Create (as draft) or refresh a dataset row from its published DuckDB file. Returns True if created."""
+def set_active(dataset_id: str, active: bool) -> dict:
     with DatasetsSessionLocal() as db:
         r = db.get(DatasetRecord, dataset_id)
-        created = r is None
-        if created:
-            r = DatasetRecord(dataset_id=dataset_id, title=dataset_id.replace("_", " ").capitalize(), status="draft")
-            db.add(r)
+        if r is None:
+            raise LookupError(f"Dataset '{dataset_id}' does not exist")
+        if active and not r.columns:
+            raise ValueError("Upload the dataset's file before activating it")
+        r.status = "active" if active else "inactive"
+        db.commit()
+        db.refresh(r)
+        return _admin_card(r)
+
+
+def delete(dataset_id: str) -> None:
+    """Remove the record. Refused while posts use the dataset (deactivate it instead)."""
+    n = post_count(dataset_id)
+    if n:
+        raise PermissionError(f"{n} post(s) use this dataset; deactivate it instead of deleting")
+    with DatasetsSessionLocal() as db:
+        r = db.get(DatasetRecord, dataset_id)
+        if r is None:
+            raise LookupError(f"Dataset '{dataset_id}' does not exist")
+        db.delete(r)
+        db.commit()
+
+
+def record_upload(dataset_id: str, info: dict) -> None:
+    """Called after the uploaded file is in place: store its profile and make the dataset active."""
+    with DatasetsSessionLocal() as db:
+        r = db.get(DatasetRecord, dataset_id)
+        if r is None:
+            raise LookupError(f"Dataset '{dataset_id}' does not exist")
         r.columns = info["columns"]
         r.row_count = info["rows"]
         r.geometry_type = info["geometry_type"]
         r.bbox = info["bbox"]
         r.crs = info["crs"]
-        r.format = "duckdb"
+        r.format = info.get("format")
         r.data_version = info["data_version"]
         r.data_uploaded_at = dt.datetime.now(dt.timezone.utc)
+        r.status = "active"
         r.keywords = _keywords(r)
         db.commit()
-        return created
-
-
-def mark_missing(dataset_id: str) -> None:
-    """The DuckDB table behind an active row disappeared: hide it (posts keep their PNG)."""
-    with DatasetsSessionLocal() as db:
-        r = db.get(DatasetRecord, dataset_id)
-        if r is not None and r.data_version is not None:
-            if r.status == "active":
-                r.status = "hidden"
-            r.data_version = None
-            r.columns = None
-            db.commit()

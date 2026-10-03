@@ -80,9 +80,9 @@ def search(term: str = "", limit: int = 12) -> list[dict]:
     return catalog.search(term, max(1, min(limit, 50)))
 
 
-def get_card(dataset_id: str) -> dict:
+def get_card(dataset_id: str, allow_inactive: bool = False) -> dict:
     dataset_id = _check_id(dataset_id)
-    card = catalog.get(dataset_id)
+    card = catalog.get(dataset_id, include_inactive=allow_inactive)
     if not card:
         raise VisualError("Dataset not found", 404)
     return {k: _json_safe(v) for k, v in card.items()}
@@ -93,8 +93,8 @@ def get_columns(dataset_id: str) -> list[dict]:
     return catalog.get_columns(dataset_id)
 
 
-def suggest(dataset_id: str) -> dict:
-    card = get_card(dataset_id)
+def suggest(dataset_id: str, allow_inactive: bool = False) -> dict:
+    card = get_card(dataset_id, allow_inactive)
     cols = get_columns(card["dataset_id"])
     if not cols:      # catalog row exists but the data file has not been uploaded yet
         raise VisualError("This dataset's data is not available on the server yet", 404)
@@ -108,9 +108,9 @@ def suggest(dataset_id: str) -> dict:
 
 def plan(dataset_id: str, viz: Optional[str] = None, x: Optional[str] = None,
          y: Optional[str] = None, label_field: Optional[str] = None,
-         z: Optional[str] = None, size: Optional[str] = None) -> dict:
+         z: Optional[str] = None, size: Optional[str] = None, allow_inactive: bool = False) -> dict:
     """Validate a visual request against the dataset and fill missing params from the recommender."""
-    info = suggest(dataset_id)
+    info = suggest(dataset_id, allow_inactive)
     options = {o["viz"]: o for o in info["options"]}
     viz = viz or info["recommended"]
     if viz not in VIZ_REGISTRY:
@@ -193,17 +193,18 @@ def clean_accent(accent: Optional[str]) -> Optional[str]:
 
 
 def build_spec(dataset_id: str, viz=None, x=None, y=None, label_field=None, accent=None,
-               z=None, size=None) -> dict:
+               z=None, size=None, allow_inactive: bool = False) -> dict:
     """The `visual_spec` JSON that the frontend's <InteractiveVisual> renders."""
-    spec = _build_spec(dataset_id, viz, x, y, label_field, z, size)
+    spec = _build_spec(dataset_id, viz, x, y, label_field, z, size, allow_inactive)
     accent = clean_accent(accent)
     if accent:
         spec["accent"] = accent          # post theme colour
     return spec
 
 
-def _build_spec(dataset_id: str, viz=None, x=None, y=None, label_field=None, z=None, size=None) -> dict:
-    p = plan(dataset_id, viz, x, y, label_field, z, size)
+def _build_spec(dataset_id: str, viz=None, x=None, y=None, label_field=None, z=None, size=None,
+                allow_inactive: bool = False) -> dict:
+    p = plan(dataset_id, viz, x, y, label_field, z, size, allow_inactive)
     url = data_url(p["dataset"]["dataset_id"], p)
     if p["kind"] == "map":
         return {"kind": "map", "map_style": "heat" if p["viz"] == "map_heat" else "auto", "data": url,
@@ -311,8 +312,9 @@ def map_geojson(p: dict) -> dict:
     return {"type": "FeatureCollection", "features": feats}
 
 
-def payload(dataset_id: str, viz=None, x=None, y=None, label_field=None, z=None, size=None) -> Any:
-    p = plan(dataset_id, viz, x, y, label_field, z, size)
+def payload(dataset_id: str, viz=None, x=None, y=None, label_field=None, z=None, size=None,
+            allow_inactive: bool = False) -> Any:
+    p = plan(dataset_id, viz, x, y, label_field, z, size, allow_inactive)
     return map_geojson(p) if p["kind"] == "map" else chart_rows(p)
 
 
@@ -327,7 +329,7 @@ def cache_key(dataset_id: str, params: dict) -> str:
     return f"gisviz:viz:{dataset_id}:{h}"
 
 
-def payload_json(dataset_id: str, params: dict) -> tuple[str, bool]:
+def payload_json(dataset_id: str, params: dict, allow_inactive: bool = False) -> tuple[str, bool]:
     """JSON text for a chart/map request and whether it came from Redis.
 
     Hit: one Redis GET, no Postgres and no DuckDB. Miss: validate, query, serialise, store."""
@@ -337,7 +339,8 @@ def payload_json(dataset_id: str, params: dict) -> tuple[str, bool]:
     if hit is not None:
         return hit, True
     p = _norm(params)
-    body = json.dumps(payload(dataset_id, **{k: p.get(k) for k in PARAM_KEYS}), separators=(",", ":"))
+    body = json.dumps(payload(dataset_id, **{k: p.get(k) for k in PARAM_KEYS}, allow_inactive=allow_inactive),
+                      separators=(",", ":"))
     cache_service.set_raw(key, body, PAYLOAD_TTL)
     return body, False
 
@@ -349,9 +352,9 @@ def params_from_spec(spec: dict) -> dict:
     return {k: v[0] for k, v in qs.items() if k in PARAM_KEYS}
 
 
-def warm(dataset_id: str, spec: dict) -> Any:
+def warm(dataset_id: str, spec: dict, allow_inactive: bool = False) -> Any:
     """Fill the cache for a post's visual (called on publish/edit) and return the payload."""
-    body, _ = payload_json(dataset_id, params_from_spec(spec))
+    body, _ = payload_json(dataset_id, params_from_spec(spec), allow_inactive)
     return json.loads(body)
 
 

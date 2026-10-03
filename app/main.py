@@ -105,19 +105,24 @@ async def lifespan(app: FastAPI):
         prefix="gisviz-cache",
     )
     print(f"[FastAPICache] Redis backend initialised  (version={_VERSION})")
-    from app.services import dataset_sync
-    dataset_sync.start_background()     # register/refresh datasets published from the DuckDB workspace
     yield
     await redis_client.aclose()
     print("[FastAPICache] Redis connection closed")
 
 
 # ── Create tables ─────────────────────────────────────────────────────────────
-UsersBase.metadata.create_all(bind=users_engine)
-PostsBase.metadata.create_all(bind=posts_engine)
-AnalyticsBase.metadata.create_all(bind=analytics_engine)
-AdminBase.metadata.create_all(bind=admin_engine)
-DatasetsBase.metadata.create_all(bind=datasets_engine)
+def _create_tables() -> None:
+    """create_all per database under an advisory lock, so several uvicorn workers starting on a
+    fresh database do not race each other (duplicate pg_type errors)."""
+    from sqlalchemy import text
+    for base, engine in ((UsersBase, users_engine), (PostsBase, posts_engine), (AnalyticsBase, analytics_engine),
+                         (AdminBase, admin_engine), (DatasetsBase, datasets_engine)):
+        with engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(424241)"))
+            base.metadata.create_all(bind=conn)
+
+
+_create_tables()
 
 
 def _upgrade_schemas() -> None:
@@ -135,13 +140,24 @@ def _upgrade_schemas() -> None:
     dataset_stmts = [
         "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS columns JSONB",
         "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS data_uploaded_at TIMESTAMPTZ",
-        "ALTER TABLE datasets ALTER COLUMN status SET DEFAULT 'draft'",
+        # two states only: active / inactive (older draft/hidden/retired rows become inactive)
+        "ALTER TABLE datasets ALTER COLUMN status SET DEFAULT 'inactive'",
+        "UPDATE datasets SET status = 'inactive' WHERE status NOT IN ('active', 'inactive') "
+        "OR (status = 'active' AND columns IS NULL)",
+        # dataset codes ds_00001, ds_00002, ... continue after the highest existing one
+        "CREATE SEQUENCE IF NOT EXISTS dataset_code_seq",
     ]
     for engine, stmts in ((posts_engine, posts_stmts), (datasets_engine, dataset_stmts)):
         with engine.begin() as conn:
             conn.execute(text("SELECT pg_advisory_xact_lock(424242)"))
             for sql in stmts:
                 conn.execute(text(sql))
+            if stmts is dataset_stmts:        # never hand out a code that already exists
+                top = conn.execute(text("SELECT max(substring(dataset_id FROM 4)::bigint) FROM datasets "
+                                        "WHERE dataset_id ~ '^ds_[0-9]+$'")).scalar()
+                last, called = conn.execute(text("SELECT last_value, is_called FROM dataset_code_seq")).one()
+                if top and (top > last or (top == last and not called)):
+                    conn.execute(text("SELECT setval('dataset_code_seq', :n, true)"), {"n": top})
 
 
 _upgrade_schemas()

@@ -3,10 +3,10 @@ app/services/duckdb_service.py
 ==============================
 Read-only access to the per-dataset DuckDB files.
 
-Layout:  $DATASETS_DIR/<dataset_id>.duckdb   (default /app/data/datasets)
+Layout:  $DATASETS_DIR/<dataset_id>.duckdb   (the gisviz data folder, default /app/data/gisviz)
          each file holds ONE table, `data` (columns + _gv_id row order + optional _gv_geom GeoJSON)
 
-* Files are written only by dataset_ingest (the role-gated upload endpoint): it builds a
+* Files are written only by dataset_ingest (the admin upload endpoint): it builds a
   temp file and swaps it in with os.replace, so readers never see a half-written file.
 * Each API worker keeps a small LRU of read-only connections, one per dataset file.
   When a file's mtime changes (new upload) the next query reopens it transparently.
@@ -23,7 +23,7 @@ from typing import Any, Sequence
 
 import duckdb
 
-DATASETS_DIR = Path(os.getenv("DATASETS_DIR", "data/datasets"))
+DATASETS_DIR = Path(os.getenv("DATASETS_DIR", "data/gisviz"))
 MAX_OPEN = int(os.getenv("DATASETS_MAX_OPEN", "64"))
 _ID_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 

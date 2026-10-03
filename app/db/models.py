@@ -103,13 +103,14 @@ class FollowCurrentRecord(UsersBase):
 
 class DatasetRecord(DatasetsBase):
     """
-    Catalog row for one dataset, in the DATASETS database. Created and refreshed automatically by
-    app/services/dataset_sync.py from the published DuckDB files (DATASETS_DIR/<dataset_id>.duckdb);
-    managers edit the descriptive fields and publish it (draft -> active) on /datasets/manage.
-    Posts reference it by dataset_id (different database, so the link is checked in code).
+    Catalog row for one dataset, in the DATASETS database. Admins create it on /admin/datasets
+    (dataset_id is a generated code: ds_00001, ds_00002, ...), upload its Parquet file (stored as
+    DATASETS_DIR/<dataset_id>.duckdb; the profile fields below are filled and it becomes active),
+    activate/deactivate, edit and delete it. Posts reference it by dataset_id (different database,
+    so the link is checked in code).
     """
     __tablename__ = "datasets"
-    dataset_id    = Column(String(64), primary_key=True)          # == data file name
+    dataset_id    = Column(String(64), primary_key=True)          # code ds_00001 == data file name
     title         = Column(String(255), nullable=False)
     description   = Column(Text, nullable=True)
     category      = Column(String(80), nullable=True, index=True)
@@ -124,9 +125,9 @@ class DatasetRecord(DatasetsBase):
     bbox          = Column(JSONB, nullable=True)
     columns       = Column(JSONB, nullable=True)                  # column profile used by the chart suggester
     keywords      = Column(Text, nullable=True)                   # lowercase search text (id, title, columns...)
-    data_version  = Column(String(32), nullable=True)             # fingerprint of the published data file
-    data_uploaded_at = Column(DateTime(timezone=True), nullable=True)   # when that file was last (re)published
-    status        = Column(String(12), default="draft", nullable=False, index=True)    # draft | active | hidden | retired
+    data_version  = Column(String(32), nullable=True)             # fingerprint of the uploaded data file
+    data_uploaded_at = Column(DateTime(timezone=True), nullable=True)   # when the file was last uploaded
+    status        = Column(String(12), default="inactive", nullable=False, index=True)  # inactive | active
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

@@ -1,16 +1,16 @@
 """
 app/scripts/seed_samples.py
 ===========================
-Four sample tables for trying the site before your own data is in. They are created as ordinary
-tables in the DuckDB WORKSPACE (exactly like tables you make in the DuckDB UI), so they flow through
-the same path: workspace -> published file -> datasets DB (draft) -> publish on /datasets/manage.
+OPTIONAL dev helper: creates four sample datasets (new ds_ codes) and uploads their data through
+the same ingest path as the admin upload, so the site can be tried without your own files.
 
-Loaded by the workspace container when GISVIZ_SEED_SAMPLES=true (only tables that do not exist yet):
+    docker compose exec api python -m app.scripts.seed_samples
+
   us_cities         points (geometry)  -> suggests a map
   monthly_sales     table with months  -> suggests a line chart
   regional_sales    576 rows           -> exercises every chart type
   africa_countries  polygons + values  -> suggests a choropleth map
-To remove them later, DROP the tables in the DuckDB UI.
+Delete them afterwards on /admin/datasets.
 """
 import csv
 import json
@@ -105,23 +105,28 @@ def _files(tmp: Path) -> dict:
             "africa_countries": HERE / "seed_data" / "africa_countries.geojson"}
 
 
-def load_into(con) -> list[str]:
-    """Create the sample tables in the workspace connection `con` (skips ones that exist)."""
-    existing = {r[0] for r in con.execute(
-        "SELECT table_name FROM duckdb_tables() WHERE schema_name = 'main' AND database_name = current_database()").fetchall()}
-    made = []
+TITLES = {
+    "us_cities": ("US city snapshot", "demographics", "Population, income and growth for 16 US cities."),
+    "monthly_sales": ("Monthly sales", "economy", "Revenue, orders and conversion by month."),
+    "regional_sales": ("Regional sales by product", "economy", "Monthly revenue, units and margin by region, category and product (synthetic)."),
+    "africa_countries": ("Africa: population, GDP and CO2 per person", "climate", "Latest-year values per country."),
+}
+
+
+def run() -> dict:
+    """Create the four sample datasets and upload their files. Returns {sample_name: dataset_code}."""
+    from app.services import catalog_service
+    out = {}
     with tempfile.TemporaryDirectory() as d:
-        for table, path in _files(Path(d)).items():
-            if table in existing:
-                continue
-            cur = con.cursor()
-            try:
-                dataset_ingest.stage_file(cur, path, path.name)
-                cols = [r[0] for r in cur.execute("DESCRIBE _stage").fetchall()]
-                sel = "* EXCLUDE (_gv_geom), _gv_geom AS geometry" if "_gv_geom" in cols else "*"
-                cur.execute(f'CREATE TABLE main."{table}" AS SELECT {sel} FROM _stage')
-                cur.execute("DROP TABLE _stage")
-                made.append(table)
-            finally:
-                cur.close()
-    return made
+        for name, path in _files(Path(d)).items():
+            title, category, desc = TITLES[name]
+            row = catalog_service.create({"title": title, "category": category, "description": desc,
+                                          "source_name": "Sample data", "license": "CC0-1.0"})
+            r = dataset_ingest.ingest(row["dataset_id"], path, path.name)
+            print(f"{row['dataset_id']}  {title}: {r['rows']} rows, geometry={r['geometry_type']}")
+            out[name] = row["dataset_id"]
+    return out
+
+
+if __name__ == "__main__":
+    run()

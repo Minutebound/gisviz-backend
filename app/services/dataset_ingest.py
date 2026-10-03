@@ -1,15 +1,13 @@
 """
 app/services/dataset_ingest.py
 ==============================
-Builds the published, per-dataset DuckDB files the API serves (DATASETS_DIR/<id>.duckdb, one
-table `data`) and profiles them for the chart suggester.
+Turns an uploaded file (Parquet recommended; CSV/TSV/GeoJSON/JSON also accepted) into the
+dataset's DuckDB file DATASETS_DIR/<code>.duckdb (one table `data`), profiles its columns for the
+chart suggester, records that on the Postgres row (which makes the dataset active) and clears
+the dataset's cached charts. Used by the admin upload endpoint.
 
-* build_file()  - used by the DuckDB workspace publisher (app/scripts/duckdb_workspace.py): it exports
-                  a workspace table to Parquet and calls this, which normalises column names, finds the
-                  geometry (GeoJSON / WKT `geometry` column, or lat/lon) and swaps the file in atomically.
-* profile_file() - used by dataset_sync on the API side to (re)register the dataset in Postgres.
-
-Also reads CSV/TSV/GeoJSON/JSON (messy Excel exports included) for the sample loader.
+Geometry for maps: a `geometry`/`geom` column holding GeoJSON or WKT text (export GEOMETRY/WKB as
+GeoJSON text, e.g. ST_AsGeoJSON, before writing Parquet), or lat/lon (latitude/longitude) columns.
 """
 from __future__ import annotations
 
@@ -324,3 +322,27 @@ def build_file(dataset_id: str, src: Path, original_name: str, src_crs: Optional
     con.close()
     os.replace(tmp, target)                      # atomic: API readers switch on their next query
     return {**info, "format": fmt}
+
+
+def ingest(dataset_id: str, src: Path, original_name: str, src_crs: Optional[str] = None) -> dict:
+    """Build the dataset file, store the profile on its row (-> active) and clear cached charts."""
+    import hashlib
+    from app.services import catalog_service, visual_service
+    if not catalog_service.exists(dataset_id):
+        raise IngestError(f"Dataset '{dataset_id}' does not exist")
+    info = build_file(dataset_id, src, original_name, src_crs)
+    digest = hashlib.sha1()
+    with open(store.path_for(dataset_id), "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    info["data_version"] = digest.hexdigest()[:16]
+    store.evict(dataset_id)
+    catalog_service.record_upload(dataset_id, info)
+    visual_service.invalidate(dataset_id)
+    return {"dataset_id": dataset_id, "rows": info["rows"], "columns": len(info["columns"]),
+            "geometry_type": info["geometry_type"], "format": info["format"], "data_version": info["data_version"]}
+
+
+def remove_file(dataset_id: str) -> None:
+    store.evict(dataset_id)
+    store.path_for(dataset_id).unlink(missing_ok=True)

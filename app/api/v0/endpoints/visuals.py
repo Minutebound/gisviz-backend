@@ -12,25 +12,32 @@ file (DATASETS_DIR/<id>.duckdb), read-only for the API.
   GET  /visuals/datasets/{id}/spec            visual_spec for one choice     (admin/publisher/editor/support)
   GET  /visuals/datasets/{id}/data            rows / GeoJSON for a spec      (public, Redis-cached)
 
-  GET  /visuals/manage/datasets               every dataset incl. drafts              (admin/publisher)
-  PUT  /visuals/manage/datasets/{id}          edit metadata / publish (status)        (admin/publisher)
-  POST /visuals/manage/datasets/sync          register tables published from DuckDB  (admin/publisher)
-
-Data is never uploaded through the API: tables are created in the DuckDB workspace (DuckDB UI),
-published to DATASETS_DIR/<id>.duckdb by the workspace container, and registered here by dataset_sync.
+  Admin (/admin/datasets), every change written to the admin audit log:
+  GET    /visuals/manage/datasets                 every dataset, active and inactive
+  POST   /visuals/manage/datasets                 create -> code ds_00001..., inactive
+  PUT    /visuals/manage/datasets/{id}            edit details
+  PUT    /visuals/manage/datasets/{id}/status     {"active": true|false}
+  POST   /visuals/manage/datasets/{id}/data       upload the Parquet file -> DuckDB, becomes active
+  DELETE /visuals/manage/datasets/{id}            delete record + file (refused while posts use it)
 """
+import os
+import tempfile
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
-from app.db.models import PlatformUserRecord
-from app.services import catalog_service, dataset_sync, duckdb_service, visual_service as vs
+from app.db.database import get_admin_db
+from app.db.models import PlatformUserRecord, log_admin_action
+from app.services import catalog_service, dataset_ingest, duckdb_service, visual_service as vs
 from app.services.auth_service import require_dataset_manager, require_publisher
 from app.services.viz_recommender import VIZ_REGISTRY
 
 router = APIRouter()
+MAX_UPLOAD_MB = int(os.getenv("DATASET_MAX_UPLOAD_MB", "2048"))
 
 
 def _guard(fn, *a, **kw):
@@ -116,7 +123,8 @@ def data(dataset_id: str, viz: Optional[str] = None, x: Optional[str] = None,
          y: Optional[str] = None, label_field: Optional[str] = None,
          z: Optional[str] = None, size: Optional[str] = None):
     params = {"viz": viz, "x": x, "y": y, "z": z, "size": size, "label_field": label_field}
-    body, hit = _guard(vs.payload_json, dataset_id, params)
+    # deactivated datasets keep serving the posts already built on them
+    body, hit = _guard(vs.payload_json, dataset_id, params, True)
     return Response(body, media_type="application/json",
                     headers={"Cache-Control": "public, max-age=300", "X-Cache": "HIT" if hit else "MISS"})
 
@@ -131,14 +139,31 @@ class DatasetMeta(BaseModel):
     source_url: Optional[str] = Field(None, max_length=1024)
     license: Optional[str] = Field(None, max_length=80)
     publisher: Optional[str] = Field(None, max_length=120)
-    status: Optional[str] = Field(None, max_length=12)
+
+
+class DatasetStatus(BaseModel):
+    active: bool
 
 
 def _check_id(dataset_id: str) -> str:
     try:
         return vs._check_id(dataset_id)
-    except vs.VisualError as e:
-        raise HTTPException(status_code=400, detail="Dataset id must be lowercase letters, digits and underscores (max 64)")
+    except vs.VisualError:
+        raise HTTPException(status_code=400, detail="Invalid dataset code")
+
+
+def _audit(admin_db, user, request: Request, action: str, dataset_id: str, payload: Optional[dict] = None):
+    try:
+        log_admin_action(admin_db, admin_user_id=user.user_id, admin_handle=getattr(user, "user_handle", None),
+                         action_type=action, target_type="dataset", target_id=dataset_id, payload=payload or {},
+                         ip_address=request.client.host if request.client else None)
+    except Exception as e:                       # auditing must never block the action
+        print(f"[datasets] audit log failed: {e}")
+
+
+def _row(dataset_id: str, row: dict, status_code: int = 200) -> JSONResponse:
+    row["has_data"] = duckdb_service.has_data(dataset_id)
+    return JSONResponse(_safe(row), status_code=status_code)
 
 
 @router.get("/manage/datasets")
@@ -150,23 +175,111 @@ def manage_list(q: str = Query("", max_length=80), status: Optional[str] = Query
     return JSONResponse([_safe(r) for r in rows])
 
 
-@router.put("/manage/datasets/{dataset_id}")
-def manage_update(dataset_id: str, meta: DatasetMeta,
-                  _user: PlatformUserRecord = Depends(require_dataset_manager)):
-    """Edit title/description/source/licence and publish (status). Rows are created by the sync."""
-    dataset_id = _check_id(dataset_id)
+@router.post("/manage/datasets")
+def manage_create(meta: DatasetMeta, request: Request, admin_db: Session = Depends(get_admin_db),
+                  user: PlatformUserRecord = Depends(require_dataset_manager)):
+    """New dataset record; the code (ds_00001, ...) is generated. Inactive until its file is uploaded."""
     try:
-        row = catalog_service.update_meta(dataset_id, meta.model_dump(exclude_unset=True))
+        row = catalog_service.create(meta.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    _audit(admin_db, user, request, "dataset.create", row["dataset_id"], {"title": row["title"]})
+    return _row(row["dataset_id"], row, 201)
+
+
+@router.put("/manage/datasets/{dataset_id}")
+def manage_update(dataset_id: str, meta: DatasetMeta, request: Request, admin_db: Session = Depends(get_admin_db),
+                  user: PlatformUserRecord = Depends(require_dataset_manager)):
+    dataset_id = _check_id(dataset_id)
+    changes = meta.model_dump(exclude_unset=True)
+    try:
+        row = catalog_service.update_meta(dataset_id, changes)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     vs.invalidate(dataset_id)
-    row["has_data"] = duckdb_service.has_data(dataset_id)
-    return JSONResponse(_safe(row))
+    _audit(admin_db, user, request, "dataset.update", dataset_id, {"fields": sorted(changes)})
+    return _row(dataset_id, row)
 
 
-@router.post("/manage/datasets/sync")
-def manage_sync(_user: PlatformUserRecord = Depends(require_dataset_manager)):
-    """Pick up tables published from the DuckDB workspace right now (also runs every 30 s)."""
-    return JSONResponse(dataset_sync.sync(force=False))
+@router.put("/manage/datasets/{dataset_id}/status")
+def manage_status(dataset_id: str, body: DatasetStatus, request: Request, admin_db: Session = Depends(get_admin_db),
+                  user: PlatformUserRecord = Depends(require_dataset_manager)):
+    dataset_id = _check_id(dataset_id)
+    try:
+        row = catalog_service.set_active(dataset_id, body.active)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    _audit(admin_db, user, request, "dataset.activate" if body.active else "dataset.deactivate", dataset_id)
+    return _row(dataset_id, row)
+
+
+@router.post("/manage/datasets/{dataset_id}/data")
+def manage_upload(dataset_id: str, request: Request, file: UploadFile = File(...),
+                  admin_db: Session = Depends(get_admin_db),
+                  user: PlatformUserRecord = Depends(require_dataset_manager)):
+    """Upload the dataset's Parquet file: written into the gisviz data folder as <code>.duckdb,
+    profiled, and the dataset becomes active. Uploading again replaces the data atomically."""
+    dataset_id = _check_id(dataset_id)
+    if not catalog_service.exists(dataset_id):
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' does not exist")
+    name = Path(file.filename or "").name
+    ext = Path(name).suffix.lower()
+    if ext not in dataset_ingest.ALLOWED:
+        raise HTTPException(status_code=415, detail="Upload a .parquet file (CSV and GeoJSON also work)")
+
+    limit = MAX_UPLOAD_MB * 1024 * 1024
+    incoming = duckdb_service.DATASETS_DIR / ".incoming"
+    try:
+        incoming.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        raise HTTPException(status_code=500, detail=f"The server cannot write to {duckdb_service.DATASETS_DIR}")
+    fd, tmp_name = tempfile.mkstemp(suffix=ext, dir=incoming)
+    tmp = Path(tmp_name)
+    try:
+        size = 0
+        with os.fdopen(fd, "wb") as out:
+            while chunk := file.file.read(1 << 20):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(status_code=413, detail=f"The file is larger than {MAX_UPLOAD_MB} MB")
+                out.write(chunk)
+        if size == 0:
+            raise HTTPException(status_code=400, detail="The file is empty")
+        try:
+            result = dataset_ingest.ingest(dataset_id, tmp, name)
+        except dataset_ingest.IngestError as e:
+            print(f"[datasets] upload rejected for {dataset_id} ({name}): {e}")
+            raise HTTPException(status_code=422, detail=str(e))
+        except PermissionError as e:
+            print(f"[datasets] cannot write dataset files: {e}")
+            raise HTTPException(status_code=500, detail=f"The server cannot write to {duckdb_service.DATASETS_DIR}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Upload failed while processing the file: {type(e).__name__}: {str(e)[:200]}")
+        _audit(admin_db, user, request, "dataset.upload", dataset_id,
+               {"file": name, "bytes": size, "rows": result["rows"], "columns": result["columns"]})
+        return JSONResponse({**result, "bytes": size})
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@router.delete("/manage/datasets/{dataset_id}")
+def manage_delete(dataset_id: str, request: Request, admin_db: Session = Depends(get_admin_db),
+                  user: PlatformUserRecord = Depends(require_dataset_manager)):
+    dataset_id = _check_id(dataset_id)
+    try:
+        catalog_service.delete(dataset_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    dataset_ingest.remove_file(dataset_id)
+    vs.invalidate(dataset_id)
+    _audit(admin_db, user, request, "dataset.delete", dataset_id)
+    return {"deleted": dataset_id}

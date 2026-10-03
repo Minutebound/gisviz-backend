@@ -117,7 +117,7 @@ services:
       - gisviz-network
 
   # ────────────────────────────────────────────────────────
-  # 5. Datasets DB (catalog of the DuckDB datasets; rows created by the API's dataset sync)
+  # 4b. Datasets DB (catalog of the datasets: code, details, status, column profile)
   # ────────────────────────────────────────────────────────
   datasets-db:
     image: postgres:15-alpine
@@ -237,7 +237,7 @@ services:
       # Build stage: prod (default, real SMTP) or dev (OTP printed in the log, no SMTP).
       # Locally put  API_TARGET=dev  in a gitignored file named .env  next to this file.
       # On the VPS leave it unset (or API_TARGET=prod).
-      target: ${API_TARGET:-prod}
+      target: dev
     container_name: gisviz-api
     restart: always
     env_file:
@@ -257,9 +257,11 @@ services:
       # No Docker volume used. Files persist across redeploys because
       # git clean -fd never touches uploads/ (it is gitignored).
       - ./uploads:/app/uploads
-      # Published datasets: one DuckDB file per dataset (/app/data/datasets/<id>.duckdb), written by
-      # the `duckdb` workspace container below. The API only reads them (and registers them in datasets-db).
-      - datasets-data:/app/data:ro
+      # gisviz data folder: one DuckDB file per dataset (/app/data/gisviz/ds_00001.duckdb ...),
+      # written when an admin uploads a dataset's Parquet file on /admin/datasets. Named volume, so the
+      # files survive rebuilds and are owned by the container user. Back up with:
+      #   docker run --rm -v gisviz-datasets:/d -v "$PWD":/b alpine tar czf /b/gisviz-datasets.tgz -C /d .
+      - datasets-data:/app/data
     depends_on:
       users-db:
         condition: service_healthy
@@ -310,39 +312,6 @@ services:
     networks:
       - gisviz-network
 
-  # ────────────────────────────────────────────────────────
-  # 9. DuckDB workspace + DuckDB UI
-  #    You create/load tables in the DuckDB UI (one table = one dataset, table name = dataset id).
-  #    This container publishes every new/changed table to the datasets volume within ~10 s; the API
-  #    then registers it in datasets-db as a draft you publish on /datasets/manage.
-  #    The UI has NO login: it is bound to localhost only. From your laptop use an SSH tunnel:
-  #      ssh -N -L 4213:localhost:4213 user@your-vps      then open http://localhost:4213
-  #    Files to load: copy them to ./duckdb-inbox on the server and query /app/workspace/inbox/<file>.
-  # ────────────────────────────────────────────────────────
-  duckdb:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: ${API_TARGET:-prod}
-    container_name: gisviz-duckdb
-    restart: unless-stopped
-    command: ["python", "-m", "app.scripts.duckdb_workspace"]
-    environment:
-      WORKSPACE_DB: /app/workspace/gisviz.duckdb
-      DATASETS_DIR: /app/data/datasets
-      HOME: /app/workspace                      # DuckDB keeps its extensions (ui, spatial) here
-      PUBLISH_SECONDS: "10"
-      GISVIZ_SEED_SAMPLES: ${GISVIZ_SEED_SAMPLES:-false}
-    volumes:
-      - ./app:/app/app                          # same code as the API (dev reload not needed here)
-      - duckdb-workspace:/app/workspace
-      - datasets-data:/app/data
-      - ./duckdb-inbox:/app/workspace/inbox:ro
-    ports:
-      - "127.0.0.1:4213:4214"
-    networks:
-      - gisviz-network
-
 networks:
   gisviz-network:
     name: gisviz-network
@@ -367,5 +336,3 @@ volumes:
     name: gisviz-datasets
   datasets-db-data:
     name: gisviz-datasets-db-data
-  duckdb-workspace:
-    name: gisviz-duckdb-workspace

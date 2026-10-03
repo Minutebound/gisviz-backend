@@ -387,6 +387,7 @@ class RoleChecker:
 PUBLISHING_ROLES = ["admin", "publisher", "editor", "support"]
 require_publisher = RoleChecker(PUBLISHING_ROLES)
 
-# Roles allowed to register datasets and upload their data files (admin always passes).
-DATASET_MANAGER_ROLES = ["admin", "publisher"]
+# Roles allowed to manage datasets (create, upload, activate, edit, delete) on /admin/datasets.
+# Add "publisher" here (and in the frontend lib/roles.ts) to let publishers manage datasets too.
+DATASET_MANAGER_ROLES = ["admin"]
 require_dataset_manager = RoleChecker(DATASET_MANAGER_ROLES)
