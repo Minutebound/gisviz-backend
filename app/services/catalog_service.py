@@ -35,12 +35,13 @@ def _card(r: DatasetRecord) -> dict:
     d = {k: getattr(r, k) for k in _FIELDS}
     d["updated_at"] = d.pop("updated_timestamp")
     d["show_data"] = bool(r.show_data)
+    d["column_count"] = len(r.columns or [])
     return d
 
 
 def _admin_card(r: DatasetRecord) -> dict:
     d = _card(r)
-    d.update(status=r.status, column_count=len(r.columns or []),
+    d.update(status=r.status,
              created_at=r.created_timestamp, data_uploaded_at=r.data_uploaded_at)
     return d
 
@@ -82,8 +83,10 @@ def get_columns(dataset_id: str) -> list[dict]:
         return list(r.columns or []) if r else []
 
 
-def list_page(term: str, category: Optional[str], skip: int, limit: int, kind: Optional[str] = None) -> dict:
-    """Public /datasets listing: active datasets, optional text / category / kind (spatial|tabular) filter."""
+def list_page(term: str, category: Optional[str], skip: int, limit: int, kind: Optional[str] = None,
+              region: Optional[str] = None) -> dict:
+    """Public /datasets listing: active datasets, optional text / category / region (with its sub-regions) /
+    kind (spatial|tabular) filter."""
     with DatasetsSessionLocal() as db:
         q = db.query(DatasetRecord).filter(DatasetRecord.status == "active")
         term = (term or "").strip().lower()
@@ -94,6 +97,9 @@ def list_page(term: str, category: Optional[str], skip: int, limit: int, kind: O
                              DatasetRecord.source_name.ilike(like), DatasetRecord.keywords.ilike(like)))
         if category:
             q = q.filter(DatasetRecord.category == category)
+        if region and region.strip().lower() != "global":       # Global = everything; a continent includes its countries
+            from app.services import region_service
+            q = q.filter(DatasetRecord.region.in_(region_service.with_descendants(region)))
         if kind == "spatial":
             q = q.filter(DatasetRecord.geometry_type.isnot(None))
         elif kind == "tabular":

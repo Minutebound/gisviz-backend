@@ -6,11 +6,11 @@ into the analytical store (gisviz.duckdb, one table per dataset code ds_00001, .
 Charts and maps built FROM a dataset are in visuals.py.
 
   Public (the /datasets page)
-  GET    /datasets/                          active datasets: ?q= &category= &kind=spatial|tabular &skip= &limit=
+  GET    /datasets/                          active datasets: ?q= &category= &region= (incl. sub-regions) &kind=spatial|tabular &skip= &limit=
   GET    /datasets/{id}                      one dataset: card + column profile + number of posts using it
                                              (the "Metadata" button on /datasets; loaded on click)
-  GET    /datasets/{id}/rows?limit=          first rows of the data — ONLY when the dataset's show_data is on
-                                             (the "View data" button on post pages; loaded on click)
+  GET    /datasets/{id}/rows?limit=&offset=  every column, a page at a time (the visual's Data tab) — public only
+                                             when show_data is on; publishers/admins always (to build posts)
 
   Publishers (post upload / edit: the dataset picker)
   GET    /datasets/search?q=&limit=          active datasets matching a code or words (exact code first)
@@ -22,7 +22,11 @@ Charts and maps built FROM a dataset are in visuals.py.
   PUT    /datasets/manage/{id}/status        {"active": true|false}
   PUT    /datasets/manage/{id}/show-data     {"show": true|false}  expose the rows on post pages or not
   GET    /datasets/manage/{id}/metadata      full record (any status) + columns + posts using it + store table info
-  POST   /datasets/manage/{id}/data          upload the data file (any supported format) -> table <id>, active.
+  POST   /datasets/manage/{id}/data          upload the data file in one step (any supported format) -> table <id>, active
+  POST   /datasets/manage/{id}/stage         upload previewer, step 1: stage the file, return columns + sample rows
+  POST   /datasets/manage/{id}/stage/sample  step 2: try column edits (rename / type / drop) on the sample
+  POST   /datasets/manage/{id}/stage/commit  step 3: apply the edits and go live (409 if published posts would break)
+  DELETE /datasets/manage/{id}/stage         cancel: drop the staged upload.
                                              Replacing: if published posts use columns the new file lacks,
                                              409 + broken_posts and nothing changes; ?force=true replaces anyway
   GET    /datasets/manage/{id}/preview       first rows of the table
@@ -43,7 +47,7 @@ from sqlalchemy.orm import Session
 from app.db.database import get_admin_db
 from app.db.models import PlatformUserRecord, log_admin_action
 from app.services import catalog_service, dataset_ingest, dataset_sync, duckdb_service, visual_service as vs
-from app.services.auth_service import require_dataset_manager, require_publisher
+from app.services.auth_service import get_optional_current_user, require_dataset_manager, require_publisher
 
 router = APIRouter()
 MAX_UPLOAD_MB = int(os.getenv("DATASET_MAX_UPLOAD_MB", "2048"))
@@ -69,9 +73,10 @@ def _safe(d: dict) -> dict:
 
 @router.get("/")
 def catalog_list(q: str = Query("", max_length=80), category: Optional[str] = Query(None, max_length=80),
+                 region: Optional[str] = Query(None, max_length=60),
                  kind: Optional[str] = Query(None, pattern="^(spatial|tabular)$"),
                  skip: int = Query(0, ge=0), limit: int = Query(24, ge=1, le=60)):
-    page = catalog_service.list_page(q, category, skip, limit, kind)
+    page = catalog_service.list_page(q, category, skip, limit, kind, region)
     page["items"] = [_safe(r) for r in page["items"]]
     page["categories"] = catalog_service.categories()
     return JSONResponse(page, headers={"Cache-Control": "public, max-age=60"})
@@ -248,6 +253,93 @@ def manage_upload(dataset_id: str, request: Request, file: UploadFile = File(...
         tmp.unlink(missing_ok=True)
 
 
+# ── upload previewer (Compass-style): stage -> sample with column edits -> commit / discard ──
+
+class StagedChanges(BaseModel):
+    """Column edits: [{"column": "<staged name>", "rename": "...", "type": "text|integer|decimal|date|datetime|boolean",
+    "include": true|false}] — unlisted columns are kept as detected."""
+    changes: list[dict] = Field(default_factory=list, max_length=500)
+    limit: int = Field(20, ge=1, le=200)
+    force: bool = False
+
+
+def _receive_upload(file: UploadFile) -> tuple[Path, str, int]:
+    name = Path(file.filename or "").name
+    ext = Path(name).suffix.lower()
+    if ext not in dataset_ingest.ALLOWED:
+        raise HTTPException(status_code=415, detail=f"Unsupported file type. Upload one of: {', '.join(dataset_ingest.ALLOWED)}")
+    limit = MAX_UPLOAD_MB * 1024 * 1024
+    fd, tmp_name = tempfile.mkstemp(suffix=ext)
+    tmp = Path(tmp_name)
+    size = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while chunk := file.file.read(1 << 20):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(status_code=413, detail=f"The file is larger than {MAX_UPLOAD_MB} MB")
+                out.write(chunk)
+        if size == 0:
+            raise HTTPException(status_code=400, detail="The file is empty")
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return tmp, name, size
+
+
+@router.post("/manage/{dataset_id}/stage")
+def manage_stage(dataset_id: str, file: UploadFile = File(...),
+                 _user: PlatformUserRecord = Depends(require_dataset_manager)):
+    """Step 1 of an upload: convert + load the file as a STAGED table (the live data is untouched) and
+    return columns with detected types and sample rows for the previewer."""
+    dataset_id = _check_id(dataset_id)
+    if not catalog_service.exists(dataset_id):
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' does not exist")
+    tmp, name, size = _receive_upload(file)
+    try:
+        return JSONResponse(dataset_ingest.stage_upload(dataset_id, tmp, name))
+    except dataset_ingest.IngestError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@router.post("/manage/{dataset_id}/stage/sample")
+def manage_stage_sample(dataset_id: str, body: StagedChanges, _user: PlatformUserRecord = Depends(require_dataset_manager)):
+    """Step 2: try column edits (rename / type / drop) on the staged sample; shows values a type change would lose."""
+    try:
+        return JSONResponse(dataset_ingest.sample_staged(_check_id(dataset_id), body.changes, body.limit))
+    except dataset_ingest.IngestError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.post("/manage/{dataset_id}/stage/commit")
+def manage_stage_commit(dataset_id: str, body: StagedChanges, request: Request, admin_db: Session = Depends(get_admin_db),
+                        user: PlatformUserRecord = Depends(require_dataset_manager)):
+    """Step 3: apply the edits and make the staged data live (409 with the posts it would break, unless force)."""
+    dataset_id = _check_id(dataset_id)
+    try:
+        result = dataset_ingest.commit_staged(dataset_id, body.changes, force=body.force)
+    except dataset_ingest.ReplaceConflict as e:
+        raise HTTPException(status_code=409, detail={
+            "message": f"{len(e.broken)} published post(s) use columns that are missing or different in the new "
+                       "data. The current data was kept and the upload is still staged: change the column edits, "
+                       "or replace anyway and then edit those posts.",
+            "broken_posts": e.broken})
+    except dataset_ingest.IngestError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    _audit(admin_db, user, request, "dataset.upload", dataset_id,
+           {"rows": result["rows"], "columns": result["columns"], "bytes": result["bytes"], "edits": len(body.changes),
+            "forced": bool(body.force), "broken_posts": [b["post_id"] for b in result["broken_posts"]]})
+    return JSONResponse(result)
+
+
+@router.delete("/manage/{dataset_id}/stage")
+def manage_stage_discard(dataset_id: str, _user: PlatformUserRecord = Depends(require_dataset_manager)):
+    """Cancel an upload: drop the staged table (the live data stays as it was)."""
+    return {"discarded": _store_guard(dataset_ingest.discard_staged, _check_id(dataset_id))}
+
+
 @router.delete("/manage/{dataset_id}")
 def manage_delete(dataset_id: str, request: Request, admin_db: Session = Depends(get_admin_db),
                   user: PlatformUserRecord = Depends(require_dataset_manager)):
@@ -329,19 +421,25 @@ def manage_sync_fix(request: Request, drop_orphans: bool = Query(False), admin_d
 # ── public detail (declared last: /{dataset_id} would otherwise catch /search and /manage) ──
 
 @router.get("/{dataset_id}/rows")
-def public_rows(dataset_id: str, limit: int = Query(50, ge=1, le=100)):
-    """Rows for the post page's "View data". Refused unless an admin switched show_data on."""
+def public_rows(dataset_id: str, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0),
+                user=Depends(get_optional_current_user)):
+    """Every column of the dataset, a page at a time, for the Data tab of a visual. Public when an
+    admin switched show_data on; publishers and admins can always read it (to build posts)."""
+    from app.services.auth_service import PUBLISHING_ROLES
     dataset_id = _check_id(dataset_id)
     card = catalog_service.get(dataset_id, include_inactive=True)    # posts keep working after deactivation
     if card is None:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    if not card.get("show_data"):
+    role = getattr(getattr(user, "role", None), "name", None)
+    if not card.get("show_data") and role not in (*PUBLISHING_ROLES, "admin"):
         raise HTTPException(status_code=403, detail="The data of this dataset is not published")
-    res = _store_guard(duckdb_service.preview, dataset_id, limit)
-    rows = [{k: v for k, v in r.items() if k != "_gv_geom"} for r in res.get("rows", [])]   # geometry stays internal
-    return JSONResponse({"dataset_id": dataset_id, "total_rows": card.get("row_count"),
-                         "columns": list(rows[0].keys()) if rows else [], "rows": rows},
-                        headers={"Cache-Control": "public, max-age=300"})
+    excl = "_gv_id, _gv_geom" if card.get("geometry_type") else "_gv_id"   # geometry stays internal
+    rows = _store_guard(duckdb_service.query, dataset_id,
+                        f"SELECT * EXCLUDE ({excl}) FROM data ORDER BY _gv_id LIMIT ? OFFSET ?", [limit, offset])
+    cols = [c["column_name"] for c in catalog_service.get_columns(dataset_id)] or (list(rows[0].keys()) if rows else [])
+    return JSONResponse({"dataset_id": dataset_id, "total_rows": card.get("row_count"), "offset": offset,
+                         "limit": limit, "columns": cols, "rows": rows},
+                        headers={"Cache-Control": "public, max-age=300" if card.get("show_data") else "private, max-age=60"})
 
 
 @router.get("/{dataset_id}")

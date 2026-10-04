@@ -20,12 +20,16 @@ How a visual is made
   GET  /visuals/datasets/{id}/spec       visual spec for one choice:                     (publishers)
                                          ?viz=bar&x=...&y=...&z=...&size=...&label_field=...&accent=%2306ba24
                                          (anything left out is filled from the recommender)
+  POST /visuals/datasets/{id}/spec       the same, with the presentation options in a JSON body           (publishers)
+                                         {viz, x, y, z, size, label_field, color, accent, story: {title, subtitle,
+                                          y_label, colors, reference_lines, filter_default, visual_type}}
   GET  /visuals/datasets/{id}/data       rows / GeoJSON for a spec (same query as the spec's data URL)  (public, cached)
 """
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
 from app.db.models import PlatformUserRecord
 from app.services import duckdb_service, visual_service as vs
@@ -90,11 +94,32 @@ def spec(
     return JSONResponse(_guard(vs.build_spec, dataset_id, viz, x, y, label_field, accent, z, size))
 
 
+class SpecRequest(BaseModel):
+    viz: Optional[str] = None
+    x: Optional[str] = None
+    y: Optional[str] = None
+    z: Optional[str] = None
+    size: Optional[str] = None
+    label_field: Optional[str] = None
+    color: Optional[str] = None
+    accent: Optional[str] = None
+    story: Optional[dict] = None        # title, subtitle, y_label, colors, reference_lines, filter_default, visual_type
+
+
+@router.post("/datasets/{dataset_id}/spec")
+def spec_with_story(dataset_id: str, body: SpecRequest, _user: PlatformUserRecord = Depends(require_publisher)):
+    """Same as GET /spec, plus the presentation options (the upload page's live preview)."""
+    return JSONResponse(_guard(vs.build_spec, dataset_id, body.viz, body.x, body.y, body.label_field, body.accent,
+                               body.z, body.size, False, body.color, body.story or {}))
+
+
 @router.get("/datasets/{dataset_id}/data")
 def data(dataset_id: str, viz: Optional[str] = None, x: Optional[str] = None,
          y: Optional[str] = None, label_field: Optional[str] = None,
-         z: Optional[str] = None, size: Optional[str] = None):
-    params = {"viz": viz, "x": x, "y": y, "z": z, "size": size, "label_field": label_field}
+         z: Optional[str] = None, size: Optional[str] = None, color: Optional[str] = None,
+         part: Optional[str] = None):
+    params = {"viz": viz, "x": x, "y": y, "z": z, "size": size, "label_field": label_field, "color": color,
+              "part": part if part == "series" else None}
     # deactivated datasets keep serving the posts already built on them
     body, hit = _guard(vs.payload_json, dataset_id, params, True)
     return Response(body, media_type="application/json",

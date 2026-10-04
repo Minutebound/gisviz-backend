@@ -6,8 +6,8 @@ from typing import List, Literal, Optional
 
 class PlatformConfigurationSettings(BaseSettings):
     PROJECT_NAME: str = "Gisviz Enterprise API"
-    VERSION: str = "0.0.0"
-    API_V0_STR: str = "/api/v0"
+    VERSION: str = "0.1.0"
+    API_VERSION_STR: str = "/api/v0"
 
     # ── Environment gate ──────────────────────────────────────────────
     # DO NOT set this in .env.backend.

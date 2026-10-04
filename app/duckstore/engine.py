@@ -38,6 +38,24 @@ from app.services import dataset_ingest as di
 ID_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 INTERNAL_SCHEMA = "_gisviz"
 STAGED = "__staged"
+# column types the admin can convert to in the upload previewer (Compass-style)
+CAST_TYPES = {"text": "VARCHAR", "integer": "BIGINT", "decimal": "DOUBLE", "date": "DATE",
+              "datetime": "TIMESTAMP", "boolean": "BOOLEAN"}
+
+
+def _kind(sql_type: str) -> str:
+    t = sql_type.split("(")[0].upper()
+    if t in ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT"):
+        return "integer"
+    if t in ("FLOAT", "DOUBLE", "DECIMAL", "REAL"):
+        return "decimal"
+    if t == "DATE":
+        return "date"
+    if t.startswith("TIMESTAMP"):
+        return "datetime"
+    if t == "BOOLEAN":
+        return "boolean"
+    return "text"
 
 
 def _staged(code: str) -> str:
@@ -81,6 +99,7 @@ class Engine:
         self.con.execute(f"CREATE TABLE IF NOT EXISTS {INTERNAL_SCHEMA}.staged ("
                          "code VARCHAR PRIMARY KEY, source_file VARCHAR, format VARCHAR, rows BIGINT, "
                          "data_version VARCHAR, staged_at TIMESTAMP DEFAULT current_timestamp)")
+        self.con.execute(f"ALTER TABLE {INTERNAL_SCHEMA}.staged ADD COLUMN IF NOT EXISTS bytes BIGINT")
         self._drop_leftovers()
         self._write = threading.Lock()                               # one load/drop at a time
 
@@ -143,6 +162,7 @@ class Engine:
         work.mkdir()
         staged_file = work / Path(original_name).name
         shutil.copyfile(str(src), staged_file)                     # into the sandboxed incoming folder
+        size = staged_file.stat().st_size
         new = f"{code}__new_{uuid.uuid4().hex[:8]}"
         target = _staged(code)
         cur = self._cursor()
@@ -158,8 +178,8 @@ class Engine:
                     cur.execute("BEGIN TRANSACTION")
                     cur.execute(f'DROP TABLE IF EXISTS main."{target}"')
                     cur.execute(f'ALTER TABLE main."{new}" RENAME TO "{target}"')
-                    cur.execute(f"INSERT OR REPLACE INTO {INTERNAL_SCHEMA}.staged (code, source_file, format, rows, data_version) "
-                                "VALUES (?, ?, ?, ?, ?)", [code, staged_file.name, fmt, info["rows"], version])
+                    cur.execute(f"INSERT OR REPLACE INTO {INTERNAL_SCHEMA}.staged (code, source_file, format, rows, data_version, bytes) "
+                                "VALUES (?, ?, ?, ?, ?, ?)", [code, staged_file.name, fmt, info["rows"], version, size])
                     cur.execute("COMMIT")
                 except (di.IngestError, convert.ConvertError) as e:
                     self._cleanup(cur, new)
@@ -173,7 +193,123 @@ class Engine:
         finally:
             cur.close()
             shutil.rmtree(work, ignore_errors=True)
-        return {**info, "format": fmt, "data_version": version, "table": code, "staged": True}
+        return {**info, "format": fmt, "data_version": version, "table": code, "staged": True, "bytes": size}
+
+    # ── upload previewer: look at a staged upload, try column edits, apply them ──
+    def _staged_select(self, cur, table: str, changes: Optional[list] = None) -> tuple[str, list[dict]]:
+        """SELECT list rebuilding `table` with the admin's edits: rename, convert type, drop column."""
+        schema = [(r[0], r[1]) for r in cur.execute(f'DESCRIBE main."{table}"').fetchall()]
+        by = {}
+        for ch in changes or []:
+            if isinstance(ch, dict) and ch.get("column"):
+                by[str(ch["column"])] = ch
+        unknown = set(by) - {n for n, _ in schema}
+        if unknown:
+            raise EngineError(f"Unknown column(s): {', '.join(sorted(unknown))}", 422)
+        cols, names = [], []
+        for name, sql_type in schema:
+            if name in ("_gv_id", "_gv_geom"):
+                continue
+            ch = by.get(name, {})
+            if ch.get("include") is False:
+                continue
+            new_type = ch.get("type") or None
+            if new_type and new_type not in CAST_TYPES:
+                raise EngineError(f"Unknown type '{new_type}' (use {', '.join(CAST_TYPES)})", 422)
+            if new_type == _kind(sql_type):
+                new_type = None
+            cols.append({"source": name, "sql_type": sql_type, "kind": _kind(sql_type), "type": new_type})
+            names.append(di.snake(str(ch.get("rename") or name)) or name)
+        if not cols:
+            raise EngineError("Keep at least one column", 422)
+        for c, n in zip(cols, di.unique_names(names)):
+            c["name"] = n
+        parts = []
+        for c in cols:
+            expr = f'TRY_CAST({di.q(c["source"])} AS {CAST_TYPES[c["type"]]})' if c["type"] else di.q(c["source"])
+            parts.append(f'{expr} AS {di.q(c["name"])}')
+        parts.append("_gv_id")
+        if any(n == "_gv_geom" for n, _ in schema):
+            parts.append("_gv_geom")
+        return ", ".join(parts), cols
+
+    def staged_sample(self, code: str, changes: Optional[list] = None, limit: int = 20) -> dict:
+        """The staged upload as the previewer shows it: columns (detected type, edit), sample rows, and how
+        many values each type conversion would lose (they become empty)."""
+        self.check(code)
+        target = _staged(code)
+        if not self.exists(target):
+            raise EngineError(f"No staged upload for {code}", 404)
+        cur = self._cursor()
+        try:
+            select, cols = self._staged_select(cur, target, changes)
+            meta = cur.execute(f"SELECT source_file, format, rows, bytes FROM {INTERNAL_SCHEMA}.staged WHERE code = ?",
+                               [code]).fetchone() or (None, None, None, None)
+            res = cur.execute(f'SELECT {select} FROM main."{target}" ORDER BY _gv_id LIMIT {max(1, min(int(limit), 200))}')
+            names = [d[0] for d in res.description]
+            rows = []
+            for r in res.fetchall():
+                row = {k: _json_safe(v) for k, v in zip(names, r) if k != "_gv_id"}
+                g = row.get("_gv_geom")
+                if isinstance(g, str) and len(g) > 80:
+                    row["_gv_geom"] = g[:77] + "..."
+                rows.append(row)
+            lost = {}
+            casts = [c for c in cols if c["type"]]
+            if casts:
+                q = ", ".join(f'count(*) FILTER (WHERE {di.q(c["source"])} IS NOT NULL AND '
+                              f'TRY_CAST({di.q(c["source"])} AS {CAST_TYPES[c["type"]]}) IS NULL)' for c in casts)
+                counts = cur.execute(f'SELECT {q} FROM main."{target}"').fetchone()
+                lost = {c["name"]: int(n) for c, n in zip(casts, counts)}
+            nulls = cur.execute("SELECT " + ", ".join(
+                f'count(*) - count({di.q(c["source"])})' for c in cols) + f' FROM main."{target}"').fetchone()
+            for c, n in zip(cols, nulls):
+                c["empty"] = int(n)
+                c["lost"] = lost.get(c["name"], 0)
+            return {"code": code, "source_file": meta[0], "format": meta[1], "rows": meta[2], "bytes": meta[3],
+                    "columns": cols, "sample": rows, "types": list(CAST_TYPES)}
+        except duckdb.Error as e:
+            raise EngineError(str(e).splitlines()[0][:300], 400)
+        finally:
+            cur.close()
+
+    def apply_changes(self, code: str, changes: Optional[list]) -> dict:
+        """Rebuild the staged table with the edits (renamed / converted / dropped columns); returns the new
+        profile. The live table is still untouched until commit()."""
+        self.check(code)
+        target = _staged(code)
+        if not changes:
+            cur = self._cursor()
+            try:
+                info = di.profile(cur, target)
+                version = cur.execute(f"SELECT data_version FROM {INTERNAL_SCHEMA}.staged WHERE code = ?", [code]).fetchone()
+            finally:
+                cur.close()
+            return {**info, "data_version": version[0] if version else None}
+        new = f"{code}__new_{uuid.uuid4().hex[:8]}"
+        cur = self._cursor()
+        try:
+            with self._write:
+                if not self.exists(target):
+                    raise EngineError(f"No staged upload for {code}", 404)
+                select, _ = self._staged_select(cur, target, changes)
+                try:
+                    cur.execute(f'CREATE TABLE main."{new}" AS SELECT {select} FROM main."{target}" ORDER BY _gv_id')
+                    info = di.profile(cur, new)
+                    n, h = cur.execute(f'SELECT count(*), bit_xor(hash(t)) FROM main."{new}" t').fetchone()
+                    version = f"{int(n):x}-{int(h) & 0xffffffffffff:x}"
+                    cur.execute("BEGIN TRANSACTION")
+                    cur.execute(f'DROP TABLE main."{target}"')
+                    cur.execute(f'ALTER TABLE main."{new}" RENAME TO "{target}"')
+                    cur.execute(f"UPDATE {INTERNAL_SCHEMA}.staged SET rows = ?, data_version = ? WHERE code = ?",
+                                [info["rows"], version, code])
+                    cur.execute("COMMIT")
+                except duckdb.Error as e:
+                    self._cleanup(cur, new)
+                    raise EngineError(f"Could not apply the column changes: {str(e).splitlines()[0][:300]}", 422)
+        finally:
+            cur.close()
+        return {**info, "data_version": version}
 
     def commit(self, code: str) -> dict:
         """Make the staged upload live: <code>__staged replaces <code> in one transaction."""

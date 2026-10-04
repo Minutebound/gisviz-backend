@@ -1,5 +1,5 @@
 from pydantic import BaseModel, UUID4
-from typing import List, Optional
+from typing import List, Optional, Union
 from datetime import datetime
 
 class CategoryData(BaseModel):
@@ -7,6 +7,9 @@ class CategoryData(BaseModel):
     slug: str = ""
     label: str
     usage_count: int = 0
+    description: Optional[str] = None
+    theme_color: Optional[str] = None      # #rrggbb; the accent of posts in this category
+    sort_order: int = 0
 
     class Config:
         from_attributes = True
@@ -44,6 +47,20 @@ class VisualParams(BaseModel):
     label_field: Optional[str] = None
     z: Optional[str] = None        # series / second category (stacked bar, heatmap)
     size: Optional[str] = None     # numeric column for bubble size
+    color: Optional[str] = None    # category column that colours the bars, with a legend (e.g. continent)
+    visual_type: Optional[str] = None   # catalog code (misc DB visual_types), e.g. choropleth; derived when empty
+    # presentation ("story") options, validated by visual_service._story
+    title: Optional[str] = None
+    subtitle: Optional[str] = None
+    y_label: Optional[str] = None                      # friendly name of the measure
+    colors: Optional[dict] = None                      # {group: "#rrggbb"}
+    reference_lines: Optional[List[dict]] = None       # [{"value"|"stat": ..., "label": ..., "mode": "line"|"divider"}]
+    filter_default: Optional[List[str]] = None         # labels pre-selected in the post page's filter (None = all)
+    show_labels: Optional[bool] = None                 # labels drawn on the map / points from the start (reader can toggle)
+
+    def story(self) -> dict:
+        return {k: getattr(self, k) for k in ("title", "subtitle", "y_label", "colors", "reference_lines",
+                                              "filter_default", "show_labels", "visual_type") if getattr(self, k) is not None}
 
 
 class PostPayload(BaseModel):
@@ -57,8 +74,22 @@ class PostPayload(BaseModel):
     note: Optional[str] = None
     source_name: Optional[str] = None
     source_url: Optional[str] = None
+    category_ids: List[int] = []          # at least one (posts DB categories)
+    region: Optional[str] = None          # required: regions.code (misc DB), e.g. "europe" or "global"
+    keywords: List[str] = []
+    # the poster behind the visual: a design from the poster editor {bg, texture, font, title_size, title_align,
+    # map_base, layout}, or "auto" (picked from the topic) / "light" / "dark" / "none". Omitted on edit = keep it.
+    backdrop: Optional[Union[dict, str]] = "auto"
+
+
+class BackdropPreviewPayload(BaseModel):
+    title: str = ""
+    description: Optional[str] = None
     category_ids: List[int] = []
     keywords: List[str] = []
+    region: Optional[str] = None
+    theme_color: Optional[str] = None
+    backdrop: Optional[Union[dict, str]] = "auto"
 
 
 class PostResponse(BaseModel):
@@ -77,11 +108,14 @@ class PostResponse(BaseModel):
     source_name: Optional[str] = None
     source_url: Optional[str] = None
     categories: List[CategoryData] = []
+    region: Optional[str] = None
     keywords: List[KeywordData] = []
     share_slug: str
     share_url: str
     total_likes_count: int
     total_comments_count: int
+    views_count: int = 0
+    backdrop: Optional[dict] = None         # the poster design: {mode, bg, texture, font, title_size, title_align, map_base, layout, dark}
     created_timestamp: datetime
     updated_timestamp: Optional[datetime] = None
     is_active: int

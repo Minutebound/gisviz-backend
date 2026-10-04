@@ -165,6 +165,9 @@ class PostRecord(PostsBase):
     share_slug      = Column(String(32), unique=True, index=True, nullable=False)
     total_likes_count    = Column(Integer, default=0, nullable=False)
     total_comments_count = Column(Integer, default=0, nullable=False)
+    backdrop        = Column(JSONB, nullable=True)   # poster design: {mode, bg, texture, font, title_size, title_align, map_base, layout, dark}
+    views_count     = Column(Integer, default=0, server_default="0", nullable=False, index=True)  # unique daily viewers (fact_post_view)
+    region          = Column(String(60), nullable=True, index=True)   # regions.code (misc DB); required for new posts
     is_active       = Column(Integer, default=1, nullable=False, index=True) 
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -282,6 +285,18 @@ class DimDate(AnalyticsBase):
     day_of_week  = Column(Integer, nullable=False)   # 0=Mon .. 6=Sun
     week_of_year = Column(Integer, nullable=False)
     is_weekend   = Column(Integer, nullable=False, default=0)
+
+
+class FactPostView(AnalyticsBase):
+    """One row per post, per viewer, per day: a post page counts once for each visitor each day.
+    viewer_key is a SHA-256 of the user id (signed in) or of IP + user agent (anonymous), so no raw
+    IP is stored. posts.views_count (posts DB) is the running total of these rows."""
+    __tablename__ = "fact_post_view"
+    post_id    = Column(UUID(as_uuid=True), primary_key=True)
+    viewer_key = Column(String(64), primary_key=True)
+    view_date  = Column(Date, primary_key=True)
+    user_id    = Column(UUID(as_uuid=True), nullable=True, index=True)     # null for anonymous viewers
+    first_seen_timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class DimUser(AnalyticsBase):

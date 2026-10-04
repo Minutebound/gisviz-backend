@@ -13,7 +13,7 @@ Mutation rule:
   so the Sidebar and the control page always see fresh data.
 """
 
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi_cache import FastAPICache
 from fastapi_cache.decorator import cache
@@ -40,6 +40,27 @@ router = APIRouter()
 class CategoryUpdatePayload(BaseModel):
     label: str
     slug: str
+    description: Optional[str] = None
+    theme_color: Optional[str] = None      # #rrggbb; "" clears it
+    sort_order: Optional[int] = None
+
+
+def _row(r: CategoryRecord) -> dict:
+    return {"category_id": r.category_id, "slug": r.slug, "label": r.label, "usage_count": r.usage_count,
+            "description": r.description, "theme_color": r.theme_color, "sort_order": r.sort_order or 0}
+
+
+def _clean_color(v: Optional[str]) -> Optional[str]:
+    import re
+    v = (v or "").strip().lower()
+    if v and not re.fullmatch(r"#[0-9a-f]{6}", v):
+        raise HTTPException(status_code=422, detail="theme_color must look like #1a2b3c")
+    return v or None
+
+
+def _fresh(cached) -> bool:
+    """Cached lists written before description/theme_color existed are ignored."""
+    return cached is not None and (not cached or "theme_color" in cached[0])
 
 
 # ── Redis key constants ───────────────────────────────────────────────────────
@@ -92,14 +113,13 @@ async def get_categories(db: Session = Depends(get_posts_db)):
     from app.services.cache_service import cache_service
 
     cached_val = cache_service.get(_CATEGORY_LIST_KEY)
-    if cached_val is not None:
+    if _fresh(cached_val):
         return cached_val
 
-    rows = db.query(CategoryRecord).order_by(CategoryRecord.label).all()
-    result = [
-        {"category_id": r.category_id, "slug": r.slug, "label": r.label, "usage_count": r.usage_count}
-        for r in rows
-    ]
+    # admin-defined order first (sort_order 0 = unordered, after the ordered ones), then by name
+    rows = db.query(CategoryRecord).order_by((CategoryRecord.sort_order == 0), CategoryRecord.sort_order,
+                                             CategoryRecord.label).all()
+    result = [_row(r) for r in rows]
     ttl = _LIST_TTL if result else 30
     cache_service.set(_CATEGORY_LIST_KEY, result, ttl_seconds=ttl)
     return rows
@@ -124,7 +144,7 @@ async def get_trending_categories(
     key = f"{_CATEGORY_TRENDING_KEY}:{limit}"
 
     cached_val = cache_service.get(key)
-    if cached_val is not None:
+    if _fresh(cached_val):
         return cached_val
 
     rows = (
@@ -134,10 +154,7 @@ async def get_trending_categories(
         .limit(limit)
         .all()
     )
-    result = [
-        {"category_id": r.category_id, "slug": r.slug, "label": r.label, "usage_count": r.usage_count}
-        for r in rows
-    ]
+    result = [_row(r) for r in rows]
     ttl = _TRENDING_TTL if result else 30
     cache_service.set(key, result, ttl_seconds=ttl)
     return rows
@@ -256,7 +273,8 @@ async def create_category(
     slug = payload.slug.strip().lower().replace(" ", "-")
     if db.query(CategoryRecord).filter(CategoryRecord.slug == slug).first():
         raise HTTPException(status_code=409, detail="Category with this slug already exists")
-    cat = CategoryRecord(slug=slug, label=payload.label.strip())
+    cat = CategoryRecord(slug=slug, label=payload.label.strip(), description=(payload.description or "").strip() or None,
+                         theme_color=_clean_color(payload.theme_color), sort_order=payload.sort_order or 0)
     db.add(cat)
     db.commit()
     db.refresh(cat)
@@ -278,6 +296,13 @@ async def update_category(
         raise HTTPException(status_code=404, detail="Category not found")
     cat.label = payload.label.strip()
     cat.slug  = payload.slug.strip().lower().replace(" ", "-")
+    fields = payload.model_fields_set
+    if "description" in fields:
+        cat.description = (payload.description or "").strip() or None
+    if "theme_color" in fields:
+        cat.theme_color = _clean_color(payload.theme_color)
+    if "sort_order" in fields and payload.sort_order is not None:
+        cat.sort_order = payload.sort_order
     db.commit()
     db.refresh(cat)
     _invalidate_all_category_caches()

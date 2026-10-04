@@ -68,11 +68,14 @@ class PostService:
             "source_name": getattr(post, "source_name", None),
             "source_url": getattr(post, "source_url", None),
             "categories": [link.category for link in post.category_links],
+            "region": getattr(post, "region", None),
             "keywords": [link.keyword for link in post.keyword_links],
             "share_slug": post.share_slug,
             "share_url": f"/p/{post.share_slug}",
             "total_likes_count": post.total_likes_count,
             "total_comments_count": post.total_comments_count,
+            "views_count": getattr(post, "views_count", 0) or 0,
+            "backdrop": getattr(post, "backdrop", None),
             "is_active":post.is_active,
             "created_timestamp": post.created_timestamp,
             "updated_timestamp": getattr(post, "updated_timestamp", None),
@@ -98,6 +101,22 @@ class PostService:
                 "status": d.status, "updated_at": d.updated_timestamp.isoformat() if d.updated_timestamp else None,
                 "file_size_bytes": d.file_size_bytes, "show_data": bool(d.show_data),
             }
+
+    @staticmethod
+    def _backdrop(posts_db, payload, previous: Optional[dict] = None) -> Optional[dict]:
+        """The poster design (posts.backdrop): the publisher's design from the poster editor (a dict), or "auto"
+        (colour, texture and title font picked from the topic), or "none". Nothing is drawn on the server."""
+        from app.services import backdrop_service
+        choice = getattr(payload, "backdrop", None)
+        if choice is None and previous:
+            return previous                                    # edit without a design: keep the poster as it is
+        labels = [label for (label,) in posts_db.query(CategoryRecord.label)
+                  .filter(CategoryRecord.category_id.in_(payload.category_ids or [-1])).all()]
+        words = [k.strip().lower() for k in payload.keywords if k.strip()]
+        try:
+            return backdrop_service.for_post(payload.title, payload.description or "", labels, words, choice or "auto")
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
 
     @staticmethod
     def _delete_preview(path: Optional[str]) -> None:
@@ -133,6 +152,44 @@ class PostService:
             for p in posts
         ]
 
+    # ------------------------------------------------------------------
+    # Filtered feed (GET /posts/feed)
+    # ------------------------------------------------------------------
+    def feed(self, posts_db, users_db, *, category=None, region=None, visual_type=None, search=None,
+             publisher=None, sort="trending", skip=0, limit=12, current_user_id=None) -> list:
+        """Active posts filtered by category (slug), region (code), visual type (catalog code), text
+        and publisher handle (region includes its sub-regions). sort: trending = most viewed, popular = most liked, recent = newest."""
+        from sqlalchemy import or_
+        q = posts_db.query(PostRecord).filter(PostRecord.is_active == 1)
+        if category:
+            q = (q.join(PostCategoryLink, PostCategoryLink.post_id == PostRecord.post_id)
+                  .join(CategoryRecord, CategoryRecord.category_id == PostCategoryLink.category_id)
+                  .filter(CategoryRecord.slug == category))
+        if region and region.strip().lower() != "global":   # Global = the whole world (no filter); a continent also matches its countries
+            from app.services import region_service
+            q = q.filter(PostRecord.region.in_(region_service.with_descendants(region)))
+        if visual_type:
+            q = q.filter(or_(PostRecord.visual_spec["visual_type"].astext == visual_type,
+                             PostRecord.visual_spec["chart_type"].astext == visual_type))
+        if search:
+            like = f"%{search.strip()}%"
+            kw_posts = (posts_db.query(PostKeywordLink.post_id)
+                        .join(KeywordRecord, KeywordRecord.keyword_id == PostKeywordLink.keyword_id)
+                        .filter(KeywordRecord.word.ilike(like)))
+            q = q.filter(or_(PostRecord.title.ilike(like), PostRecord.description.ilike(like),
+                             PostRecord.post_id.in_(kw_posts)))
+        if publisher:
+            user = users_db.query(PlatformUserRecord).filter(PlatformUserRecord.user_handle == publisher).first()
+            if user is None:
+                return []
+            q = q.filter(PostRecord.publisher_user_id == user.user_id)
+        order = {
+            "recent": [desc(PostRecord.created_timestamp)],
+            "popular": [desc(PostRecord.total_likes_count), desc(PostRecord.created_timestamp)],
+        }.get(sort, [desc(PostRecord.views_count), desc(PostRecord.total_likes_count), desc(PostRecord.created_timestamp)])
+        posts = q.order_by(*order).offset(skip).limit(limit).all()
+        return [self._format_post_response(posts_db, users_db, p, current_user_id) for p in posts]
+
    # ------------------------------------------------------------------
     # Create
     # ------------------------------------------------------------------
@@ -148,6 +205,7 @@ class PostService:
                 accent=payload.theme_color,
                 z=getattr(vp, "z", None), size=getattr(vp, "size", None),
                 allow_inactive=allow_inactive,
+                color=getattr(vp, "color", None), story=vp.story() if vp else None,
             )
             data = visual_service.warm(payload.dataset_id, spec, allow_inactive)   # readers start on a cache hit
         except visual_service.VisualError as e:
@@ -157,35 +215,96 @@ class PostService:
         except duckdb_service.EngineError as e:
             raise HTTPException(status_code=503 if e.status >= 500 else 400, detail=e.message)
 
-        image_path = None
+        return spec, data
+
+    def _render_image(self, posts_db, post, data=None) -> Optional[str]:
+        """The post's poster as one square PNG (feed card, thumbnails, link previews): title, chart / map, legend,
+        sources and the GISViz mark on the post's poster design. Never blocks saving: None when it fails."""
+        from app.services import region_service
         try:
-            card = visual_service.get_card(payload.dataset_id, allow_inactive)
-            image_path = visual_image.render_thumbnail(
-                title=payload.title, subtitle=f"{card['title']} · {card.get('source_name') or ''}".strip(" ·"),
-                spec=spec, payload=data, accent=spec.get("accent"),
+            spec = post.visual_spec or {}
+            if data is None:
+                data = visual_service.warm(post.dataset_id, spec, allow_inactive=True)
+            labels = [label for (label,) in posts_db.query(CategoryRecord.label)
+                      .join(PostCategoryLink, PostCategoryLink.category_id == CategoryRecord.category_id)
+                      .filter(PostCategoryLink.post_id == post.post_id).all()]
+            region = next((r for r in region_service.list_regions(include_inactive=True) if r["code"] == post.region), None)
+            place = "Worldwide" if not region or region.get("kind") == "global" else region["name"]
+            card = {}
+            try:
+                card = visual_service.get_card(post.dataset_id, True)
+            except Exception:
+                pass
+            sources = []
+            if card.get("source_name") or post.source_name:
+                sources.append(card.get("source_name") or post.source_name)
+            if post.source_name and card.get("source_name") and post.source_name != card["source_name"]:
+                sources.append(post.source_name)
+            if card.get("title"):
+                sources.append(card["title"] + (f", {card['license']}" if card.get("license") else ""))
+            return visual_image.render_poster(
+                title=spec.get("title") or post.title, subtitle=spec.get("subtitle") or "",
+                eyebrow=" · ".join(x for x in (labels[0] if labels else "", place) if x),
+                spec=spec, payload=data, design=post.backdrop, accent=post.theme_color or spec.get("accent"),
+                sources=sources, note=post.note or "",
             )
         except Exception as exc:   # a preview glitch must not block publishing
-            print(f"[post_service] thumbnail render failed for {payload.dataset_id}: {exc}")
-        return spec, image_path
+            print(f"[post_service] poster image failed for post {post.post_id}: {exc}")
+            return None
+
+    def rerender_images(self, posts_db) -> dict:
+        """Admin: draw every active post's poster image again (after a design change of the image itself)."""
+        done = failed = 0
+        for post in posts_db.query(PostRecord).filter(PostRecord.dataset_id.isnot(None)).all():
+            path = self._render_image(posts_db, post)
+            if path:
+                old, post.visual_image_path = post.visual_image_path, path
+                posts_db.commit()
+                self._delete_preview(old)
+                done += 1
+            else:
+                failed += 1
+        return {"rendered": done, "failed": failed}
+
+    @staticmethod
+    def _check_taxonomy(posts_db, payload) -> None:
+        """Every post has a region (misc DB) and one or two categories (posts DB)."""
+        from app.services import region_service
+        payload.region = (payload.region or "").strip().lower() or None
+        if not payload.region:
+            raise HTTPException(status_code=422, detail="Pick the region this post is about")
+        if not region_service.exists(payload.region):
+            raise HTTPException(status_code=422, detail=f"Unknown region '{payload.region}'")
+        ids = list(dict.fromkeys(payload.category_ids or []))
+        if not ids:
+            raise HTTPException(status_code=422, detail="Pick at least one category")
+        if len(ids) > 2:
+            raise HTTPException(status_code=422, detail="Pick at most two categories")
+        found = {c for (c,) in posts_db.query(CategoryRecord.category_id).filter(CategoryRecord.category_id.in_(ids)).all()}
+        if found != set(ids):
+            raise HTTPException(status_code=422, detail="Unknown category")
+        payload.category_ids = ids
 
     async def create_post(self, posts_db, users_db, user_id, payload):
         if not payload.dataset_id:
             raise HTTPException(status_code=422, detail="Pick a dataset for this post")
+        self._check_taxonomy(posts_db, payload)
         dataset_id = payload.dataset_id.strip().lower()
         payload.dataset_id = dataset_id
-        spec, image_path = self._prepare_dataset_visual(payload)
+        spec, data = self._prepare_dataset_visual(payload)
 
         new_post = PostRecord(
             publisher_user_id=user_id,
             title=payload.title,
             description=payload.description,
-            visual_image_path=image_path,
             dataset_id=dataset_id,
             visual_spec=spec,
             theme_color=spec.get("accent"),
             note=payload.note,
             source_name=payload.source_name,
             source_url=payload.source_url,
+            region=payload.region,
+            backdrop=self._backdrop(posts_db, payload),
             share_slug=generate_unique_slug(posts_db),
         )
         posts_db.add(new_post)
@@ -214,6 +333,9 @@ class PostService:
             kw.usage_count = (kw.usage_count or 0) + 1
             posts_db.add(PostKeywordLink(post_id=new_post.post_id, keyword_id=kw.keyword_id))
 
+        posts_db.flush()
+        new_post.visual_image_path = self._render_image(posts_db, new_post, data)   # the poster, with its categories
+
         # Commit once, after all categories and keywords. (Previously this sat
         # inside the keyword loop, so only the first keyword was saved.)
         posts_db.commit()
@@ -241,25 +363,24 @@ class PostService:
         ):
             raise HTTPException(status_code=403, detail="Not authorized to update this post")
 
+        self._check_taxonomy(posts_db, payload)
+        post.region = payload.region
         post.title = payload.title
         post.description = payload.description
         post.note = payload.note
         post.source_name = payload.source_name
         post.source_url = payload.source_url
 
-        # Changing the dataset, chart or theme colour rebuilds the spec and the preview PNG.
+        # Changing the dataset, chart or theme colour rebuilds the spec; the poster image is redrawn on every save.
+        data = None
         if payload.dataset_id:
             payload.dataset_id = payload.dataset_id.strip().lower()
             # a post may keep (and re-chart) its own dataset even after that dataset was deactivated
-            spec, image_path = self._prepare_dataset_visual(
+            spec, data = self._prepare_dataset_visual(
                 payload, allow_inactive=(payload.dataset_id == post.dataset_id))
-            old_image = post.visual_image_path
             post.dataset_id = payload.dataset_id
             post.visual_spec = spec
             post.theme_color = spec.get("accent")
-            if image_path:
-                post.visual_image_path = image_path
-                self._delete_preview(old_image)
 
         # FIX: Decrement old categories before deleting links
         old_cat_links = posts_db.query(PostCategoryLink).filter(
@@ -311,6 +432,14 @@ class PostService:
                 keyword_id=keyword_record.keyword_id,
             ))
 
+        post.backdrop = self._backdrop(posts_db, payload, getattr(post, "backdrop", None))
+        posts_db.flush()
+        # the poster image follows every edit (title, design, categories, chart)
+        if post.dataset_id:
+            image_path = self._render_image(posts_db, post, data)
+            if image_path:
+                old_image, post.visual_image_path = post.visual_image_path, image_path
+                self._delete_preview(old_image)
         posts_db.commit()
         posts_db.refresh(post)
         return self._format_post_response(posts_db, users_db, post, current_user.user_id)

@@ -208,6 +208,8 @@ def classify(name: str, sql_type: str, n_distinct: int, rows: int) -> str:
         return "temporal"
     if base in NUMERIC:
         return "id" if name.endswith("_id") or name == "id" else "numeric"
+    if base == "BOOLEAN":                      # yes / no: two groups
+        return "categorical"
     if base == "VARCHAR":
         if n_distinct <= max(60, rows * 0.5) and n_distinct < rows * 0.95 + 1:
             return "categorical" if n_distinct < rows or rows <= 60 else "text"
@@ -340,6 +342,61 @@ def ingest(dataset_id: str, src: Path, original_name: str, force: bool = False) 
     return {"dataset_id": dataset_id, "rows": info["rows"], "columns": len(info["columns"]), "bytes": info["bytes"],
             "geometry_type": info["geometry_type"], "format": info["format"], "data_version": info["data_version"],
             "broken_posts": broken}
+
+
+# ── upload previewer (admin): stage -> look / edit columns -> commit or discard ──
+
+def stage_upload(dataset_id: str, src: Path, original_name: str) -> dict:
+    """Load the file as the dataset's STAGED table (the live table is untouched) and return what the
+    previewer shows: columns with their detected types, sample rows, size."""
+    from app.services import catalog_service, duckdb_service
+    if not catalog_service.exists(dataset_id):
+        raise IngestError(f"Dataset '{dataset_id}' does not exist")
+    try:
+        duckdb_service.stage(dataset_id, src, original_name)
+        return duckdb_service.staged_sample(dataset_id)
+    except duckdb_service.EngineError as e:
+        raise IngestError(str(e)) from e
+
+
+def sample_staged(dataset_id: str, changes: Optional[list] = None, limit: int = 20) -> dict:
+    """The staged upload with the admin's column edits tried on a sample (nothing is kept)."""
+    from app.services import duckdb_service
+    try:
+        return duckdb_service.staged_sample(dataset_id, changes, limit)
+    except duckdb_service.EngineError as e:
+        raise IngestError(e.message if hasattr(e, "message") else str(e)) from e
+
+
+def commit_staged(dataset_id: str, changes: Optional[list] = None, force: bool = False) -> dict:
+    """Apply the column edits, check published posts against the result, then make it live. A conflict
+    keeps the staged upload so the admin can change the edits or replace anyway."""
+    from app.services import catalog_service, duckdb_service, visual_service
+    try:
+        meta = duckdb_service.staged_sample(dataset_id, None, 1)
+        info = duckdb_service.apply_changes(dataset_id, changes)
+    except duckdb_service.StoreUnavailable as e:
+        raise IngestError("No staged upload for this dataset (drop the file again)") from e
+    except duckdb_service.EngineError as e:
+        raise IngestError(str(e)) from e
+    broken = _broken_posts(dataset_id, info)
+    if broken and not force:
+        raise ReplaceConflict(broken)
+    try:
+        duckdb_service.commit(dataset_id)
+    except duckdb_service.EngineError as e:
+        raise IngestError(str(e)) from e
+    info.update(format=meta.get("format"), bytes=meta.get("bytes"))
+    catalog_service.record_upload(dataset_id, info)
+    visual_service.invalidate(dataset_id)
+    return {"dataset_id": dataset_id, "rows": info["rows"], "columns": len(info["columns"]), "bytes": info.get("bytes"),
+            "geometry_type": info["geometry_type"], "format": info.get("format"), "data_version": info["data_version"],
+            "broken_posts": broken}
+
+
+def discard_staged(dataset_id: str) -> bool:
+    from app.services import duckdb_service
+    return duckdb_service.discard(dataset_id)
 
 
 def remove(dataset_id: str) -> None:

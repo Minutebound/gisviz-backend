@@ -1,7 +1,7 @@
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from fastapi_cache import FastAPICache
 from fastapi_cache.decorator import cache
 from sqlalchemy.orm import Session
@@ -15,6 +15,7 @@ from app.db.models import (
     PostCommentRecord, PostReportRecord, RoleRecord,
 )
 from app.schemas.post_schema import (
+    BackdropPreviewPayload,
     PostResponse, PostPayload, LikeResponse, BookmarkResponse,
     CommentPayload, CommentData, PostReportPayload, PostReportResponse,ReportStatusPayload
 )
@@ -96,6 +97,118 @@ async def trending_posts(n: int = Query(10, ge=1, le=50)):
 #  Per-user is_liked / is_bookmarked included when JWT present.
 #  Client-side 2-minute TTL in api.ts prevents hammering.
 # -------------------------------------------------------------------
+@router.get("/keywords/trending")
+def trending_keywords(
+    category: Optional[str] = Query(None, max_length=60),
+    limit: int = Query(10, ge=1, le=30),
+    posts_db: Session = Depends(get_posts_db),
+):
+    """Public: the tags (keywords) used by the most active posts, optionally within one category
+    (categories.slug). Feeds the "Trending Tags" rail; nothing about it is hard-coded."""
+    from sqlalchemy import func
+    from app.db.models import CategoryRecord, KeywordRecord, PostCategoryLink, PostKeywordLink, PostRecord
+    from app.services.cache_service import cache_service
+    key = f"gisviz-cache:keywords:trending:{category or 'all'}:{limit}"
+    cached = cache_service.get(key)
+    if cached is not None:
+        return cached
+    n = func.count(PostKeywordLink.post_id)
+    q = (posts_db.query(KeywordRecord.word, n.label("posts"))
+         .join(PostKeywordLink, PostKeywordLink.keyword_id == KeywordRecord.keyword_id)
+         .join(PostRecord, PostRecord.post_id == PostKeywordLink.post_id)
+         .filter(PostRecord.is_active == 1))
+    if category:
+        q = (q.join(PostCategoryLink, PostCategoryLink.post_id == PostRecord.post_id)
+              .join(CategoryRecord, CategoryRecord.category_id == PostCategoryLink.category_id)
+              .filter(CategoryRecord.slug == category))
+    rows = q.group_by(KeywordRecord.word).order_by(n.desc(), KeywordRecord.word).limit(limit).all()
+    result = [{"word": w, "posts": c} for w, c in rows]
+    cache_service.set(key, result, ttl_seconds=3600 if result else 60)
+    return result
+
+
+@router.get("/feed", response_model=List[PostResponse])
+def filtered_feed(
+    category: Optional[str] = Query(None, max_length=60),
+    region: Optional[str] = Query(None, max_length=60),
+    chart_type: Optional[str] = Query(None, max_length=40),     # visual type: catalog code (misc DB)
+    search: Optional[str] = Query(None, max_length=120),
+    publisher: Optional[str] = Query(None, max_length=60),
+    sort: str = Query("trending", pattern="^(trending|recent|popular)$"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(12, ge=1, le=60),
+    posts_db: Session = Depends(get_posts_db),
+    users_db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
+):
+    """Public: the feed with its filters (category bar, region, visual type, search, publisher)."""
+    return post_service.feed(posts_db, users_db, category=category or None, region=region or None,
+                             visual_type=chart_type or None, search=search or None, publisher=publisher or None,
+                             sort=sort, skip=skip, limit=limit,
+                             current_user_id=current_user.user_id if current_user else None)
+
+
+@router.get("/backdrop/options")
+def backdrop_options():
+    """Public: what the poster editor can choose from (textures, title fonts, movable blocks, map bases)."""
+    from app.services import backdrop_service
+    return backdrop_service.options()
+
+
+@router.post("/backdrop/preview")
+def backdrop_preview(
+    body: BackdropPreviewPayload,
+    posts_db: Session = Depends(get_posts_db),
+    _user: PlatformUserRecord = Depends(require_publisher),
+):
+    """Publishers: the poster design "auto" would pick for this topic (colour, texture, title font), or the
+    publisher's design cleaned the way publishing would clean it."""
+    body.title = (body.title or "").strip()
+    return post_service._backdrop(posts_db, body)
+
+
+@router.post("/manage/rerender-images")
+def rerender_images(
+    posts_db: Session = Depends(get_posts_db),
+    _admin: PlatformUserRecord = Depends(RoleChecker(["admin"])),
+):
+    """Admin: redraw every post's poster image (feed card / thumbnail / share preview) with the current renderer."""
+    return post_service.rerender_images(posts_db)
+
+
+@router.get("/featured")
+def featured_post(
+    category: Optional[str] = Query(None, max_length=60),
+    posts_db: Session = Depends(get_posts_db),
+    users_db: Session = Depends(get_users_db),
+):
+    """Public: the feed banner's editor's pick — the most-viewed active post, in one category
+    (categories.slug) or overall. Ties go to the most liked, then the newest. null when none."""
+    from app.db.models import CategoryRecord, PostCategoryLink, PostRecord
+    key = f"gisviz-cache:posts:featured:{category or 'all'}"
+    cached = cache_service.get(key)
+    if cached:
+        return cached
+    q = posts_db.query(PostRecord).filter(PostRecord.is_active == 1)
+    if category:
+        q = (q.join(PostCategoryLink, PostCategoryLink.post_id == PostRecord.post_id)
+              .join(CategoryRecord, CategoryRecord.category_id == PostCategoryLink.category_id)
+              .filter(CategoryRecord.slug == category))
+    p = q.order_by(PostRecord.views_count.desc(), PostRecord.total_likes_count.desc(),
+                   PostRecord.created_timestamp.desc()).first()
+    result = {}
+    if p is not None:
+        pub = users_db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == p.publisher_user_id).first()
+        result = {"post_id": str(p.post_id), "title": p.title, "visual_image_path": p.visual_image_path,
+                  "theme_color": p.theme_color, "views_count": p.views_count or 0,
+                  "total_likes_count": p.total_likes_count, "share_slug": p.share_slug,
+                  "publisher_handle": pub.user_handle if pub else None,
+                  "created_timestamp": p.created_timestamp.isoformat() if p.created_timestamp else None}
+    if result:  # never cache "no pick": the first post of a category must appear at once
+        cache_service.set(key, result, ttl_seconds=120)
+    return result or None
+
+
 @router.get("/trending-full", response_model=List[PostResponse])
 async def trending_posts_full(
     n: int = Query(20, ge=1, le=50),
@@ -463,6 +576,28 @@ async def update_report_status(
 # -------------------------------------------------------------------
 #  LIKES
 # -------------------------------------------------------------------
+@router.post("/{post_id}/view")
+def record_post_view(
+    post_id: str,
+    request: Request,
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
+):
+    """Public: called once when a post page opens. Counted once per visitor per day (fact_post_view
+    in the analytics DB); returns the post's current view total."""
+    from app.services import view_service
+    try:
+        uuid.UUID(post_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Post not found")
+    fwd = request.headers.get("x-forwarded-for", "")
+    ip = fwd.split(",")[0].strip() or (request.client.host if request.client else None)
+    try:
+        return view_service.record_view(post_id, str(current_user.user_id) if current_user else None,
+                                        ip, request.headers.get("user-agent"))
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+
 @router.post("/{post_id}/like", response_model=LikeResponse)
 async def toggle_like(
     post_id: uuid.UUID,

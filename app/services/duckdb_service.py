@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 SERVICE_URL = os.getenv("DUCKDB_SERVICE_URL", "").rstrip("/")
 TOKEN = os.getenv("DUCKDB_SERVICE_TOKEN", "")
@@ -104,6 +104,20 @@ def stage(dataset_id: str, src: Path, original_name: str) -> dict:
             return _call("POST", f"/tables/{dataset_id}/stage", timeout=UPLOAD_TIMEOUT,
                          files={"file": (Path(original_name).name, fh)}, data={"name": Path(original_name).name})
     return _wrap(_embedded().stage, dataset_id, Path(src), original_name)
+
+
+def staged_sample(dataset_id: str, changes: Optional[list] = None, limit: int = 20) -> dict:
+    """Columns + sample rows of a staged upload, with column edits tried on them (not kept)."""
+    if SERVICE_URL:
+        return _call("POST", f"/tables/{dataset_id}/staged/sample", json={"changes": changes or [], "limit": limit})
+    return _wrap(_embedded().staged_sample, dataset_id, changes, limit)
+
+
+def apply_changes(dataset_id: str, changes: Optional[list]) -> dict:
+    """Rebuild the staged upload with the column edits; returns its new profile."""
+    if SERVICE_URL:
+        return _call("POST", f"/tables/{dataset_id}/staged/apply", json={"changes": changes or []}, timeout=UPLOAD_TIMEOUT)
+    return _wrap(_embedded().apply_changes, dataset_id, changes)
 
 
 def commit(dataset_id: str) -> dict:

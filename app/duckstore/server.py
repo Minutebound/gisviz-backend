@@ -93,6 +93,23 @@ def stage(code: str, file: UploadFile = File(...), name: str = Form(...)):
         tmp.unlink(missing_ok=True)
 
 
+class ChangesBody(BaseModel):
+    changes: list[dict] = []
+    limit: int = 20
+
+
+@app.post("/tables/{code}/staged/sample", dependencies=[Depends(auth)])
+def staged_sample(code: str, body: ChangesBody):
+    """The staged upload with (optional) column edits applied to a sample, without keeping them."""
+    return get_engine().staged_sample(code, body.changes, body.limit)
+
+
+@app.post("/tables/{code}/staged/apply", dependencies=[Depends(auth)])
+def staged_apply(code: str, body: ChangesBody):
+    """Apply the column edits to the staged table (before commit)."""
+    return get_engine().apply_changes(code, body.changes)
+
+
 @app.post("/tables/{code}/commit", dependencies=[Depends(auth)])
 def commit(code: str):
     return get_engine().commit(code)

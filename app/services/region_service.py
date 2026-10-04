@@ -4,9 +4,9 @@ app/services/region_service.py
 Regions live in the MISC database (table `regions`). Datasets store a region's `code`
 (datasets.region); other features (posts, users, filters) can use the same table later.
 
-Seeded by GET /seed (app/main.py SEED_REGIONS) with the world, the continents and the UN M49 sub-regions. The seed only
-inserts codes that are missing, so regions edited or added by admins are never overwritten.
-Countries (kind="country", parent_code=<sub-region>) can be added from the API when needed.
+Seeded by GET /seed (app/main.py SEED_REGIONS + SEED_COUNTRIES): Global, the 7 continents (parent = global) and
+every ISO 3166 country (kind="country", parent_code = its continent, iso_a2/iso_a3, m49, bbox). /seed upserts them
+and switches off any other row. Filters list only Global + continents; posts and datasets can be tagged with a country.
 """
 from __future__ import annotations
 
@@ -37,6 +37,35 @@ def list_regions(include_inactive: bool = False) -> list[dict]:
             q = q.filter(RegionRecord.is_active == 1)
         rows = q.order_by(RegionRecord.sort_order, RegionRecord.name).all()
         return [_row(r) for r in rows]
+
+
+# "global" is the top of the tree (global > continent > country). The feed and dataset filters treat it as
+# "the whole world" and skip filtering; with_descendants() keeps it out of the expansion so a stray call
+# never builds a list of every region.
+NON_CONTAINERS = ("global",)
+
+
+def with_descendants(code: str) -> list[str]:
+    """The region and every region below it (parent_code chain), e.g. africa -> [africa, eastern-africa, ke, ...].
+    Inactive sub-regions are included so content tagged with them before they were switched off still matches.
+    Used by the feed and dataset filters: picking a continent also shows its sub-regions' content."""
+    code = (code or "").strip().lower()
+    if not code or code in NON_CONTAINERS:
+        return [code] if code else []
+    with MiscSessionLocal() as db:
+        pairs = db.query(RegionRecord.code, RegionRecord.parent_code).all()
+    children: dict[str, list[str]] = {}
+    for c, parent in pairs:
+        if parent:
+            children.setdefault(parent, []).append(c)
+    out, todo = [], [code]
+    while todo:
+        c = todo.pop()
+        if c in out:
+            continue                      # guards against a parent loop typed in by hand
+        out.append(c)
+        todo.extend(children.get(c, []))
+    return out
 
 
 def exists(code: str) -> bool:
