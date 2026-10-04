@@ -97,6 +97,29 @@ def load(dataset_id: str, src: Path, original_name: str) -> dict:
     return _wrap(_embedded().load, dataset_id, Path(src), original_name)
 
 
+def stage(dataset_id: str, src: Path, original_name: str) -> dict:
+    """Load an upload as <id>__staged and return its profile; the live table is untouched."""
+    if SERVICE_URL:
+        with open(src, "rb") as fh:
+            return _call("POST", f"/tables/{dataset_id}/stage", timeout=UPLOAD_TIMEOUT,
+                         files={"file": (Path(original_name).name, fh)}, data={"name": Path(original_name).name})
+    return _wrap(_embedded().stage, dataset_id, Path(src), original_name)
+
+
+def commit(dataset_id: str) -> dict:
+    """Make the staged upload live (replaces the table in one transaction)."""
+    if SERVICE_URL:
+        return _call("POST", f"/tables/{dataset_id}/commit", timeout=UPLOAD_TIMEOUT)
+    return _wrap(_embedded().commit, dataset_id)
+
+
+def discard(dataset_id: str) -> bool:
+    """Throw away a staged upload."""
+    if SERVICE_URL:
+        return bool(_call("DELETE", f"/tables/{dataset_id}/staged").get("discarded"))
+    return _wrap(_embedded().discard, dataset_id)
+
+
 def drop(dataset_id: str) -> bool:
     if SERVICE_URL:
         return bool(_call("DELETE", f"/tables/{dataset_id}").get("dropped"))
@@ -107,6 +130,17 @@ def tables() -> list[dict]:
     if SERVICE_URL:
         return _call("GET", "/tables")
     return _wrap(_embedded().tables)
+
+
+def stats() -> dict:
+    """File, size, table and row counts of gisviz.duckdb."""
+    if SERVICE_URL:
+        return _call("GET", "/stats", timeout=10)
+    return _wrap(_embedded().stats)
+
+
+def describe() -> str:
+    return SERVICE_URL or "embedded (no DUCKDB_SERVICE_URL)"
 
 
 def preview(dataset_id: str, limit: int = 50) -> dict:

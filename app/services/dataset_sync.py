@@ -35,6 +35,25 @@ def status() -> dict:
             "missing_table": missing, "version_mismatch": mismatch, "orphan_tables": orphans}
 
 
+def report() -> dict:
+    """status() plus the store's own figures, for /admin/datasets. Never raises: when the DuckDB
+    service cannot be reached the report says so (state "unreachable")."""
+    import datetime as dt
+    out = {"checked_at": dt.datetime.now(dt.timezone.utc).isoformat(), "service": store.describe()}
+    try:
+        s = status()
+    except Exception as e:
+        msg = getattr(e, "message", None) or str(e) or type(e).__name__
+        return {**out, "state": "unreachable", "error": msg[:300], "in_sync": False, "store": None,
+                "records": len(catalog.data_versions()), "tables": None,
+                "missing_table": [], "version_mismatch": [], "orphan_tables": []}
+    try:
+        st = store.stats()
+    except Exception:                                   # older duckdb container without /stats
+        st = None
+    return {**out, **s, "state": "in_sync" if s["in_sync"] else "out_of_sync", "store": st}
+
+
 def fix(drop_orphans: bool = False) -> dict:
     """Records whose table is missing become inactive; optionally drop tables without a record."""
     from app.services import visual_service
@@ -47,7 +66,7 @@ def fix(drop_orphans: bool = False) -> dict:
         for o in s["orphan_tables"]:
             store.drop(o["code"])
             dropped.append(o["code"])
-    return {**status(), "fixed_missing": s["missing_table"], "dropped_orphans": dropped}
+    return {**report(), "fixed_missing": s["missing_table"], "dropped_orphans": dropped}
 
 
 def startup_check() -> None:

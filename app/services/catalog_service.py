@@ -9,7 +9,8 @@ Admins manage it on /admin/datasets:
   upload  -> the Parquet file becomes table <code> in gisviz.duckdb (DuckDB service); row turns `active`
   toggle  -> active / inactive (inactive = hidden from /datasets and the post picker;
              posts already built on it keep working)
-  edit    -> title, description, category, source, licence, publisher
+  edit    -> title, description, category (posts DB categories.slug), region (misc DB regions.code),
+             source, licence, publisher
   delete  -> only when no post uses it (otherwise deactivate it)
 """
 from __future__ import annotations
@@ -24,14 +25,16 @@ from app.db.models import DatasetRecord
 
 STATUSES = ("inactive", "active")
 CODE_PREFIX = "ds_"
-META_FIELDS = ("title", "description", "category", "source_name", "source_url", "license", "publisher")
-_FIELDS = ("dataset_id", "title", "description", "category", "format", "source_name", "source_url",
-           "license", "publisher", "geometry_type", "row_count", "crs", "bbox", "data_version", "updated_timestamp")
+META_FIELDS = ("title", "description", "category", "region", "source_name", "source_url", "license", "publisher")
+_FIELDS = ("dataset_id", "title", "description", "category", "region", "format", "source_name", "source_url",
+           "license", "publisher", "geometry_type", "row_count", "crs", "bbox", "data_version", "file_size_bytes",
+           "updated_timestamp")
 
 
 def _card(r: DatasetRecord) -> dict:
     d = {k: getattr(r, k) for k in _FIELDS}
     d["updated_at"] = d.pop("updated_timestamp")
+    d["show_data"] = bool(r.show_data)
     return d
 
 
@@ -44,7 +47,7 @@ def _admin_card(r: DatasetRecord) -> dict:
 
 def _keywords(r: DatasetRecord) -> str:
     cols = " ".join(c.get("label") or c.get("column_name") or "" for c in (r.columns or []))
-    return " ".join(filter(None, [r.dataset_id, r.title, r.description, r.category, r.source_name, cols])).lower()
+    return " ".join(filter(None, [r.dataset_id, r.title, r.description, r.category, r.region, r.source_name, cols])).lower()
 
 
 # ── public / publisher reads (active only) ───────────────────────────
@@ -106,6 +109,29 @@ def categories() -> list[dict]:
                 .filter(DatasetRecord.status == "active", DatasetRecord.category.isnot(None))
                 .group_by(DatasetRecord.category).order_by(DatasetRecord.category).all())
         return [{"category": c, "count": n} for c, n in rows]
+
+
+def category_exists(slug: str) -> bool:
+    """Dataset categories are the post categories (posts DB, categories.slug)."""
+    from app.db.models import CategoryRecord
+    with PostsSessionLocal() as db:
+        return db.query(CategoryRecord.category_id).filter(CategoryRecord.slug == slug).first() is not None
+
+
+def region_usage(code: str) -> int:
+    """How many datasets are tagged with a region (any status)."""
+    with DatasetsSessionLocal() as db:
+        return db.query(func.count()).select_from(DatasetRecord).filter(DatasetRecord.region == code).scalar() or 0
+
+
+def posts_using(dataset_id: str) -> list[dict]:
+    """Active posts built on a dataset, with their saved visual spec (checked before a file is replaced)."""
+    from app.db.models import PostRecord
+    with PostsSessionLocal() as db:
+        rows = (db.query(PostRecord.post_id, PostRecord.title, PostRecord.share_slug, PostRecord.visual_spec)
+                .filter(PostRecord.dataset_id == dataset_id, PostRecord.is_active == 1).all())
+        return [{"post_id": str(r.post_id), "title": r.title, "share_slug": r.share_slug, "visual_spec": r.visual_spec}
+                for r in rows]
 
 
 def post_count(dataset_id: str) -> int:
@@ -187,6 +213,29 @@ def set_active(dataset_id: str, active: bool) -> dict:
         return _admin_card(r)
 
 
+def set_show_data(dataset_id: str, show: bool) -> dict:
+    """Whether the dataset's rows may be shown publicly on the pages of posts built on it."""
+    with DatasetsSessionLocal() as db:
+        r = db.get(DatasetRecord, dataset_id)
+        if r is None:
+            raise LookupError(f"Dataset '{dataset_id}' does not exist")
+        r.show_data = 1 if show else 0
+        db.commit()
+        db.refresh(r)
+        return _admin_card(r)
+
+
+def metadata(dataset_id: str) -> Optional[dict]:
+    """Everything the catalog holds about one dataset, any status (admin metadata panel)."""
+    with DatasetsSessionLocal() as db:
+        r = db.get(DatasetRecord, dataset_id)
+        if r is None:
+            return None
+        d = _admin_card(r)
+        d["columns"] = list(r.columns or [])
+        return d
+
+
 def delete(dataset_id: str) -> None:
     """Remove the record. Refused while posts use the dataset (deactivate it instead)."""
     n = post_count(dataset_id)
@@ -214,6 +263,8 @@ def record_upload(dataset_id: str, info: dict) -> None:
         r.format = info.get("format")
         r.data_version = info["data_version"]
         r.data_uploaded_at = dt.datetime.now(dt.timezone.utc)
+        if info.get("bytes") is not None:
+            r.file_size_bytes = int(info["bytes"])
         r.status = "active"
         r.keywords = _keywords(r)
         db.commit()
@@ -238,4 +289,5 @@ def mark_missing(dataset_id: str) -> None:
             r.columns = None
             r.row_count = 0
             r.data_version = None
+            r.file_size_bytes = None
             db.commit()

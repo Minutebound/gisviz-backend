@@ -96,6 +96,7 @@ class PostService:
                 "source_url": d.source_url, "license": d.license, "publisher": d.publisher,
                 "geometry_type": d.geometry_type, "row_count": d.row_count, "crs": d.crs,
                 "status": d.status, "updated_at": d.updated_timestamp.isoformat() if d.updated_timestamp else None,
+                "file_size_bytes": d.file_size_bytes, "show_data": bool(d.show_data),
             }
 
     @staticmethod

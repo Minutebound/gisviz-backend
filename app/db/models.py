@@ -8,6 +8,8 @@ Databases:
   PostsBase    → posts_db      (posts, categories, keywords, likes, comments, reports)
   AnalyticsBase→ analytics_db  (star schema warehouse, snapshot ETL)
   AdminBase    → admin_db      (audit trail, role history, report resolutions)
+  DatasetsBase → datasets_db   (dataset catalog; data itself in gisviz.duckdb)
+  MiscBase     → misc_db       (shared reference data: regions, ...)
 
 """
 
@@ -24,7 +26,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
-from app.db.database import UsersBase, PostsBase, AnalyticsBase, AdminBase, DatasetsBase
+from app.db.database import UsersBase, PostsBase, AnalyticsBase, AdminBase, DatasetsBase, MiscBase
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -125,7 +127,8 @@ class DatasetRecord(DatasetsBase):
     dataset_id    = Column(String(64), primary_key=True)          # code ds_00001 == data file name
     title         = Column(String(255), nullable=False)
     description   = Column(Text, nullable=True)
-    category      = Column(String(80), nullable=True, index=True)
+    category      = Column(String(80), nullable=True, index=True)   # categories.slug (posts DB)
+    region        = Column(String(60), nullable=True, index=True)   # regions.code (misc DB)
     format        = Column(String(20), nullable=True)             # format of the last upload
     source_name   = Column(String(255), nullable=True)
     source_url    = Column(String(1024), nullable=True)
@@ -139,6 +142,8 @@ class DatasetRecord(DatasetsBase):
     keywords      = Column(Text, nullable=True)                   # lowercase search text (id, title, columns...)
     data_version  = Column(String(32), nullable=True)             # fingerprint of the uploaded data file
     data_uploaded_at = Column(DateTime(timezone=True), nullable=True)   # when the file was last uploaded
+    file_size_bytes = Column(BigInteger, nullable=True)            # size of the last uploaded data file
+    show_data     = Column(Integer, default=0, server_default="0", nullable=False)  # 1 = rows shown on post pages (public)
     status        = Column(String(12), default="inactive", nullable=False, index=True)  # inactive | active
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -208,6 +213,9 @@ class CategoryRecord(PostsBase):
     category_id   = Column(Integer, primary_key=True, autoincrement=True)
     slug          = Column(String(60), unique=True, index=True, nullable=False)
     label         = Column(String(80), nullable=False)
+    description   = Column(Text, nullable=True)
+    theme_color   = Column(String(7), nullable=True)          # #rrggbb, used as the post/visual accent
+    sort_order    = Column(Integer, nullable=False, default=0, server_default="0")
     usage_count   = Column(Integer, default=0, nullable=False)
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     post_links = relationship("PostCategoryLink", back_populates="category")
@@ -588,3 +596,64 @@ def log_report_resolution(
     if commit:
         admin_db.commit()
     return row
+
+# ── MISC database (reference data shared across features) ────────────────────
+
+class RegionRecord(MiscBase):
+    """Regions a dataset (and later a post, a user, a filter) can be tagged with.
+    code is the stable key stored elsewhere (datasets.region); parent_code builds the hierarchy
+    global > continent > sub-region > country."""
+    __tablename__ = "regions"
+    region_id   = Column(Integer, primary_key=True, autoincrement=True)
+    code        = Column(String(60), unique=True, nullable=False, index=True)     # e.g. global, africa, eastern-africa, ke
+    name        = Column(String(120), nullable=False)
+    kind        = Column(String(20), nullable=False, default="region")            # global | continent | subregion | country | custom
+    parent_code = Column(String(60), nullable=True, index=True)
+    iso_a2      = Column(String(2), nullable=True)
+    iso_a3      = Column(String(3), nullable=True)
+    m49         = Column(String(3), nullable=True)                                # UN M49 area code
+    bbox        = Column(JSONB, nullable=True)                                    # [minx, miny, maxx, maxy]
+    sort_order  = Column(Integer, nullable=False, default=0)
+    is_active   = Column(Integer, nullable=False, default=1)
+    created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class VisualCategoryRecord(MiscBase):
+    """The 7 families of visuals (data-to-viz): distribution, correlation, ranking, part_of_whole,
+    evolution, map, flow. Seeded by GET /seed (app/main.py)."""
+    __tablename__ = "visual_categories"
+    code        = Column(String(40), primary_key=True)
+    name        = Column(String(80), nullable=False)
+    color       = Column(String(7), nullable=True)
+    question    = Column(Text, nullable=True)               # what this family answers
+    guide_goals = Column(JSONB, nullable=True)              # matching "data goals" of the Datylon guide
+    sort_order  = Column(Integer, nullable=False, default=0)
+
+
+class VisualTypeRecord(MiscBase):
+    """One chart or map type. status: live (renders today) | next (small renderer addition) |
+    later (new data shape / renderer). Only enabled types are offered to publishers and the AI."""
+    __tablename__ = "visual_types"
+    code         = Column(String(40), primary_key=True)
+    name         = Column(String(120), nullable=False)
+    category     = Column(String(40), nullable=False, index=True)   # visual_categories.code
+    kind         = Column(String(10), nullable=False)               # chart | map
+    roles        = Column(JSONB, nullable=False)                    # {"x": "categorical", "y": "numeric", "z?": ...}
+    best_when    = Column(Text, nullable=True)
+    avoid_when   = Column(Text, nullable=True)
+    status       = Column(String(10), nullable=False, index=True)   # live | next | later
+    interactions = Column(JSONB, nullable=True)                     # ["tooltip", "label_filter", "time_play", ...]
+    legacy_code  = Column(String(40), nullable=True)                # code used by the current renderer, if different
+    enabled      = Column(Integer, nullable=False, default=0, server_default="0")   # admin switch; seeded = live
+    sort_order   = Column(Integer, nullable=False, default=0)
+    updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AiPromptRecord(MiscBase):
+    """Prompt templates used by AI features (e.g. visual_selection). Editable without a deploy."""
+    __tablename__ = "ai_prompts"
+    code        = Column(String(60), primary_key=True)
+    template    = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

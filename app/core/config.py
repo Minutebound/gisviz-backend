@@ -57,6 +57,8 @@ class PlatformConfigurationSettings(BaseSettings):
     ADMIN_DATABASE_URL: str
     # Dataset catalog (one row per DuckDB dataset). Falls back to the posts DB when unset.
     DATASETS_DATABASE_URL: Optional[str] = None
+    # Shared reference data (regions, ...). Falls back to the datasets DB, then the posts DB, when unset.
+    MISC_DATABASE_URL: Optional[str] = None
 
     # ── Cache ─────────────────────────────────────────────────────────
     REDIS_URL: str

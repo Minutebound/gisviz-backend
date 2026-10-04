@@ -283,20 +283,63 @@ def stage_file(con, src: Path, original_name: str, src_crs: Optional[str] = None
 
 # ── API side: upload -> DuckDB service -> Postgres record ─────────────
 
-def ingest(dataset_id: str, src: Path, original_name: str) -> dict:
-    """Send the file to the DuckDB service (table <code> in gisviz.duckdb), store the profile on the
-    dataset's row (which makes it active) and clear the dataset's cached charts."""
+class ReplaceConflict(Exception):
+    """The new file would break published posts (columns they use are missing or changed type)."""
+    def __init__(self, broken: list[dict]):
+        super().__init__(f"{len(broken)} published post(s) would break")
+        self.broken = broken
+
+
+def _broken_posts(dataset_id: str, info: dict) -> list[dict]:
+    """Published posts on this dataset whose chart/map would no longer render with the staged data."""
+    from app.services import catalog_service, visual_service
+    posts = catalog_service.posts_using(dataset_id)
+    if not posts:
+        return []
+    card = catalog_service.get(dataset_id, include_inactive=True) or {"dataset_id": dataset_id}
+    card = {**card, "geometry_type": info.get("geometry_type"), "bbox": info.get("bbox"),
+            "crs": info.get("crs"), "row_count": info.get("rows")}
+    vinfo = visual_service.info_for(card, info["columns"])
+    out = []
+    for p in posts:
+        problem = visual_service.spec_problem(dataset_id, p["visual_spec"], vinfo)
+        if problem:
+            out.append({"post_id": p["post_id"], "title": p["title"], "share_slug": p["share_slug"], "problem": problem})
+    return out
+
+
+def ingest(dataset_id: str, src: Path, original_name: str, force: bool = False) -> dict:
+    """Load an uploaded file as the dataset's table in gisviz.duckdb.
+
+    The file is first STAGED (the live table is untouched) and every published post on this dataset
+    is checked against the new columns. If any would break, the staged data is thrown away and
+    ReplaceConflict lists them, unless force=True. Then it is committed, the profile is stored on
+    the dataset's row (which makes it active) and the dataset's cached charts are cleared."""
     from app.services import catalog_service, duckdb_service, visual_service
     if not catalog_service.exists(dataset_id):
         raise IngestError(f"Dataset '{dataset_id}' does not exist")
     try:
-        info = duckdb_service.load(dataset_id, src, original_name)
+        info = duckdb_service.stage(dataset_id, src, original_name)
     except duckdb_service.EngineError as e:
         raise IngestError(str(e)) from e
+    try:
+        broken = _broken_posts(dataset_id, info)
+    except Exception:
+        duckdb_service.discard(dataset_id)
+        raise
+    if broken and not force:
+        duckdb_service.discard(dataset_id)
+        raise ReplaceConflict(broken)
+    try:
+        duckdb_service.commit(dataset_id)
+    except duckdb_service.EngineError as e:
+        raise IngestError(str(e)) from e
+    info["bytes"] = Path(src).stat().st_size                   # size of the file as uploaded
     catalog_service.record_upload(dataset_id, info)
     visual_service.invalidate(dataset_id)
-    return {"dataset_id": dataset_id, "rows": info["rows"], "columns": len(info["columns"]),
-            "geometry_type": info["geometry_type"], "format": info["format"], "data_version": info["data_version"]}
+    return {"dataset_id": dataset_id, "rows": info["rows"], "columns": len(info["columns"]), "bytes": info["bytes"],
+            "geometry_type": info["geometry_type"], "format": info["format"], "data_version": info["data_version"],
+            "broken_posts": broken}
 
 
 def remove(dataset_id: str) -> None:

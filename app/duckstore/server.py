@@ -60,16 +60,47 @@ def tables():
     return get_engine().tables()
 
 
+@app.get("/stats", dependencies=[Depends(auth)])
+def stats():
+    return get_engine().stats()
+
+
 @app.post("/tables/{code}", dependencies=[Depends(auth)])
 def load(code: str, file: UploadFile = File(...), name: str = Form(...)):
     e = get_engine()
+    tmp = _receive(e, file, name)
+    try:
+        return e.load(code, tmp, name)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _receive(e, file: UploadFile, name: str) -> Path:
     fd, tmp = tempfile.mkstemp(dir=e.incoming, suffix=Path(name).suffix)
     with os.fdopen(fd, "wb") as out:
         shutil.copyfileobj(file.file, out, length=1 << 20)
+    return Path(tmp)
+
+
+@app.post("/tables/{code}/stage", dependencies=[Depends(auth)])
+def stage(code: str, file: UploadFile = File(...), name: str = Form(...)):
+    """Build <code>__staged; the live table is untouched until /commit."""
+    e = get_engine()
+    tmp = _receive(e, file, name)
     try:
-        return e.load(code, Path(tmp), name)
+        return e.stage(code, tmp, name)
     finally:
-        Path(tmp).unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
+
+
+@app.post("/tables/{code}/commit", dependencies=[Depends(auth)])
+def commit(code: str):
+    return get_engine().commit(code)
+
+
+@app.delete("/tables/{code}/staged", dependencies=[Depends(auth)])
+def discard(code: str):
+    return {"discarded": get_engine().discard(code)}
 
 
 @app.delete("/tables/{code}", dependencies=[Depends(auth)])

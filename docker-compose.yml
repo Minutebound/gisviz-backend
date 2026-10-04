@@ -143,6 +143,31 @@ services:
     networks:
       - gisviz-network
 
+  # Shared reference data (regions, ...): MISC_DATABASE_URL
+  misc-db:
+    image: postgres:15-alpine
+    container_name: gisviz-misc-db
+    restart: always
+    ports:
+      - "127.0.0.1:5438:5432"
+    env_file:
+      - .env.database
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        export POSTGRES_USER="$$MISC_DB_USER" POSTGRES_PASSWORD="$$MISC_DB_PASSWORD" POSTGRES_DB="$$MISC_DB_NAME";
+        exec docker-entrypoint.sh postgres
+    volumes:
+      - misc-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$MISC_DB_USER -d $$MISC_DB_NAME"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gisviz-network
+
   # ────────────────────────────────────────────────────────
   # 5. Redis Cache
   # ────────────────────────────────────────────────────────
@@ -268,6 +293,8 @@ services:
         condition: service_healthy
       datasets-db:
         condition: service_healthy
+      misc-db:
+        condition: service_healthy
       duckdb:
         condition: service_healthy
       cache:
@@ -313,7 +340,7 @@ services:
   # 9. DuckDB analytical store (gisviz.duckdb: one table per dataset, ds_00001, ds_00002, ...)
   #    The ONLY process that opens gisviz.duckdb (one worker), so there are no file-lock conflicts.
   #    The API reaches it at http://duckdb:8100 with the shared DUCKDB_SERVICE_TOKEN (.env.backend).
-  #    Not published to the host. Inspect data from /admin/datasets (preview + SQL console).
+  #    Not published to the host. Inspect data from /admin/datasets (store status + row preview).
   #    Backup (consistent copy): docker compose stop duckdb && \
   #      docker run --rm -v gisviz-duckdb-data:/d -v "$PWD":/b alpine tar czf /b/gisviz-duckdb.tgz -C /d . && \
   #      docker compose start duckdb
@@ -369,3 +396,5 @@ volumes:
     name: gisviz-duckdb-data
   datasets-db-data:
     name: gisviz-datasets-db-data
+  misc-db-data:
+    name: gisviz-misc-db-data

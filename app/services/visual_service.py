@@ -108,18 +108,30 @@ def suggest(dataset_id: str, allow_inactive: bool = False) -> dict:
 
 def plan(dataset_id: str, viz: Optional[str] = None, x: Optional[str] = None,
          y: Optional[str] = None, label_field: Optional[str] = None,
-         z: Optional[str] = None, size: Optional[str] = None, allow_inactive: bool = False) -> dict:
-    """Validate a visual request against the dataset and fill missing params from the recommender."""
-    info = suggest(dataset_id, allow_inactive)
+         z: Optional[str] = None, size: Optional[str] = None, allow_inactive: bool = False,
+         info: Optional[dict] = None) -> dict:
+    """Validate a visual request against the dataset and fill missing params from the recommender.
+    `info` (card + columns + options, as from suggest()) checks against other data, e.g. a staged upload."""
+    info = info or suggest(dataset_id, allow_inactive)
     options = {o["viz"]: o for o in info["options"]}
+    explicit = bool(viz)
     viz = viz or info["recommended"]
     if viz not in VIZ_REGISTRY:
         raise VisualError(f"Unknown visual type '{viz}'", 400)
-    if viz not in options:
+    # The recommender's options only RANK and fill defaults. A visual asked for explicitly (a saved
+    # post, a publisher's pick) is valid whenever its columns exist and fit the chart type, checked
+    # below; otherwise replacing a file with, say, fewer categories would break posts whose columns
+    # are all still there, just because the recommender would no longer suggest that chart first.
+    if viz in options:
+        params = dict(options[viz]["params"])
+    elif explicit:
+        params = {}
+        if VIZ_REGISTRY[viz]["kind"] == "map" and not info["dataset"].get("geometry_type"):
+            raise VisualError("A map needs data with geometry", 400)
+    else:
         raise VisualError(f"'{viz}' is not available for this dataset", 400)
 
     cols = {c["column_name"]: c for c in info["columns"]}
-    params = dict(options[viz]["params"])
     x = x or params.get("x")
     y = y or params.get("y")
     z = z or params.get("z")
@@ -343,6 +355,28 @@ def payload_json(dataset_id: str, params: dict, allow_inactive: bool = False) ->
                       separators=(",", ":"))
     cache_service.set_raw(key, body, PAYLOAD_TTL)
     return body, False
+
+
+def info_for(card: dict, columns: list[dict]) -> dict:
+    """suggest()-shaped info for a card + column profile that is not live yet (a staged upload)."""
+    options = recommend(card, columns)
+    return {"dataset": card, "columns": columns, "options": options,
+            "recommended": options[0]["viz"] if options else None}
+
+
+def spec_problem(dataset_id: str, spec: Optional[dict], info: dict) -> Optional[str]:
+    """Why a saved visual_spec would not render against `info`'s data (None when it still works)."""
+    if not spec or not spec.get("data"):
+        return None
+    if not info["options"]:
+        return "the new data has no plottable columns"
+    p = params_from_spec(spec)
+    try:
+        plan(dataset_id, p.get("viz"), p.get("x"), p.get("y"), p.get("label_field"), p.get("z"), p.get("size"),
+             allow_inactive=True, info=info)
+    except VisualError as e:
+        return e.message
+    return None
 
 
 def params_from_spec(spec: dict) -> dict:
