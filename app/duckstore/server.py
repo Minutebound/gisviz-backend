@@ -130,6 +130,16 @@ def query(code: str, body: QueryBody):
     return get_engine().query(code, body.sql, body.params)
 
 
+class AppendBody(BaseModel):
+    rows: list
+    keep_last: Optional[int] = None
+
+
+@app.post("/tables/{code}/append", dependencies=[Depends(auth)])
+def append(code: str, body: AppendBody):
+    return get_engine().append(code, body.rows, body.keep_last)
+
+
 @app.get("/tables/{code}/preview", dependencies=[Depends(auth)])
 def preview(code: str, limit: int = 50):
     return get_engine().preview(code, limit)

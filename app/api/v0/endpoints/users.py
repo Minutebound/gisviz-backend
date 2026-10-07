@@ -134,6 +134,7 @@ def _full_user_dict(user: PlatformUserRecord) -> dict:
         "post_count": user.post_count,
         "role_name": user.role.name if user.role else "viewer",
         "joined_at": user.created_timestamp,
+        "account_type": getattr(user, "account_type", None) or "individual",
     }
 
 
@@ -198,7 +199,14 @@ async def get_user_profile(
             pass
 
     profile = _full_user_dict(user)
+    profile.pop("email_address", None)          # personal data: never on a public profile (own account: GET /me)
     profile["is_following"] = is_following
+    profile["organization"] = None
+    if profile["account_type"] == "organization":
+        from app.services import access_service
+        org = access_service.org_of_account(db, user.user_id)
+        if org is not None and org.status == "verified":
+            profile["organization"] = {"name": org.name, "email_domain": org.email_domain, "verified": True}
     return profile
 
 
@@ -337,19 +345,27 @@ def request_email_change(
     if not auth_service.verify_password(payload.current_password, current_user.hashed_security_password):
         raise HTTPException(status_code=400, detail="Incorrect password")
 
-    import random, string
-    otp = "".join(random.choices(string.digits, k=6))
+    new_email = str(payload.new_email).strip()
+    if db.query(PlatformUserRecord).filter(PlatformUserRecord.email_address == new_email,
+                                           PlatformUserRecord.user_id != current_user.user_id).first():
+        raise HTTPException(status_code=400, detail="That email is already used by another account")
+    otp = auth_service._generate_otp()                 # cryptographically random
     current_user.verification_otp     = otp
     current_user.otp_expires_at       = datetime.now(timezone.utc) + timedelta(minutes=15)
-    current_user.password_reset_token = f"email_change::{payload.new_email}"
+    current_user.password_reset_token = f"email_change::{new_email}"
     db.commit()
 
-    auth_service.simulate_send_email(
-        email=payload.new_email,
+    # The code goes to the NEW address only (proves ownership: organisation membership follows the email domain).
+    auth_service._email(
+        to_email=new_email,
         subject="Confirm your new email address",
-        content=f"Your verification code is: {otp}. It expires in 15 minutes.",
+        plain_body=f"Your verification code is: {otp}. It expires in 15 minutes.",
+        html_body=auth_service._build_html_email(
+            title="Confirm your new email address",
+            content_html=f"<p>Your verification code is:</p><div style='text-align:center;'><div class='otp-box'>{otp}</div></div>"
+                         "<p><em>This code will expire in 15 minutes.</em></p>"),
     )
-    return {"message": "Verification code sent", "dev_otp": otp}
+    return {"message": "Verification code sent", "dev_otp": auth_service._expose_dev_field(otp)}
 
 
 # ── POST /email/verify ───────────────────────────────────────────────
@@ -367,16 +383,25 @@ def verify_email_change(
     pending_email = pending_token.removeprefix("email_change::")
     if pending_email != payload.new_email:
         raise HTTPException(status_code=400, detail="Email mismatch. Please start the process again.")
-    if current_user.verification_otp != payload.otp:
+    from app.services.cache_service import cache_service
+    if cache_service.hit(f"gisviz:otp-tries:{current_user.user_id}", 900) > 8:
+        raise HTTPException(status_code=429, detail="Too many attempts. Request a new code in a few minutes.")
+    if not current_user.verification_otp or current_user.verification_otp != payload.otp:
         raise HTTPException(status_code=400, detail="Invalid verification code")
     if current_user.otp_expires_at and datetime.now(timezone.utc) > current_user.otp_expires_at:
         raise HTTPException(status_code=400, detail="Code has expired. Please request a new one.")
 
+    from app.services import access_service
+    if (current_user.account_type or "individual") == "organization":
+        org = access_service.org_of_account(db, current_user.user_id)
+        if org is not None and access_service.email_domain(pending_email) != org.email_domain:
+            raise HTTPException(status_code=409, detail=f"An organisation account must keep an @{org.email_domain} email")
     current_user.email_address        = pending_email
     current_user.verification_otp     = None
     current_user.otp_expires_at       = None
     current_user.password_reset_token = None
     db.commit()
+    access_service.sync_memberships(db, current_user)      # organisation memberships follow the new domain
     return {"message": "Email updated successfully", "new_email": pending_email}
 
 
@@ -393,6 +418,57 @@ def delete_own_account(
     current_user.is_active = 0
     db.commit()
     return {"message": "Account deactivated successfully"}
+
+
+# ── GDPR: data export + erasure ──────────────────────────────────────
+
+@router.get("/me/export")
+def export_my_data(
+    db: Session = Depends(get_users_db),
+    current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
+):
+    """Right of access / portability: everything GisViz holds about me, as a JSON file."""
+    from fastapi.responses import JSONResponse
+    from app.services import gdpr_service
+    data = gdpr_service.export(db, current_user)
+    return JSONResponse(data, headers={
+        "Content-Disposition": f'attachment; filename="gisviz-{current_user.user_handle}-data.json"',
+        "Cache-Control": "no-store"})
+
+
+class EraseAccountPayload(BaseModel):
+    current_password: str
+    confirm: str            # must be "DELETE"
+
+
+@router.post("/me/erase")
+def erase_my_account(
+    payload: EraseAccountPayload,
+    request: Request,
+    db: Session = Depends(get_users_db),
+    admin_db: Session = Depends(get_admin_db),
+    current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
+):
+    """Right to erasure: permanently delete my account and my personal data (posts, comments, likes, ...)."""
+    from app.services import gdpr_service
+    if payload.confirm != "DELETE":
+        raise HTTPException(status_code=400, detail='Type DELETE to confirm')
+    if not auth_service.verify_password(payload.current_password, current_user.hashed_security_password):
+        raise HTTPException(status_code=400, detail="Incorrect password — nothing was deleted")
+    if current_user.role and current_user.role.name == "admin":
+        others = db.query(PlatformUserRecord).join(RoleRecord).filter(RoleRecord.name == "admin",
+                                                                      PlatformUserRecord.user_id != current_user.user_id).count()
+        if not others:
+            raise HTTPException(status_code=409, detail="You are the only admin: make someone else admin first")
+    uid, handle = current_user.user_id, current_user.user_handle
+    result = gdpr_service.erase(db, current_user)
+    try:                                      # keeps the fact of the erasure, no personal data
+        log_admin_action(admin_db, admin_user_id=uid, admin_handle=None, action_type="user.self_erase",
+                         target_type="user", target_id=str(uid), payload={k: v for k, v in result.items() if k != "erased"},
+                         ip_address=None)
+    except Exception as e:
+        print(f"[gdpr] audit log failed: {e}")
+    return {"message": f"Account @{handle} and its personal data were deleted", **result}
 
 
 # ── PUT /{user_id}/role  — ADMIN ONLY  (+ audit log) ────────────────

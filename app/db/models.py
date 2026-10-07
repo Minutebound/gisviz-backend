@@ -4,11 +4,11 @@ app/db/models.py
 Single source of truth for every SQLAlchemy model.
 
 Databases:
-  UsersBase    → users_db      (users, roles, follows)
-  PostsBase    → posts_db      (posts, categories, keywords, likes, comments, reports)
-  AnalyticsBase→ analytics_db  (star schema warehouse, snapshot ETL)
+  UsersBase    → users_db      (users, roles, follows, organisations + members, consent records)
+  PostsBase    → posts_db      (posts, categories, keywords, likes, comments, views, reports, post shares)
+  AnalyticsBase→ analytics_db  (daily aggregates for the admin growth charts + their run log)
   AdminBase    → admin_db      (audit trail, role history, report resolutions)
-  DatasetsBase → datasets_db   (dataset catalog; data itself in gisviz.duckdb)
+  DatasetsBase → datasets_db   (dataset catalog + dataset shares; data itself in gisviz.duckdb)
   MiscBase     → misc_db       (shared reference data: regions, ...)
 
 """
@@ -20,7 +20,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Column, String, DateTime, Integer, BigInteger, Text,
-    Date, ForeignKey, Index, Numeric, UniqueConstraint,
+    Date, ForeignKey, Index, Numeric, UniqueConstraint, text,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
@@ -65,10 +65,47 @@ class PlatformUserRecord(UsersBase):
     is_active       = Column(Integer, default=1, nullable=False)
     # bumped on password change/reset or "log out everywhere": every older token stops working
     token_version   = Column(Integer, default=0, server_default="0", nullable=False)
+    # individual | organization (an organisation's own account; its members are users with its verified email domain)
+    account_type    = Column(String(16), default="individual", server_default="individual", nullable=False)
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     role     = relationship("RoleRecord", back_populates="users")
     location = relationship("UserLocationRecord", back_populates="user", uselist=False, cascade="all, delete-orphan")
+
+
+class OrganizationRecord(UsersBase):
+    """An organisation on GisViz. Its profile is an account (account_user_id, account_type=organization) whose
+    email domain was checked by an admin. Every user whose verified email is on that domain is a member
+    (organization_members, source=domain) and sees what is shared with the organisation."""
+    __tablename__ = "organizations"
+    org_id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    account_user_id = Column(UUID(as_uuid=True), ForeignKey("platform_users.user_id", ondelete="CASCADE"),
+                             unique=True, nullable=False)
+    name            = Column(String(160), nullable=False)
+    email_domain    = Column(String(190), unique=True, nullable=False, index=True)    # lowercase, e.g. acme.org
+    status          = Column(String(12), default="pending", server_default="pending", nullable=False, index=True)  # pending | verified | rejected
+    reviewed_by_user_id = Column(UUID(as_uuid=True), nullable=True)
+    reviewed_timestamp  = Column(DateTime(timezone=True), nullable=True)
+    created_timestamp   = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class OrganizationMemberRecord(UsersBase):
+    __tablename__ = "organization_members"
+    org_id    = Column(UUID(as_uuid=True), ForeignKey("organizations.org_id", ondelete="CASCADE"), primary_key=True)
+    user_id   = Column(UUID(as_uuid=True), ForeignKey("platform_users.user_id", ondelete="CASCADE"), primary_key=True, index=True)
+    role      = Column(String(12), default="member", nullable=False)       # owner (the org account) | member
+    source    = Column(String(12), default="domain", nullable=False)       # account | domain
+    joined_timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ConsentRecord(UsersBase):
+    """GDPR: proof of what a user accepted (terms of service, privacy policy) and when."""
+    __tablename__ = "consent_records"
+    consent_id  = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id     = Column(UUID(as_uuid=True), ForeignKey("platform_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    document    = Column(String(20), nullable=False)          # terms | privacy
+    version     = Column(String(20), nullable=False)
+    accepted_timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class RevokedTokenRecord(UsersBase):
@@ -145,8 +182,40 @@ class DatasetRecord(DatasetsBase):
     file_size_bytes = Column(BigInteger, nullable=True)            # size of the last uploaded data file
     show_data     = Column(Integer, default=0, server_default="0", nullable=False)  # 1 = rows shown on post pages (public)
     status        = Column(String(12), default="inactive", nullable=False, index=True)  # inactive | active
+    # who may see it: public | private (owner, admins, people / organisations it is shared with)
+    visibility    = Column(String(10), default="public", server_default="public", nullable=False, index=True)
+    owner_user_id = Column(UUID(as_uuid=True), nullable=True, index=True)        # a user or an organisation account
+    # batch: refreshed now and then by uploading a file;  stream: rows pushed continuously (live posts)
+    pipeline      = Column(String(10), default="batch", server_default="batch", nullable=False, index=True)
+    refresh_seconds = Column(Integer, default=60, server_default="60", nullable=False)   # live posts re-read every n s
+    retention_rows  = Column(Integer, nullable=True)                              # stream: keep the newest n rows
+    ingest_key_hash = Column(String(64), nullable=True)                           # sha256 of the stream ingest key
+    last_ingested_at = Column(DateTime(timezone=True), nullable=True)
+    # copyright / licensing (app/services/licences.py)
+    license_code  = Column(String(40), nullable=True)
+    attribution   = Column(Text, nullable=True)                                   # e.g. "© OpenStreetMap contributors"
+    copyright_holder = Column(String(255), nullable=True)
+    contains_personal_data = Column(Integer, default=0, server_default="0", nullable=False)   # GDPR: rows never public
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class DatasetShareRecord(DatasetsBase):
+    """Who a private dataset is shared with, and who shared it (kept after revoking: the access history)."""
+    __tablename__ = "dataset_shares"
+    share_id      = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    dataset_id    = Column(String(64), ForeignKey("datasets.dataset_id", ondelete="CASCADE"), nullable=False, index=True)
+    grantee_type  = Column(String(8), nullable=False)                       # user | org
+    grantee_id    = Column(UUID(as_uuid=True), nullable=False, index=True)
+    permission    = Column(String(10), default="view", server_default="view", nullable=False)
+    granted_by_user_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    created_timestamp  = Column(DateTime(timezone=True), server_default=func.now())
+    revoked_timestamp  = Column(DateTime(timezone=True), nullable=True)
+    revoked_by_user_id = Column(UUID(as_uuid=True), nullable=True)
+    __table_args__ = (
+        Index("uq_dataset_shares_active", "dataset_id", "grantee_type", "grantee_id", unique=True,
+              postgresql_where=text("revoked_timestamp IS NULL")),
+    )
 
 
 class PostRecord(PostsBase):
@@ -166,9 +235,13 @@ class PostRecord(PostsBase):
     total_likes_count    = Column(Integer, default=0, nullable=False)
     total_comments_count = Column(Integer, default=0, nullable=False)
     backdrop        = Column(JSONB, nullable=True)   # poster design: {mode, bg, texture, font, title_size, title_align, map_base, layout, dark}
-    views_count     = Column(Integer, default=0, server_default="0", nullable=False, index=True)  # unique daily viewers (fact_post_view)
+    views_count     = Column(Integer, default=0, server_default="0", nullable=False, index=True)  # total page views (rows in post_views)
     region          = Column(String(60), nullable=True, index=True)   # regions.code (misc DB); required for new posts
+    visibility      = Column(String(10), default="public", server_default="public", nullable=False, index=True)  # public | private
+    post_type       = Column(String(10), default="standard", server_default="standard", nullable=False)       # standard | live
     is_active       = Column(Integer, default=1, nullable=False, index=True) 
+    # 1 when the post was switched off because its dataset became inactive (it comes back with the dataset)
+    deactivated_by_dataset = Column(Integer, default=0, server_default="0", nullable=False)
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     updated_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     likes          = relationship("PostLikeRecord",     back_populates="post", cascade="all, delete-orphan")
@@ -177,6 +250,26 @@ class PostRecord(PostsBase):
     category_links = relationship("PostCategoryLink",   back_populates="post", cascade="all, delete-orphan")
     keyword_links  = relationship("PostKeywordLink",    back_populates="post", cascade="all, delete-orphan")
     reports        = relationship("PostReportRecord",   back_populates="post", cascade="all, delete-orphan")
+    shares         = relationship("PostShareRecord",    back_populates="post", cascade="all, delete-orphan")
+
+
+class PostShareRecord(PostsBase):
+    """Who a private post is shared with, and who shared it (kept after revoking: the access history)."""
+    __tablename__ = "post_shares"
+    share_id      = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    post_id       = Column(UUID(as_uuid=True), ForeignKey("posts.post_id", ondelete="CASCADE"), nullable=False, index=True)
+    grantee_type  = Column(String(8), nullable=False)                       # user | org
+    grantee_id    = Column(UUID(as_uuid=True), nullable=False, index=True)  # user_id or org_id (users DB)
+    permission    = Column(String(10), default="view", server_default="view", nullable=False)
+    granted_by_user_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    created_timestamp  = Column(DateTime(timezone=True), server_default=func.now())
+    revoked_timestamp  = Column(DateTime(timezone=True), nullable=True)
+    revoked_by_user_id = Column(UUID(as_uuid=True), nullable=True)
+    post = relationship("PostRecord", back_populates="shares")
+    __table_args__ = (
+        Index("uq_post_shares_active", "post_id", "grantee_type", "grantee_id", unique=True,
+              postgresql_where=text("revoked_timestamp IS NULL")),
+    )
 
 class PostLikeRecord(PostsBase):
     __tablename__ = "post_likes"
@@ -196,6 +289,23 @@ class PostBookmarkRecord(PostsBase):
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     post = relationship("PostRecord", back_populates="bookmarks")
     __table_args__ = (UniqueConstraint("post_id", "user_id", name="uq_post_bookmarks_post_user"),)
+
+
+class PostViewRecord(PostsBase):
+    """One row per post page opened (POST /posts/{id}/view). posts.views_count is the running total.
+    viewer_hash: SHA-256 of the user id (signed in) or IP + user agent (anonymous) with the server
+    secret, never the raw IP; it lets the stats count distinct viewers. user_id is null for anonymous
+    visitors and is cleared when an account is erased."""
+    __tablename__    = "post_views"
+    view_id          = Column(BigInteger, primary_key=True, autoincrement=True)
+    post_id          = Column(UUID(as_uuid=True), ForeignKey("posts.post_id", ondelete="CASCADE"), nullable=False)
+    user_id          = Column(UUID(as_uuid=True), nullable=True, index=True)
+    viewer_hash      = Column(String(64), nullable=False)
+    viewed_timestamp = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        Index("ix_post_views_post_time", "post_id", "viewed_timestamp"),
+        Index("brin_post_views_time", "viewed_timestamp", postgresql_using="brin"),
+    )
 
 
 class PostCommentRecord(PostsBase):
@@ -219,6 +329,9 @@ class CategoryRecord(PostsBase):
     description   = Column(Text, nullable=True)
     theme_color   = Column(String(7), nullable=True)          # #rrggbb, used as the post/visual accent
     sort_order    = Column(Integer, nullable=False, default=0, server_default="0")
+    # the feed banner's animated scene, picked from the category's words by the poster topic engine
+    # (app/services/banner_service.py): {"version", "topic", "scene", "color", "source", "generated_at"}
+    banner        = Column(JSONB, nullable=True)
     usage_count   = Column(Integer, default=0, nullable=False)
     created_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     post_links = relationship("PostCategoryLink", back_populates="category")
@@ -271,185 +384,65 @@ class PostReportRecord(PostsBase):
 
 
 # ════════════════════════════════════════════════════════════════════
-#  ANALYTICS DATABASE  (star schema warehouse)
+#  ANALYTICS DATABASE  (daily history for the admin growth charts)
+#  Written by app/analytics/snapshot.py: automatically every hour (today's row is
+#  refreshed in place) and by the admin "Refresh" button. Only aggregates live here;
+#  the raw events (views, likes, ...) stay in their own databases.
 # ════════════════════════════════════════════════════════════════════
 
-class DimDate(AnalyticsBase):
-    """One row per calendar day."""
-    __tablename__ = "dim_date"
-    date_key     = Column(Date, primary_key=True)
-    year         = Column(Integer, nullable=False)
-    quarter      = Column(Integer, nullable=False)
-    month        = Column(Integer, nullable=False)
-    day          = Column(Integer, nullable=False)
-    day_of_week  = Column(Integer, nullable=False)   # 0=Mon .. 6=Sun
-    week_of_year = Column(Integer, nullable=False)
-    is_weekend   = Column(Integer, nullable=False, default=0)
+class DailyPlatformStats(AnalyticsBase):
+    """One row per day: platform totals at the end of the day (today: at the last run) and what
+    happened that day. Totals for days before the first run are rebuilt from creation dates."""
+    __tablename__   = "daily_platform_stats"
+    stat_date       = Column(Date, primary_key=True)
+    users           = Column(BigInteger, nullable=False, default=0)
+    posts           = Column(BigInteger, nullable=False, default=0)
+    likes           = Column(BigInteger, nullable=False, default=0)
+    bookmarks       = Column(BigInteger, nullable=False, default=0)
+    comments        = Column(BigInteger, nullable=False, default=0)
+    follows         = Column(BigInteger, nullable=False, default=0)
+    open_reports    = Column(BigInteger, nullable=False, default=0)
+    new_users       = Column(Integer, nullable=False, default=0)
+    new_posts       = Column(Integer, nullable=False, default=0)
+    views           = Column(Integer, nullable=False, default=0)    # post views that day
+    viewers         = Column(Integer, nullable=False, default=0)    # distinct viewers that day
+    captured_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-class FactPostView(AnalyticsBase):
-    """One row per post, per viewer, per day: a post page counts once for each visitor each day.
-    viewer_key is a SHA-256 of the user id (signed in) or of IP + user agent (anonymous), so no raw
-    IP is stored. posts.views_count (posts DB) is the running total of these rows."""
-    __tablename__ = "fact_post_view"
-    post_id    = Column(UUID(as_uuid=True), primary_key=True)
-    viewer_key = Column(String(64), primary_key=True)
-    view_date  = Column(Date, primary_key=True)
-    user_id    = Column(UUID(as_uuid=True), nullable=True, index=True)     # null for anonymous viewers
-    first_seen_timestamp = Column(DateTime(timezone=True), server_default=func.now())
+class DailyCategoryStats(AnalyticsBase):
+    """One row per category per day. The label is copied in, so a renamed or deleted category
+    still reads correctly in old rows."""
+    __tablename__   = "daily_category_stats"
+    stat_date       = Column(Date, primary_key=True)
+    category_id     = Column(Integer, primary_key=True)
+    label           = Column(String(80), nullable=False)
+    posts           = Column(BigInteger, nullable=False, default=0)   # posts in the category (total)
+    new_posts       = Column(Integer, nullable=False, default=0)
+    views           = Column(Integer, nullable=False, default=0)      # views that day on its posts
+    captured_timestamp = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-class DimUser(AnalyticsBase):
-    """Denormalised user label cache."""
-    __tablename__          = "dim_user"
-    user_id                = Column(UUID(as_uuid=True), primary_key=True)
-    user_handle            = Column(String(50), nullable=False)
-    role_name              = Column(String(50), nullable=True)
-    first_seen_date        = Column(Date, nullable=True)
-    last_synced_timestamp  = Column(DateTime(timezone=True), server_default=func.now())
-
-
-class DimPost(AnalyticsBase):
-    """Denormalised post label cache."""
-    __tablename__          = "dim_post"
-    post_id                = Column(UUID(as_uuid=True), primary_key=True)
-    title                  = Column(String(255), nullable=True)
-    publisher_user_id      = Column(UUID(as_uuid=True), nullable=True, index=True)
-    publisher_handle       = Column(String(50), nullable=True)
-    created_date           = Column(Date, nullable=True)
-    last_synced_timestamp  = Column(DateTime(timezone=True), server_default=func.now())
-
-
-class DimCategory(AnalyticsBase):
-    __tablename__          = "dim_category"
-    category_id            = Column(Integer, primary_key=True)
-    slug                   = Column(String(60), nullable=False)
-    label                  = Column(String(80), nullable=False)
-    last_synced_timestamp  = Column(DateTime(timezone=True), server_default=func.now())
-
-
-class FactDailySnapshot(AnalyticsBase):
-    """Platform-wide daily totals. Grain: one row per day. UPSERT-safe."""
-    __tablename__      = "fact_daily_snapshot"
-    snapshot_date      = Column(Date, ForeignKey("dim_date.date_key"), primary_key=True)
-    total_users        = Column(BigInteger, nullable=False, default=0)
-    total_posts        = Column(BigInteger, nullable=False, default=0)
-    total_likes        = Column(BigInteger, nullable=False, default=0)
-    total_bookmarks    = Column(BigInteger, nullable=False, default=0)
-    total_comments     = Column(BigInteger, nullable=False, default=0)
-    total_follows      = Column(BigInteger, nullable=False, default=0)
-    total_categories   = Column(BigInteger, nullable=False, default=0)
-    total_keywords     = Column(BigInteger, nullable=False, default=0)
-    open_reports       = Column(BigInteger, nullable=False, default=0)
-    new_users          = Column(Integer,    nullable=False, default=0)
-    new_posts          = Column(Integer,    nullable=False, default=0)
-    captured_timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (
-        Index("brin_fact_daily_snapshot_date", "snapshot_date", postgresql_using="brin"),
-    )
-
-
-class FactPostEngagement(AnalyticsBase):
-    """Per-post engagement. Grain: (post_id, snapshot_date)."""
-    __tablename__      = "fact_post_engagement"
-    snapshot_date      = Column(Date, ForeignKey("dim_date.date_key"), primary_key=True)
-    post_id            = Column(UUID(as_uuid=True), primary_key=True)
-    likes              = Column(BigInteger, nullable=False, default=0)
-    bookmarks          = Column(BigInteger, nullable=False, default=0)
-    comments           = Column(BigInteger, nullable=False, default=0)
-    captured_timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (
-        Index("ix_fact_post_engagement_post",  "post_id"),
-        Index("brin_fact_post_engagement_date", "snapshot_date", postgresql_using="brin"),
-    )
-
-
-class FactCategoryDaily(AnalyticsBase):
-    """Per-category usage. Grain: (category_id, snapshot_date)."""
-    __tablename__      = "fact_category_daily"
-    snapshot_date      = Column(Date, ForeignKey("dim_date.date_key"), primary_key=True)
-    category_id        = Column(Integer, primary_key=True)
-    usage_count        = Column(BigInteger, nullable=False, default=0)
-    post_count         = Column(BigInteger, nullable=False, default=0)
-    captured_timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (
-        Index("brin_fact_category_daily_date", "snapshot_date", postgresql_using="brin"),
-    )
-
-
-class FactWeeklyDelta(AnalyticsBase):
-    """This-week vs last-week new user/post counts. Grain: one row per snapshot_date."""
-    __tablename__        = "fact_weekly_delta"
-    snapshot_date        = Column(Date, primary_key=True)
-    this_week_new_users  = Column(Integer, nullable=False, default=0)
-    this_week_new_posts  = Column(Integer, nullable=False, default=0)
-    last_week_new_users  = Column(Integer, nullable=False, default=0)
-    last_week_new_posts  = Column(Integer, nullable=False, default=0)
-    captured_timestamp   = Column(DateTime(timezone=True), server_default=func.now())
-
-
-class FactTopPost(AnalyticsBase):
-    """Ranked top posts per snapshot. Grain: (snapshot_date, rank_by, rank)."""
-    __tablename__         = "fact_top_post"
-    snapshot_date         = Column(Date, primary_key=True)
-    rank_by               = Column(String(12), primary_key=True)   # likes|bookmarks|comments
-    rank                  = Column(Integer, primary_key=True)
-    post_id               = Column(UUID(as_uuid=True), nullable=False)
-    title                 = Column(String(255), nullable=True)
-    publisher_handle      = Column(String(50), nullable=True)
-    total_likes_count     = Column(BigInteger, nullable=False, default=0)
-    total_comments_count  = Column(BigInteger, nullable=False, default=0)
-    metric_value          = Column(BigInteger, nullable=False, default=0)
-    captured_timestamp    = Column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (
-        Index("ix_fact_top_post_lookup", "snapshot_date", "rank_by", "rank"),
-    )
-
-
-class FactTopUser(AnalyticsBase):
-    """Ranked top users per snapshot. Grain: (snapshot_date, rank_by, rank)."""
-    __tablename__      = "fact_top_user"
-    snapshot_date      = Column(Date, primary_key=True)
-    rank_by            = Column(String(12), primary_key=True)   # followers|posts
-    rank               = Column(Integer, primary_key=True)
-    user_id            = Column(UUID(as_uuid=True), nullable=False)
-    user_handle        = Column(String(50), nullable=True)
-    role_name          = Column(String(50), nullable=True)
-    follower_count     = Column(BigInteger, nullable=False, default=0)
-    post_count         = Column(BigInteger, nullable=False, default=0)
-    metric_value       = Column(BigInteger, nullable=False, default=0)
-    captured_timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (
-        Index("ix_fact_top_user_lookup", "snapshot_date", "rank_by", "rank"),
-    )
-
-
-class FactTopCommenter(AnalyticsBase):
-    """Ranked top commenters per snapshot. Grain: (snapshot_date, rank)."""
-    __tablename__      = "fact_top_commenter"
-    snapshot_date      = Column(Date, primary_key=True)
-    rank               = Column(Integer, primary_key=True)
-    user_id            = Column(UUID(as_uuid=True), nullable=False)
-    user_handle        = Column(String(50), nullable=True)
-    comment_count      = Column(BigInteger, nullable=False, default=0)
-    captured_timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (
-        Index("ix_fact_top_commenter_lookup", "snapshot_date", "rank"),
-    )
-
-
-class EtlRunLog(AnalyticsBase):
-    """One row per ETL run. Written by snapshot.py, read by /admin/analytics/etl-status."""
-    __tablename__       = "etl_run_log"
+class SnapshotRun(AnalyticsBase):
+    """One row per run of the snapshot job (kept 60 days): proves it runs, and shows errors."""
+    __tablename__       = "snapshot_runs"
     run_id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    job_name            = Column(String(80), nullable=False, index=True)
-    snapshot_date       = Column(Date, nullable=True, index=True)
-    status              = Column(String(20), nullable=False, default="running")
+    trigger             = Column(String(12), nullable=False, default="schedule")   # schedule|manual|backfill
+    stat_date           = Column(Date, nullable=True, index=True)
+    status              = Column(String(12), nullable=False, default="running")    # running|success|failed
     rows_written        = Column(Integer, nullable=False, default=0)
     error_message       = Column(Text, nullable=True)
-    started_timestamp   = Column(DateTime(timezone=True), server_default=func.now())
+    started_timestamp   = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     finished_timestamp  = Column(DateTime(timezone=True), nullable=True)
     duration_seconds    = Column(Numeric(10, 3), nullable=True)
+
+
+# Tables of the old star-schema warehouse, dropped at start-up (app/main.py). fact_post_view's rows are
+# first copied into post_views (posts DB); the rest were snapshots nothing reads.
+OBSOLETE_ANALYTICS_TABLES = (
+    "fact_post_view", "fact_daily_snapshot", "fact_post_engagement", "fact_category_daily",
+    "fact_weekly_delta", "fact_top_post", "fact_top_user", "fact_top_commenter",
+    "dim_user", "dim_post", "dim_category", "dim_date", "etl_run_log",
+)
 
 
 # ════════════════════════════════════════════════════════════════════

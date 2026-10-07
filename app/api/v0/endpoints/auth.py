@@ -123,6 +123,11 @@ def login(
             },
         )
 
+    try:                                          # organisation memberships follow the verified email domain
+        from app.services import access_service
+        access_service.sync_memberships(db, user)
+    except Exception as e:
+        print(f"[auth] organisation membership sync skipped: {e}")
     access_token = auth_service.create_access_token(subject=str(user.user_id), token_version=user.token_version)
     return {
         "access_token": access_token,

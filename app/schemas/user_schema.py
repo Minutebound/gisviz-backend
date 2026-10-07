@@ -19,10 +19,18 @@ class UserRegistrationPayload(BaseModel):
     user_handle: str
     email_address: EmailStr
     plaintext_password: str
+    # GDPR: the Terms of Service and the Privacy Policy must be accepted to open an account (stored with the version)
+    accept_terms: bool = False
 
     @validator('plaintext_password')
     def validate_password(cls, v):
         return validate_password_complexity(v)
+
+    @validator('accept_terms')
+    def must_accept_terms(cls, v):
+        if not v:
+            raise ValueError("Please accept the Terms of Service and the Privacy Policy")
+        return v
 
 class UserAuthenticationResponse(BaseModel):
     access_token: str

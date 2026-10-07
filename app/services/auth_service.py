@@ -77,7 +77,7 @@ class AuthenticationService:
     # Token / OTP generators
     # ----------------------------------------------------------------
     def _generate_otp(self) -> str:
-        return "".join(random.choices(string.digits, k=6))
+        return "".join(secrets.choice(string.digits) for _ in range(6))      # cryptographically random
 
     def _generate_secure_token(self) -> str:
         return secrets.token_urlsafe(32)
@@ -181,6 +181,7 @@ class AuthenticationService:
         db.add(new_user)
         db.commit()
         db.refresh(new_user)
+        record_consent(db, new_user.user_id)
 
         html_content = self._build_html_email(
             title="Account Verification",
@@ -242,6 +243,9 @@ class AuthenticationService:
             raise HTTPException(status_code=404, detail="User not found")
         if user.is_verified == 1 and user.is_active == 1:
             return {"status": "Already verified"}
+        from app.services.cache_service import cache_service
+        if cache_service.hit(f"gisviz:otp-tries:{user.user_id}", 900) > 8:      # 6 digits: no brute force
+            raise HTTPException(status_code=429, detail="Too many attempts. Request a new code in a few minutes.")
         if user.verification_otp != otp:
             raise HTTPException(status_code=400, detail="Invalid OTP")
         if user.otp_expires_at and datetime.now(timezone.utc) > user.otp_expires_at:
@@ -252,6 +256,11 @@ class AuthenticationService:
         user.verification_otp = None
         user.otp_expires_at = None
         db.commit()
+        try:                                       # a verified email on a verified organisation's domain joins it
+            from app.services import access_service
+            access_service.sync_memberships(db, user)
+        except Exception as e:
+            print(f"[auth] organisation membership sync skipped: {e}")
 
         return {"status": "Email verified successfully", "reactivated": True}
 
@@ -302,6 +311,15 @@ class AuthenticationService:
         user.token_version = (user.token_version or 0) + 1      # log out every device
         db.commit()
         return {"status": "Password has been successfully reset"}
+
+
+def record_consent(db: Session, user_id, documents=("terms", "privacy")) -> None:
+    """GDPR: keep proof of which version of the terms / privacy policy a user accepted, and when."""
+    from app.api.v0.endpoints.legal import LEGAL_VERSION
+    from app.db.models import ConsentRecord
+    for doc in documents:
+        db.add(ConsentRecord(user_id=user_id, document=doc, version=LEGAL_VERSION))
+    db.commit()
 
 
 # ----------------------------------------------------------------
@@ -414,5 +432,5 @@ require_publisher = RoleChecker(PUBLISHING_ROLES)
 
 # Roles allowed to manage datasets (create, upload, activate, edit, delete) on /admin/datasets.
 # Add "publisher" here (and in the frontend lib/roles.ts) to let publishers manage datasets too.
-DATASET_MANAGER_ROLES = ["admin","publisher"]
+DATASET_MANAGER_ROLES = ["admin"]
 require_dataset_manager = RoleChecker(DATASET_MANAGER_ROLES)

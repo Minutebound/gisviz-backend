@@ -17,6 +17,7 @@ def get_sitemap_data(
         .filter(
             PostRecord.share_slug.isnot(None),
             PostRecord.is_active == 1,          # only index active posts
+            PostRecord.visibility == "public",  # never list private posts
         )
         .all()
     )

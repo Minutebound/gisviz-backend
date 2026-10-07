@@ -20,7 +20,9 @@ from app.services.cache_service import cache_service
 
 router = APIRouter()
 
-VALID_SLUGS = {"about", "privacy", "terms", "cookies", "accessibility"}
+VALID_SLUGS = {"about", "privacy", "terms", "cookies", "accessibility", "data-policy"}
+# Version of the terms / privacy policy users accept at sign-up (consent_records). Bump it when they change.
+LEGAL_VERSION = "2026-10-04"
 _TTL = 86400 * 30  # 30 days
 
 
@@ -63,278 +65,231 @@ We read everything. Response times vary but we aim to reply within 2 business da
     # ── PRIVACY ──────────────────────────────────────────────────────────────
     "privacy": {
         "title": "Privacy Policy",
-        "last_updated": "July 2026",
+        "last_updated": "October 2026",
         "content": """\
-Effective date: July 1, 2026
+Effective date: October 4, 2026 (version 2026-10-04)
 
-GisViz ("we," "us," or "our") operates gisviz.com. This Privacy Policy explains what personal information we collect, how we use it, and your rights regarding that information. By using GisViz, you agree to the practices described below.
-
-
-1. Information We Collect
-
-Account Information
-When you register, we collect your email address, a username (handle), and a password (stored as a one-way bcrypt hash). We use this to authenticate you and send transactional emails such as verification codes and password reset links. We do not use your email address for marketing without your explicit consent.
-
-Profile Information
-You may optionally add a display title, LinkedIn URL, Medium URL, personal website URL, and a general location (city, state, country). This information is public and displayed on your profile page. You control what you share.
-
-Published Content
-Posts you create — titles, descriptions, source credits, category tags, keywords, and uploaded images — are public. Images are stored on our servers. Metadata is stored in our database.
-
-Interaction Data
-Likes, bookmarks, comments, and follow relationships are stored to power the platform's social features. These are linked to your user account.
-
-Server Logs
-Our servers record standard HTTP request logs (IP address, URL path, timestamp, response code) for security and debugging purposes. These logs are retained for 30 days and are not used for profiling or advertising.
+GisViz ("we", "us", "our") operates gisviz.com. This policy explains what personal data we process, why, on which legal basis, how long we keep it, who receives it, and the rights you have under the EU/UK General Data Protection Regulation (GDPR), the California Consumer Privacy Act (CCPA) and similar laws. When you open an account you confirm that you have read this policy; we keep a record of the version you accepted and when.
 
 
-2. What We Do Not Collect
+1. Who is responsible
 
-We do not collect payment information — GisViz is currently free to use.
-We do not sell, rent, or share your personal data with third parties for commercial or advertising purposes.
-We do not run behavioral advertising or retargeting campaigns.
-We do not use fingerprinting or cross-site tracking technologies.
-We do not use third-party analytics services that receive your personal data.
+GisViz is the controller of the personal data described here. Contact for every privacy question and request: info@gisviz.com.
 
 
-3. How We Use Your Information
+2. What we process, why, and on which legal basis
 
-To operate your account and authenticate your sessions.
-To send transactional emails you have requested (account verification, password reset).
-To display your public profile and published content to other users.
-To detect and prevent abuse, spam, and unauthorized access.
-To improve the platform based on aggregated, non-identifiable usage patterns.
+Account (contract, Art. 6(1)(b) GDPR)
+Email address, handle, password (stored only as a bcrypt hash), account type (individual or organisation), role, verification status, and the record of the terms and privacy policy versions you accepted (consent record). Used to run your account, sign you in and send the emails you need (verification codes, password resets, notifications that something was shared with you).
 
+Profile (contract)
+Optional: title, links (LinkedIn, Medium, website), location, avatar and cover photo. Your profile is public, but your email address is never shown on it.
 
-4. How Your Data Is Stored and Protected
+Organisations (contract / legitimate interest, Art. 6(1)(f))
+An organisation account is registered with an email address on the organisation's own domain and checked by our team. Once verified, every GisViz user whose verified email address is on that domain becomes a member automatically, so that content shared with the organisation reaches its people. Membership is derived from your email domain and is not shown publicly. If you change your email address, your memberships follow the new domain.
 
-All data is stored on servers we control. Passwords are hashed using bcrypt and are never stored or transmitted in plain text. Connections to our platform are encrypted via TLS. We take reasonable technical and organizational measures to protect your data against unauthorized access, loss, or disclosure.
+Posts, comments and interactions (contract)
+Posts (title, description, notes, sources, categories, keywords, region, the visual's settings and poster design), comments, likes, bookmarks and follows. Public posts are visible to everyone; private posts only to you, the people and organisations you share them with, and our moderators.
 
-We retain your account data for as long as your account is active. If you delete your account, we remove your profile, posts, comments, likes, and bookmarks. Your username may remain visible in other users' comment threads as "deleted user."
+Sharing records (contract / legitimate interest)
+When a post or dataset is shared, we record who shared it, with whom and when, and who revoked access and when. This history lets owners see who has access and lets us investigate abuse.
 
+Usage and security data (legitimate interest)
+A daily view counter per post, keyed by a one-way hash (SHA-256) of your account id, or of your IP address and browser user agent when you are not signed in — the IP address itself is not stored for this. Our servers keep standard request logs (IP address, path, time, status) for up to 30 days for security and debugging. Rate-limit counters (for example for verification codes) are kept for minutes.
 
-5. Your Rights
-
-Depending on where you are located, you may have rights regarding your personal data, including the right to access, correct, or delete it. Regardless of your location, you can:
-
-Access your data — review your profile and posts at any time while logged in.
-Correct your data — update your profile via Settings.
-Delete your account — go to Settings → Account → Delete Account. This permanently removes your account and associated content.
-Request a data export — email us at info@gisviz.com.
-
-To exercise any of these rights, contact us at info@gisviz.com. We will respond within 30 days.
+Support requests (contract / legitimate interest)
+What you write to support and the contact email you give.
 
 
-6. California Residents (CCPA)
+3. What we do not do
 
-If you are a California resident, you have the right to know what personal information we collect, the right to delete your personal information, and the right to opt out of the sale of personal information. We do not sell personal information. To make a request under the CCPA, contact us at info@gisviz.com.
-
-
-7. Children's Privacy
-
-GisViz is not directed at children under the age of 13. We do not knowingly collect personal information from children under 13. If you believe a child under 13 has created an account, please contact us at info@gisviz.com and we will promptly delete the account.
+We do not sell or rent personal data. We do not run behavioural advertising, retargeting, cross-site tracking or fingerprinting, and no third-party analytics service receives your personal data.
 
 
-8. Third-Party Services
+4. Datasets and personal data inside them
 
-We use a limited number of third-party services to operate the platform. These services may process data on our behalf:
-
-Cloudflare — provides DNS, content delivery, and DDoS protection. Cloudflare may process IP addresses as part of routing and security operations. Privacy policy: cloudflare.com/privacypolicy.
-IONOS — provides transactional email delivery for verification and password reset emails only.
-
-We do not use any other third-party services that receive your personal data.
+Datasets are loaded by our team or by their owners. A dataset that contains personal data is flagged as such: its rows are never shown to readers, only aggregated visuals, and it should be private. If you believe a dataset or a visual on GisViz contains personal data about you, write to info@gisviz.com and we will review it promptly, and remove it where the law requires.
 
 
-9. Changes to This Policy
+5. Recipients and processors
 
-We will notify registered users of material changes to this Privacy Policy by email before they take effect. The effective date at the top of this page reflects the current version. Continued use of GisViz after changes take effect constitutes acceptance of the updated policy.
+Hosting (IONOS, EU) — servers and databases. Email delivery (IONOS) — transactional emails only. Cloudflare — DNS, content delivery and DDoS protection (processes IP addresses for routing and security).
+Your browser also loads a few resources directly from third parties, which therefore see your IP address: map tiles (OpenFreeMap), web fonts (Google Fonts) and country flag icons (flagcdn.com). They receive no account data from us.
+We may disclose data if required by law or to protect the safety of users.
 
 
-10. Contact
+6. International transfers
 
-GisViz
-info@gisviz.com\
+Our servers are in the European Union. Where a provider processes data outside the EEA/UK (for example Cloudflare), the transfer relies on the European Commission's adequacy decisions or Standard Contractual Clauses.
+
+
+7. How long we keep data
+
+Account and content: as long as your account exists. Deleted account: removed immediately (see 8). Server logs: up to 30 days. Sharing history of a deleted account: kept without personal data ("deleted account"). Admin audit logs (who changed what, by id): kept for security and legal obligations. Backups roll over within 30 days.
+
+
+8. Your rights
+
+Access and portability — Settings → Privacy → "Download my data" gives you a JSON file with everything we hold about you (account, consents, organisation, posts, comments, likes, bookmarks, follows, shares made and received, support tickets, views recorded under your account).
+Rectification — edit your profile and email in Settings.
+Erasure — Settings → Privacy → "Delete my account and data" permanently deletes your account, posts (and their images), comments, likes, bookmarks, follows, organisation and memberships. Records of what you shared become anonymous; page views become anonymous.
+Restriction and objection — write to us; you may object to processing based on legitimate interest at any time.
+Withdrawing consent — where we rely on consent you may withdraw it at any time, without affecting earlier processing.
+Complaint — you may lodge a complaint with your data protection authority.
+We answer requests within one month. California residents have the rights to know, delete and opt out of sale; we do not sell personal information.
+
+
+9. Security
+
+Passwords are hashed with bcrypt; connections use TLS; verification codes are random and attempt-limited; sessions can be ended on every device; private visuals are served with short-lived signed links; access to private content is checked on every request.
+
+
+10. Children
+
+GisViz is not directed at children under 16. We do not knowingly collect their personal data; if you believe a child has an account, contact us and we will delete it.
+
+
+11. Changes
+
+We will tell registered users about material changes by email before they take effect and show the new version date here.
+
+
+12. Contact
+
+GisViz — info@gisviz.com\
 """,
     },
 
     # ── TERMS ────────────────────────────────────────────────────────────────
     "terms": {
         "title": "Terms of Service",
-        "last_updated": "July 2026",
+        "last_updated": "October 2026",
         "content": """\
-Effective date: July 1, 2026
+Effective date: October 4, 2026 (version 2026-10-04)
 
-These Terms of Service ("Terms") govern your access to and use of GisViz ("we," "us," or "our") at gisviz.com (the "Service"). By creating an account or using the Service, you agree to be bound by these Terms. If you do not agree, do not use the Service.
+These Terms of Service ("Terms") govern your use of GisViz ("we", "us", "our") at gisviz.com (the "Service"). By creating an account you accept these Terms and our Privacy Policy; we keep a record of the version you accepted.
 
 
 1. The Service
 
-GisViz is a platform for publishing and discovering geospatial visualizations. Users can create accounts, upload map imagery and spatial renders, write descriptions, tag posts by category and keyword, and interact with other users' content through likes, bookmarks, comments, and follows.
+GisViz is a platform for publishing and discovering geospatial and data visualisations. Posts are built from datasets hosted on GisViz:
+  — Standard posts use batch datasets, refreshed from time to time when new data is available.
+  — Live posts use stream datasets that receive new rows continuously; their visual refreshes itself while you watch, and the time of the last update is shown.
+Each post and each dataset is public or private.
 
 
-2. Eligibility
+2. Accounts
 
-You must be at least 13 years old to use GisViz. If you are between 13 and 18, you represent that your parent or legal guardian has reviewed and agreed to these Terms on your behalf.
+You must be at least 16 years old. You are responsible for your credentials and for everything done with your account. Handles must not impersonate another person or organisation.
 
-By using GisViz, you represent that all information you provide is accurate and that you have the legal capacity to enter into these Terms.
-
-
-3. Your Account
-
-You are responsible for maintaining the confidentiality of your login credentials. You may not share your account with others or create multiple accounts. Your username (handle) must not impersonate another person or organization.
-
-You are responsible for all activity that occurs under your account. Notify us immediately at info@gisviz.com if you suspect unauthorized access.
+Individual accounts belong to one person. Organisation accounts represent an organisation: they must be registered with an email address on the organisation's own domain, are reviewed by us, and may only be opened by someone authorised to act for the organisation. Once verified, users whose verified email is on that domain become members of the organisation and can see what is shared with it. If you leave an organisation, change your email to an address outside its domain.
 
 
-4. Content You Publish
+3. Public and private content, sharing
 
-You retain ownership of the geospatial visualizations and descriptions you publish on GisViz.
-
-By publishing content on GisViz, you grant us a non-exclusive, worldwide, royalty-free license to store, display, and distribute your content solely for the purpose of operating and improving the Service.
-
-You represent and warrant that:
-  — You have the right to publish the content (you created it, own the necessary data license, or have appropriate permission from the rights holder).
-  — Your content does not infringe the intellectual property rights, privacy rights, or other rights of any third party.
-  — Your content does not include sensitive, classified, or restricted geospatial data that you are not authorized to share publicly.
-  — Uploaded imagery is your own original render or visualization. You may not upload screenshots of proprietary commercial mapping products (such as Google Maps, Mapbox, or Esri basemaps) without explicit written permission from the respective provider.
-
-Data source attribution is required. All posts must include the Source Name field crediting the origin of the underlying data. Posts without proper attribution may be removed.
+Public posts appear in the feed, search and your profile. Private posts and private datasets are visible only to their owner, our administrators and moderators, the people and organisations they are shared with, and the members of the organisation that owns them.
+When you share something you decide who may see it; you can revoke access at any time. We keep a record of who shared what with whom and when.
+A public post may be built on a private dataset only by someone who controls that dataset (its owner, its organisation or an administrator). Readers then see the visual only — never the dataset's rows. If a private dataset was merely shared with you, posts you build on it must stay private.
+Do not use sharing to disclose information you are not allowed to disclose.
 
 
-5. Prohibited Conduct
+4. Your content and licence to us
 
-You agree not to use GisViz to:
-  — Publish content you do not have rights to share.
-  — Harass, threaten, impersonate, or intimidate other users.
-  — Upload malicious code, viruses, or any software designed to damage or interfere with systems.
-  — Submit spam, unsolicited commercial content, or automated posts without prior written permission.
-  — Attempt to gain unauthorized access to the platform, other user accounts, or our servers.
-  — Scrape or systematically download content without prior written agreement.
-  — Use the Service for any unlawful purpose or in violation of any applicable federal, state, or local law.
+You keep ownership of what you publish. You grant us a non-exclusive, worldwide, royalty-free licence to host, display, reproduce (including as the poster image shown in feeds and link previews) and distribute it to the people allowed to see it, for operating and promoting the Service. For private content the licence covers only the people it is shared with.
 
 
-6. Content Moderation
+5. Data, copyright and attribution
 
-We reserve the right to remove content, suspend accounts, or terminate access to the Service for violations of these Terms, without prior notice in cases involving serious harm or illegal activity.
-
-You may report content that violates these Terms using the Report button on any post. We review all reports and aim to respond within 5 business days.
-
-Moderation decisions may be appealed by contacting info@gisviz.com.
-
-
-7. Intellectual Property
-
-The GisViz name, logo, design, and platform code are owned by GisViz and protected by applicable intellectual property laws. You may not use our trademarks or branding without prior written permission.
+Every dataset carries a licence category, a copyright holder and an attribution text where its licence requires one; GisViz shows the attribution with every post built on it. You must only upload or use data you are entitled to use and respect its licence:
+  — Open licences (CC0, PDDL, public domain, CC BY, CC BY-SA, ODC-By, ODbL, OGL): attribution as required; share-alike licences require derived data to keep the same licence.
+  — Non-commercial licences (e.g. CC BY-NC): no commercial re-use.
+  — "Used with permission" and other restricted licences: readers see the visual only, never the rows; you confirm you hold the permission.
+  — "All rights reserved": private use only.
+Posts must credit their data source. We may remove content or data that infringes rights; rights holders can contact info@gisviz.com (we act on valid notices, including under the DMCA and the EU Digital Services Act).
 
 
-8. Disclaimers
+6. Personal data in datasets
 
-THE SERVICE IS PROVIDED "AS IS" AND "AS AVAILABLE" WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT.
-
-We do not warrant that the Service will be uninterrupted, error-free, or free of viruses. We do not guarantee the accuracy or completeness of any user-generated content, including geospatial data and visualizations.
+Do not upload datasets with personal data unless you have a lawful basis to process it and to share it on GisViz. Datasets containing personal data must be flagged as such: their rows are never shown to readers and they should be private. You are the controller of personal data you upload.
 
 
-9. Limitation of Liability
+7. Stream datasets and ingest keys
 
-TO THE FULLEST EXTENT PERMITTED BY APPLICABLE LAW, GISVIZ SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES ARISING FROM YOUR USE OF OR INABILITY TO USE THE SERVICE, EVEN IF WE HAVE BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
-
-OUR TOTAL LIABILITY TO YOU FOR ANY CLAIM ARISING FROM OR RELATED TO THESE TERMS OR THE SERVICE SHALL NOT EXCEED ONE HUNDRED DOLLARS ($100).
-
-NOTHING IN THESE TERMS LIMITS LIABILITY FOR FRAUD, GROSS NEGLIGENCE, OR WILLFUL MISCONDUCT.
+Stream datasets receive rows through an ingest key. Keep keys secret; anyone with a key can add rows to that dataset. We may rate-limit or block pushes that harm the Service. Old rows may be dropped by the dataset's retention setting.
 
 
-10. Governing Law and Dispute Resolution
+8. Prohibited conduct
 
-These Terms are governed by the laws of the State of Delaware, United States, without regard to its conflict-of-law provisions.
-
-Any dispute arising from or relating to these Terms or the Service will be resolved through binding arbitration administered by the American Arbitration Association (AAA) under its Consumer Arbitration Rules, except that either party may seek injunctive or other equitable relief in any court of competent jurisdiction. You waive any right to a jury trial or to participate in a class action.
+No unlawful content; no harassment or impersonation; no malware; no spam or automated posting without permission; no attempts to access accounts, private content or systems you are not authorised to; no scraping without written agreement; no sensitive, classified or restricted geospatial data you are not authorised to share.
 
 
-11. Changes to These Terms
+9. Moderation
 
-We will notify registered users of material changes to these Terms by email at least 14 days before they take effect. Continued use of the Service after that date constitutes acceptance of the updated Terms.
+We may remove content, revoke shares, suspend accounts or reject organisation registrations that break these Terms. Our administrators and moderators can see private content when needed to run the Service or investigate reports. Report content with the Report button; decisions can be appealed at info@gisviz.com.
 
 
-12. Contact
+10. Ending your account
 
-GisViz
-info@gisviz.com\
+You can delete your account and personal data at any time in Settings (see the Privacy Policy). We may terminate accounts for serious or repeated violations.
+
+
+11. Disclaimers and liability
+
+The Service and all user content and data are provided "as is". We do not guarantee the accuracy, completeness or timeliness of any dataset or visual, including live data. To the extent permitted by law we are not liable for indirect or consequential damages, and our total liability is limited to one hundred US dollars (USD 100). Nothing limits liability that cannot be limited by law, including for fraud, gross negligence or wilful misconduct, and nothing affects your statutory rights as a consumer.
+
+
+12. Governing law
+
+These Terms are governed by the laws of the State of Delaware, USA, without prejudice to mandatory consumer protection rules of the country where you live. If you are a consumer in the EU or UK you may bring claims in your local courts.
+
+
+13. Changes
+
+We will notify registered users of material changes at least 14 days before they take effect.
+
+
+14. Contact
+
+GisViz — info@gisviz.com\
 """,
     },
 
     # ── COOKIES ──────────────────────────────────────────────────────────────
     "cookies": {
         "title": "Cookie Policy",
-        "last_updated": "July 2026",
+        "last_updated": "October 2026",
         "content": """\
-Effective date: July 1, 2026
+Effective date: October 4, 2026
 
-This Cookie Policy explains how GisViz uses cookies and similar browser storage technologies when you use gisviz.com.
-
-
-1. What is a cookie?
-
-A cookie is a small text file placed on your device by a website. We use this term broadly to include both traditional cookies and browser localStorage, since GisViz relies primarily on localStorage for session management.
+GisViz uses only what is strictly necessary to run the site. Because we use no analytics, advertising or tracking cookies, no cookie consent banner is needed; if that ever changes we will ask for your consent first.
 
 
-2. What we use
+1. What GisViz stores in your browser (first party, strictly necessary)
 
-Authentication Token (localStorage)
-Key: gisviz_token
-Purpose: Stores your JSON Web Token (JWT) to keep you logged in between page loads and sessions.
-Duration: Until you log out or the token expires (typically 60 minutes of inactivity, configurable by us).
-Type: First-party. Strictly necessary for using the platform.
+gisviz_token (localStorage) — your session, so you stay signed in. Removed when you log out; you can end every session from Settings.
+gisviz_handle (localStorage) — your handle, to show the interface without an extra request. Removed when you log out.
+Theme preference (localStorage) — light or dark mode.
 
-User Handle (localStorage)
-Key: gisviz_handle
-Purpose: Stores your username so the interface can display it without an additional server request.
-Duration: Until you log out.
-Type: First-party. Strictly necessary for a functional logged-in experience.
 
-These are the only items GisViz itself writes to your browser's storage.
+2. Third parties your browser contacts
+
+Cloudflare may set the strictly necessary security cookie __cf_bm (bot protection, expires within 30 minutes).
+Map tiles (OpenFreeMap), fonts (Google Fonts) and flag icons (flagcdn.com) are loaded from those providers; they receive your IP address as part of the request but GisViz sets no cookies for them and shares no account data with them.
+Links to private visuals carry a short-lived signed token in the address (not a cookie) that only lets your browser fetch that visual's data.
 
 
 3. What we do not use
 
-We do not use:
-  — Analytics cookies or localStorage (no Google Analytics, Mixpanel, Amplitude, or similar services).
-  — Advertising or retargeting cookies.
-  — Social media tracking pixels (no Meta Pixel, Twitter/X Pixel, TikTok Pixel, or similar).
-  — Session recording tools (no Hotjar, FullStory, or similar).
-  — Cross-site tracking of any kind.
+No Google Analytics or similar, no advertising or retargeting cookies, no social media pixels, no session recording, no cross-site tracking.
 
 
-4. Third-party cookies
+4. Your choices
 
-Cloudflare, our content delivery and security provider, may set a short-lived browser cookie named __cf_bm for bot detection and DDoS protection. This cookie:
-  — Is set by Cloudflare, not by GisViz directly.
-  — Expires within 30 minutes.
-  — Is strictly necessary for security and cannot be disabled without potentially blocking your access to the site.
-  — Does not track you across websites.
-
-For more information, see Cloudflare's privacy policy at cloudflare.com/privacypolicy.
+Log out to remove the session items. You can clear site data for gisviz.com in your browser settings at any time; blocking localStorage prevents signing in.
 
 
-5. Your choices
+5. Contact
 
-You can remove your authentication token at any time by clicking Log out in the navigation. This removes both localStorage items listed above.
-
-You can also clear site data manually through your browser:
-  Chrome / Edge: Settings → Privacy and security → Site settings → View permissions and data stored across sites → gisviz.com → Clear data.
-  Firefox: Preferences → Privacy & Security → Cookies and Site Data → Manage Data → search for gisviz.com → Remove Selected.
-  Safari: Preferences → Privacy → Manage Website Data → search for gisviz.com → Remove.
-
-Note: Clearing your authentication token will log you out. Blocking localStorage entirely will prevent you from logging in to GisViz.
-
-
-6. Changes to this policy
-
-If we introduce new cookies or storage items in the future, we will update this policy and notify registered users before the change takes effect.
-
-
-7. Contact
-
-Questions about this policy or our use of cookies:
 info@gisviz.com\
 """,
     },
@@ -405,6 +360,73 @@ If you encounter any barrier that prevents you from using GisViz, we want to hea
 We aim to acknowledge accessibility reports within 2 business days and to resolve confirmed issues as a priority.\
 """,
     },
+
+    # ── DATA, SHARING & LICENSING ───────────────────────────────────────────
+    "data-policy": {
+        "title": "Data, Sharing & Licensing",
+        "last_updated": "October 2026",
+        "content": """\
+Effective date: October 4, 2026
+
+This page explains how data moves through GisViz: who can see datasets and posts, how sharing and organisations work, how licences and attribution are applied, and how live data arrives.
+
+
+1. Datasets: batch and stream
+
+Batch datasets are files (CSV, Parquet, GeoJSON, …) loaded by our team or a dataset's owner and refreshed now and then when new data is available. Posts built on them are standard posts.
+Stream datasets receive new rows continuously from the data owner's systems, through a secret ingest key. Posts built on them are live posts: the visual re-reads the data at the dataset's refresh interval and shows when it was last updated. A stream dataset can keep only its newest rows (retention).
+
+
+2. Public and private
+
+Every post and every dataset is public or private.
+  — Public: anyone can see it; public posts appear in the feed, search, profiles and the sitemap.
+  — Private: only the owner, GisViz administrators (and moderators, for posts), the people and organisations it is shared with, and the members of the organisation that owns it. Private posts never appear in feeds, search, the sitemap or other people's profiles; a link to a private post shows "not found" to everyone else.
+Charts of private datasets are delivered through short-lived signed links, issued only to people allowed to see them.
+
+
+3. The four combinations
+
+  — Public post, public dataset: everyone sees the visual; the rows (Data tab) are shown when the dataset's licence allows it and its owner chose to publish them.
+  — Public post, private dataset: everyone sees the visual, nobody but the dataset's managers sees the rows. Only someone who controls the dataset may publish such a post.
+  — Private post, public dataset: only the people with access to the post see it.
+  — Private post, private dataset: only people with access to the post see the visual; only people with access to the dataset see its rows.
+
+
+4. Sharing and its record
+
+Owners share a post or dataset with a person (@handle) or with an organisation (its @handle: every member gets access). Shared items appear in the Shared tab of each recipient's profile, with who shared them and when. Revoking access takes effect immediately. GisViz keeps the full history: who shared, with whom, when, and who revoked it and when; owners can see it in the access panel.
+
+
+5. Organisations
+
+An organisation account is registered with an email address on the organisation's own domain (public mail providers such as Gmail are not accepted) and reviewed by GisViz before it is verified. Every user whose verified email address is on a verified organisation's domain is a member and sees what is shared with the organisation and the organisation's own private content. Changing your email address changes your memberships accordingly.
+
+
+6. Licences, copyright and attribution
+
+Each dataset declares a licence category, the copyright holder and, where required, the attribution text shown with every visual built on it:
+  — Open: CC0, ODC PDDL, public domain, CC BY 4.0, CC BY-SA 4.0, ODC-By, ODbL (e.g. OpenStreetMap), UK OGL v3.
+  — Restricted: CC BY-NC 4.0 (non-commercial), "used with permission", other licences — readers see the visual; rows are not redistributed (except CC BY-NC, whose rows may be shown).
+  — Closed: "all rights reserved" — private datasets only.
+A public dataset must have a licence. Share-alike licences require derived data to keep the same licence. Rights holders can request removal at info@gisviz.com.
+
+
+7. Personal data in datasets
+
+Datasets that contain personal data are flagged; their rows are never shown to readers (only to the dataset's managers) and they should be private. Uploaders are responsible for having a lawful basis under the GDPR. People can ask us at info@gisviz.com to review or remove data about them.
+
+
+8. Your data
+
+Your own account data can be downloaded or deleted at any time from Settings → Privacy (see the Privacy Policy).
+
+
+9. Contact
+
+info@gisviz.com\
+""",
+    },
 }
 
 
@@ -423,11 +445,11 @@ def list_legal_pages():
 def get_legal_page(slug: str):
     if slug not in VALID_SLUGS:
         raise HTTPException(status_code=404, detail="Legal page not found")
-    cached = cache_service.get(f"legal:{slug}")
+    cached = cache_service.get(f"legal:v2:{slug}")
     if cached:
         return cached
     default = _DEFAULTS[slug]
-    cache_service.set(f"legal:{slug}", default, ttl_seconds=_TTL)
+    cache_service.set(f"legal:v2:{slug}", default, ttl_seconds=_TTL)
     return default
 
 
@@ -440,5 +462,5 @@ def update_legal_page(
     if slug not in VALID_SLUGS:
         raise HTTPException(status_code=404, detail="Legal page not found")
     data = payload.model_dump()
-    cache_service.set(f"legal:{slug}", data, ttl_seconds=_TTL)
+    cache_service.set(f"legal:v2:{slug}", data, ttl_seconds=_TTL)
     return {"status": "updated", "slug": slug}

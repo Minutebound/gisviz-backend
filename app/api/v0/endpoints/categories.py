@@ -31,6 +31,7 @@ from app.db.models import (
 )
 from app.schemas.post_schema import CategoryData, PendingCategoryData, PendingCategorySuggestion
 from app.services.auth_service import get_current_authenticated_user, RoleChecker
+from app.services import banner_service
 
 router = APIRouter()
 
@@ -47,7 +48,8 @@ class CategoryUpdatePayload(BaseModel):
 
 def _row(r: CategoryRecord) -> dict:
     return {"category_id": r.category_id, "slug": r.slug, "label": r.label, "usage_count": r.usage_count,
-            "description": r.description, "theme_color": r.theme_color, "sort_order": r.sort_order or 0}
+            "description": r.description, "theme_color": r.theme_color, "sort_order": r.sort_order or 0,
+            "banner": r.banner}
 
 
 def _clean_color(v: Optional[str]) -> Optional[str]:
@@ -59,8 +61,8 @@ def _clean_color(v: Optional[str]) -> Optional[str]:
 
 
 def _fresh(cached) -> bool:
-    """Cached lists written before description/theme_color existed are ignored."""
-    return cached is not None and (not cached or "theme_color" in cached[0])
+    """Cached lists written before description/theme_color/banner existed are ignored."""
+    return cached is not None and (not cached or ("theme_color" in cached[0] and "banner" in cached[0]))
 
 
 # ── Redis key constants ───────────────────────────────────────────────────────
@@ -224,6 +226,7 @@ async def approve_pending_category(
         raise HTTPException(status_code=409, detail="A category with this slug already exists")
 
     new_cat = CategoryRecord(slug=pending.normalized_slug, label=pending.label)
+    banner_service.ensure(new_cat)
     db.add(new_cat)
     pending.status = "approved"
     pending.reviewed_timestamp = datetime.now(timezone.utc)
@@ -275,6 +278,7 @@ async def create_category(
         raise HTTPException(status_code=409, detail="Category with this slug already exists")
     cat = CategoryRecord(slug=slug, label=payload.label.strip(), description=(payload.description or "").strip() or None,
                          theme_color=_clean_color(payload.theme_color), sort_order=payload.sort_order or 0)
+    banner_service.ensure(cat)
     db.add(cat)
     db.commit()
     db.refresh(cat)
@@ -303,10 +307,23 @@ async def update_category(
         cat.theme_color = _clean_color(payload.theme_color)
     if "sort_order" in fields and payload.sort_order is not None:
         cat.sort_order = payload.sort_order
+    banner_service.ensure(cat)              # new words / colour -> a new banner scene
     db.commit()
     db.refresh(cat)
     _invalidate_all_category_caches()
     return cat
+
+
+# ── POST /banners/refresh — admin: rebuild every category's banner scene ─────
+
+@router.post("/banners/refresh")
+async def refresh_banners(
+    db: Session = Depends(get_posts_db),
+    current_user: PlatformUserRecord = Depends(RoleChecker(["admin"])),
+):
+    n = banner_service.ensure_all(db, force=True)
+    _invalidate_all_category_caches()
+    return {"refreshed": n}
 
 
 # ── DELETE /{category_id} — admin only ───────────────────────────────────────

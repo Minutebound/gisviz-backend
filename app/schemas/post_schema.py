@@ -10,6 +10,7 @@ class CategoryData(BaseModel):
     description: Optional[str] = None
     theme_color: Optional[str] = None      # #rrggbb; the accent of posts in this category
     sort_order: int = 0
+    banner: Optional[dict] = None          # the feed banner's animated scene (banner_service)
 
     class Config:
         from_attributes = True
@@ -72,6 +73,7 @@ class PostPayload(BaseModel):
     visual_params: Optional[VisualParams] = None
     theme_color: Optional[str] = None      # hex like #06ba24, saved on the post and used to colour the visual
     note: Optional[str] = None
+    # ignored: a post's source is its dataset's source (kept so older clients still validate)
     source_name: Optional[str] = None
     source_url: Optional[str] = None
     category_ids: List[int] = []          # at least one (posts DB categories)
@@ -80,6 +82,11 @@ class PostPayload(BaseModel):
     # the poster behind the visual: a design from the poster editor {bg, texture, font, title_size, title_align,
     # map_base, layout}, or "auto" (picked from the topic) / "light" / "dark" / "none". Omitted on edit = keep it.
     backdrop: Optional[Union[dict, str]] = "auto"
+    # who sees it: public (feed, search, profile) | private (only you, admins/editors, and who you share it with)
+    # omitted: public for a new post, unchanged on edit
+    visibility: Optional[str] = None
+    # standard | live — informational: a post on a STREAM dataset is always live (refreshes itself)
+    post_type: Optional[str] = None
 
 
 class BackdropPreviewPayload(BaseModel):
@@ -121,6 +128,11 @@ class PostResponse(BaseModel):
     is_active: int
     is_liked: Optional[bool] = None
     is_bookmarked: Optional[bool] = None
+    visibility: str = "public"              # public | private
+    post_type: str = "standard"             # standard | live
+    live: Optional[dict] = None             # live posts: {refresh_seconds, updated_at}
+    can_manage: Optional[bool] = None       # the viewer may edit / share it
+    shared_by: Optional[dict] = None        # "Shared" tab: {handle, label, at, via}
 
     class Config:
         from_attributes = True

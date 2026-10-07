@@ -30,6 +30,24 @@ from app.services.auth_service import (
 
 router = APIRouter()
 
+
+def _viewer(user, users_db=None):
+    from app.services import access_service
+    return access_service.viewer_for(user, users_db)
+
+
+def _readable_post(posts_db, post_id, viewer) -> PostRecord:
+    """The post if this viewer may read it, else 404 (a private post is never confirmed to exist)."""
+    from app.services import access_service
+    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
+    if post is None:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post.is_active != 1 and not access_service.can_manage_post(viewer, post):
+        raise HTTPException(status_code=404, detail="Post not found")
+    if not access_service.can_view_post(viewer, post, posts_db):
+        raise HTTPException(status_code=404, detail="Post not found")
+    return post
+
 # TTL constants in seconds
 STREAM_TTL = 30
 POST_TTL   = 86400
@@ -52,6 +70,15 @@ async def _invalidate_user_posts(handle: str) -> None:
             await backend.clear(key=f"gisviz-cache:posts:user:{handle.lower()}:{skip}:50")
     except Exception as exc:
         print(f"[cache] user posts invalidation failed for {handle}: {exc}")
+
+
+def _invalidate_post_images() -> None:
+    """A post was created / edited / deleted: its poster image changed, so cached lists that carry image paths
+    (the feed banner's editor's pick) are dropped."""
+    try:
+        cache_service.delete_pattern("gisviz-cache:posts:featured:*")
+    except Exception as exc:
+        print(f"[cache] featured invalidation failed: {exc}")
 
 
 # -------------------------------------------------------------------
@@ -116,7 +143,7 @@ def trending_keywords(
     q = (posts_db.query(KeywordRecord.word, n.label("posts"))
          .join(PostKeywordLink, PostKeywordLink.keyword_id == KeywordRecord.keyword_id)
          .join(PostRecord, PostRecord.post_id == PostKeywordLink.post_id)
-         .filter(PostRecord.is_active == 1))
+         .filter(PostRecord.is_active == 1, PostRecord.visibility == "public"))
     if category:
         q = (q.join(PostCategoryLink, PostCategoryLink.post_id == PostRecord.post_id)
               .join(CategoryRecord, CategoryRecord.category_id == PostCategoryLink.category_id)
@@ -189,7 +216,7 @@ def featured_post(
     cached = cache_service.get(key)
     if cached:
         return cached
-    q = posts_db.query(PostRecord).filter(PostRecord.is_active == 1)
+    q = posts_db.query(PostRecord).filter(PostRecord.is_active == 1, PostRecord.visibility == "public")
     if category:
         q = (q.join(PostCategoryLink, PostCategoryLink.post_id == PostRecord.post_id)
               .join(CategoryRecord, CategoryRecord.category_id == PostCategoryLink.category_id)
@@ -223,7 +250,8 @@ async def trending_posts_full(
         id_list = [uuid.UUID(i) for i in trending_ids[:n]]
         posts = posts_db.query(PostRecord).filter(
             PostRecord.post_id.in_(id_list),
-            PostRecord.is_active == 1,   
+            PostRecord.is_active == 1,
+            PostRecord.visibility == "public",
         ).all()
         # preserve Redis order
         order = {pid: idx for idx, pid in enumerate(id_list)}
@@ -231,7 +259,7 @@ async def trending_posts_full(
     else:
         posts = (
             posts_db.query(PostRecord)
-            .filter(PostRecord.is_active == 1)   
+            .filter(PostRecord.is_active == 1, PostRecord.visibility == "public")
             .order_by(desc(PostRecord.total_likes_count))
             .limit(n)
             .all()
@@ -258,7 +286,8 @@ async def search_post_stream(
     posts = (
         posts_db.query(PostRecord)
         .filter(
-            (PostRecord.title.ilike(f"%{q}%")) | (PostRecord.description.ilike(f"%{q}%"))
+            (PostRecord.title.ilike(f"%{q}%")) | (PostRecord.description.ilike(f"%{q}%")),
+            PostRecord.is_active == 1, PostRecord.visibility == "public",
         )
         .order_by(desc(PostRecord.created_timestamp))
         .offset(skip).limit(limit).all()
@@ -297,13 +326,14 @@ async def get_user_posts(
         current_user is not None
         and current_user.user_id == user.user_id
     )
-    if not is_own_profile:
-        query = query.filter(PostRecord.is_active == 1)
+    if not is_own_profile:      # others: active public posts (private ones are in the Shared tab of who can see them)
+        query = query.filter(PostRecord.is_active == 1, PostRecord.visibility == "public")
 
     posts = query.order_by(PostRecord.created_timestamp.desc()).offset(skip).limit(limit).all()
     current_user_id = current_user.user_id if current_user else None
+    viewer = _viewer(current_user, users_db) if is_own_profile else None
     return [
-        post_service._format_post_response(posts_db, users_db, p, current_user_id)
+        post_service._format_post_response(posts_db, users_db, p, current_user_id, viewer)
         for p in posts
     ]
 
@@ -343,10 +373,12 @@ async def get_user_bookmarks(
             PostRecord.post_id.in_([b.post_id for b in bookmarks])
         ).all()
     }
+    from app.services import access_service
+    viewer = _viewer(current_user, users_db)
     results = []
     for bm in bookmarks:
         post = post_map.get(bm.post_id)
-        if post:
+        if post and post.is_active == 1 and access_service.can_view_post(viewer, post, posts_db):
             results.append(
                 post_service._format_post_response(posts_db, users_db, post, current_user.user_id)
             )
@@ -365,13 +397,10 @@ async def get_post(
     users_db: Session = Depends(get_users_db),
     current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
-    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    if post.is_active != 1:
-        raise HTTPException(status_code=404, detail="Post not found")  # treat inactive as non-existent publicly
+    viewer = _viewer(current_user, users_db)
+    post = _readable_post(posts_db, post_id, viewer)
     current_user_id = current_user.user_id if current_user else None
-    return post_service._format_post_response(posts_db, users_db, post, current_user_id)
+    return post_service._format_post_response(posts_db, users_db, post, current_user_id, viewer)
 
 # -------------------------------------------------------------------
 #  POST CRUD
@@ -385,7 +414,7 @@ async def create_post(
 ):
     new_post = await post_service.create_post(
         posts_db=posts_db, users_db=users_db,
-        user_id=current_user.user_id, payload=payload,
+        user_id=current_user.user_id, payload=payload, viewer=_viewer(current_user, users_db),
     )
     current_user.post_count = (current_user.post_count or 0) + 1
     if current_user.role and current_user.role.name == "viewer":
@@ -396,6 +425,7 @@ async def create_post(
                 current_user.title = "Platform Publisher"
     users_db.commit()
     await _invalidate_user_posts(current_user.user_handle)
+    _invalidate_post_images()
     return new_post
 
 
@@ -411,6 +441,7 @@ async def update_post(
         post_id=post_id, payload=payload, current_user=current_user,
     )
     await _invalidate_user_posts(current_user.user_handle)
+    _invalidate_post_images()
     return result
 
 
@@ -421,12 +452,14 @@ async def delete_post(
     users_db: Session = Depends(get_users_db),    # ← ADD this dependency
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    return await post_service.delete_post(
+    out = await post_service.delete_post(
         posts_db=posts_db,
         post_id=post_id,
         current_user=current_user,
-        users_db=users_db,    # ← pass it
+        users_db=users_db,
     )
+    _invalidate_post_images()
+    return out
 
 @router.put("/{post_id}/status")
 async def set_post_status(
@@ -439,6 +472,7 @@ async def set_post_status(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     post.is_active = 1 if is_active else 0
+    post.deactivated_by_dataset = 0          # an admin decision: no longer tied to the dataset's state
     posts_db.commit()
     return {"post_id": str(post_id), "is_active": post.is_active}
 
@@ -452,6 +486,7 @@ async def report_post(
     posts_db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
+    _readable_post(posts_db, post_id, _viewer(current_user))
     report = PostReportRecord(
         post_id=post_id, reporter_user_id=current_user.user_id, reason=payload.reason,
     )
@@ -580,15 +615,17 @@ async def update_report_status(
 def record_post_view(
     post_id: str,
     request: Request,
+    posts_db: Session = Depends(get_posts_db),
     current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
-    """Public: called once when a post page opens. Counted once per visitor per day (fact_post_view
-    in the analytics DB); returns the post's current view total."""
+    """Public: called each time a post page opens. Every call is a view (post_views in the posts DB),
+    except a repeat by the same viewer within a few seconds; returns the post's view total."""
     from app.services import view_service
     try:
-        uuid.UUID(post_id)
+        pid = uuid.UUID(post_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Post not found")
+    _readable_post(posts_db, pid, _viewer(current_user))
     fwd = request.headers.get("x-forwarded-for", "")
     ip = fwd.split(",")[0].strip() or (request.client.host if request.client else None)
     try:
@@ -604,9 +641,7 @@ async def toggle_like(
     posts_db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
+    post = _readable_post(posts_db, post_id, _viewer(current_user))
 
     existing = posts_db.query(PostLikeRecord).filter(
         PostLikeRecord.post_id == post_id,
@@ -640,9 +675,7 @@ async def toggle_bookmark(
     posts_db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
+    post = _readable_post(posts_db, post_id, _viewer(current_user))
 
     # Users cannot bookmark their own posts
     if post.publisher_user_id == current_user.user_id:
@@ -673,9 +706,7 @@ async def add_comment(
     posts_db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
+    post = _readable_post(posts_db, post_id, _viewer(current_user))
     new_comment = PostCommentRecord(
         post_id=post_id, user_id=current_user.user_id,
         parent_comment_id=payload.parent_comment_id, content=payload.content,
@@ -699,7 +730,9 @@ async def get_comments(
     post_id: uuid.UUID,
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
+    _readable_post(posts_db, post_id, _viewer(current_user, users_db))
     all_comments = (
         posts_db.query(PostCommentRecord)
         .filter(PostCommentRecord.post_id == post_id)
@@ -739,7 +772,9 @@ async def get_post_by_slug(
     current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
     post = posts_db.query(PostRecord).filter(PostRecord.share_slug == slug).first()
-    if not post or post.is_active != 1:
+    if not post:
         raise HTTPException(status_code=404, detail="Post not found")
+    viewer = _viewer(current_user, users_db)
+    post = _readable_post(posts_db, post.post_id, viewer)
     current_user_id = current_user.user_id if current_user else None
-    return post_service._format_post_response(posts_db, users_db, post, current_user_id)
+    return post_service._format_post_response(posts_db, users_db, post, current_user_id, viewer)

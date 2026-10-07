@@ -259,9 +259,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # Build stage: prod (default, real SMTP) or dev (OTP printed in the log, no SMTP).
-      # Locally put  API_TARGET=dev  in a gitignored file named .env  next to this file.
-      # On the VPS leave it unset (or API_TARGET=prod).
+      # prod: real SMTP, code baked in, non-root, 4 workers (the VPS).
+      # On your computer docker-compose.override.yml switches this to dev (OTP printed in the log, --reload).
       target: dev
     container_name: gisviz-api
     restart: always
@@ -349,10 +348,20 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: dev
+      target: prod                      # always prod, on your computer and on the VPS (no reload needed)
     container_name: gisviz-duckdb
     restart: always
-    command: ["uvicorn", "app.duckstore.server:app", "--host", "0.0.0.0", "--port", "8100", "--workers", "1"]
+    working_dir: /app                   # the package `app` lives at /app/app
+    # checks the image really holds the code first (an image unpacked on a full Docker disk can miss it), then starts
+    command:
+      - sh
+      - -c
+      - >-
+        if [ ! -f /app/app/duckstore/server.py ]; then
+        echo "gisviz-duckdb: /app/app/duckstore/server.py is missing: this image is incomplete.";
+        echo "Free Docker disk space, then: docker compose build --no-cache duckdb && docker compose up -d duckdb";
+        ls -la /app /app/app 2>&1; exit 1; fi;
+        exec uvicorn app.duckstore.server:app --app-dir /app --host 0.0.0.0 --port 8100 --workers 1
     env_file:
       - path: .env.backend
         required: true
@@ -361,8 +370,7 @@ services:
       DUCKDB_THREADS: "4"
       DUCKDB_MEMORY_LIMIT: 2GB
     volumes:
-      - ./app:/app/app
-      - duckdb-data:/app/duckdb
+      - duckdb-data:/app/duckdb         # only the data lives outside the image; code changes need a rebuild
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)"]
       interval: 10s

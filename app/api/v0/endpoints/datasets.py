@@ -13,7 +13,14 @@ Charts and maps built FROM a dataset are in visuals.py.
                                              when show_data is on; publishers/admins always (to build posts)
 
   Publishers (post upload / edit: the dataset picker)
-  GET    /datasets/search?q=&limit=          active datasets matching a code or words (exact code first)
+  GET    /datasets/search?q=&limit=&pipeline=   active datasets this publisher may use (public + private ones shared
+                                             with them / their organisation), matching a code or words; pipeline
+                                             batch (standard posts) | stream (live posts)
+  GET    /datasets/licences                  the licence categories (app/services/licences.py)
+
+  Stream datasets (live posts) — machines push rows with the dataset's ingest key
+  POST   /datasets/{id}/stream               {"rows": [{column: value, ...}, ...]}  header X-Ingest-Key: gvk_...
+                                             appended to the live table; live posts pick them up on their next refresh
 
   Admin (/admin/datasets) — every change is written to the admin audit log
   GET    /datasets/manage                    every dataset, active and inactive (?q= &status=)
@@ -31,6 +38,8 @@ Charts and maps built FROM a dataset are in visuals.py.
                                              409 + broken_posts and nothing changes; ?force=true replaces anyway
   GET    /datasets/manage/{id}/preview       first rows of the table
   DELETE /datasets/manage/{id}               delete record + table (refused while posts use it)
+  POST   /datasets/manage/{id}/ingest-key    (stream) new ingest key, shown once; DELETE revokes it
+  Visibility / sharing of a dataset: /access/dataset/{id} (access.py)
   GET    /datasets/manage/sync               datasets DB vs gisviz.duckdb: in_sync / out_of_sync / unreachable
   POST   /datasets/manage/sync               fix: missing tables -> inactive; ?drop_orphans=true drops tables without a record
 """
@@ -46,7 +55,10 @@ from sqlalchemy.orm import Session
 
 from app.db.database import get_admin_db
 from app.db.models import PlatformUserRecord, log_admin_action
-from app.services import catalog_service, dataset_ingest, dataset_sync, duckdb_service, visual_service as vs
+from fastapi import Header
+
+from app.services import access_service, catalog_service, dataset_ingest, dataset_sync, duckdb_service, licences, \
+    visual_service as vs
 from app.services.auth_service import get_optional_current_user, require_dataset_manager, require_publisher
 
 router = APIRouter()
@@ -75,11 +87,27 @@ def _safe(d: dict) -> dict:
 def catalog_list(q: str = Query("", max_length=80), category: Optional[str] = Query(None, max_length=80),
                  region: Optional[str] = Query(None, max_length=60),
                  kind: Optional[str] = Query(None, pattern="^(spatial|tabular)$"),
-                 skip: int = Query(0, ge=0), limit: int = Query(24, ge=1, le=60)):
-    page = catalog_service.list_page(q, category, skip, limit, kind, region)
-    page["items"] = [_safe(r) for r in page["items"]]
+                 pipeline: Optional[str] = Query(None, pattern="^(batch|stream)$"),
+                 skip: int = Query(0, ge=0), limit: int = Query(24, ge=1, le=60),
+                 user=Depends(get_optional_current_user)):
+    """Active datasets: public ones for everybody, plus the private ones a signed-in viewer may see."""
+    viewer = access_service.viewer_for(user)
+    page = catalog_service.list_page(q, category, skip, limit, kind, region, viewer, pipeline)
+    page["items"] = [_public_card(r) for r in page["items"]]
     page["categories"] = catalog_service.categories()
-    return JSONResponse(page, headers={"Cache-Control": "public, max-age=60"})
+    return JSONResponse(page, headers={"Cache-Control": "private, max-age=30" if user else "public, max-age=60"})
+
+
+def _public_card(r: dict) -> dict:
+    """What readers see of a dataset (the owner id stays internal)."""
+    r = dict(r)
+    r.pop("owner_user_id", None)
+    return _safe(r)
+
+
+@router.get("/licences")
+def licence_list():
+    return JSONResponse(licences.LICENCES, headers={"Cache-Control": "public, max-age=3600"})
 
 
 # ── publisher: dataset picker on post upload / edit ──────────────────
@@ -88,9 +116,18 @@ def catalog_list(q: str = Query("", max_length=80), category: Optional[str] = Qu
 def search_datasets(
     q: str = Query("", max_length=80),
     limit: int = Query(12, ge=1, le=50),
+    pipeline: Optional[str] = Query(None, pattern="^(batch|stream)$"),
     _user: PlatformUserRecord = Depends(require_publisher),
 ):
-    return JSONResponse(_guard(lambda: [_safe(r) for r in vs.search(q, limit)]))
+    viewer = access_service.viewer_for(_user)
+    rows = catalog_service.search(q, limit, viewer, pipeline)
+    out = []
+    for r in rows:
+        # private datasets: may this publisher make PUBLIC posts on it, or only private ones?
+        r["can_publish_publicly"] = r.get("visibility") != "private" or \
+            access_service.can_publish_publicly(viewer, catalog_service.raw(r["dataset_id"]))
+        out.append(_public_card(r))
+    return JSONResponse(out)
 
 
 # ── admin: create, upload, activate, edit, delete, sync ──────────────
@@ -104,6 +141,68 @@ class DatasetMeta(BaseModel):
     source_url: Optional[str] = Field(None, max_length=1024)
     license: Optional[str] = Field(None, max_length=80)
     publisher: Optional[str] = Field(None, max_length=120)
+    # access, pipeline, licensing, GDPR
+    visibility: Optional[str] = Field(None, pattern="^(public|private)$")
+    owner_handle: Optional[str] = Field(None, max_length=51)  # @handle of the owning user / organisation; "" clears
+    pipeline: Optional[str] = Field(None, pattern="^(batch|stream)$")
+    refresh_seconds: Optional[int] = Field(None, ge=5, le=86400)
+    retention_rows: Optional[int] = Field(None, ge=0, le=5_000_000)
+    license_code: Optional[str] = Field(None, max_length=40)
+    attribution: Optional[str] = Field(None, max_length=1000)
+    copyright_holder: Optional[str] = Field(None, max_length=255)
+    contains_personal_data: Optional[bool] = None
+
+
+REQUIRED = {"title": "A title", "source_name": "The source name", "copyright_holder": "The copyright holder"}
+
+
+def _require(fields: dict, row: Optional[dict] = None) -> None:
+    """Title, source name and copyright holder are mandatory: in a new dataset, and they cannot be blanked."""
+    for k, name in REQUIRED.items():
+        v = fields.get(k, (row or {}).get(k) if row is not None else None)
+        if (k in fields or row is None) and not (v or "").strip():
+            raise HTTPException(status_code=422, detail=f"{name} is required")
+
+
+def _licence_text(fields: dict) -> dict:
+    """The licence is picked from the list (license_code); its name is kept in the old free-text field too."""
+    if fields.get("license_code"):
+        from app.services import licences
+        lic = licences.get(fields["license_code"])
+        if lic:
+            fields["license"] = lic["name"]
+    return fields
+
+
+def _resolve_owner(fields: dict) -> dict:
+    """owner_handle -> owner_user_id (users DB)."""
+    if "owner_handle" not in fields:
+        return fields
+    h = (fields.pop("owner_handle") or "").strip().lstrip("@")
+    if not h:
+        fields["owner_user_id"] = None
+        return fields
+    from sqlalchemy import func
+    from app.db.database import UsersSessionLocal
+    with UsersSessionLocal() as udb:
+        u = udb.query(PlatformUserRecord).filter(func.lower(PlatformUserRecord.user_handle) == h.lower()).first()
+        if u is None:
+            raise HTTPException(status_code=422, detail=f"No account @{h}")
+        fields["owner_user_id"] = u.user_id
+    return fields
+
+
+def _owner_handles(rows: list[dict]) -> list[dict]:
+    ids = {r.get("owner_user_id") for r in rows if r.get("owner_user_id")}
+    if ids:
+        import uuid as _uuid
+        from app.db.database import UsersSessionLocal
+        with UsersSessionLocal() as udb:
+            names = {str(u.user_id): u.user_handle for u in udb.query(PlatformUserRecord)
+                     .filter(PlatformUserRecord.user_id.in_([_uuid.UUID(i) for i in ids])).all()}
+        for r in rows:
+            r["owner_handle"] = names.get(r.get("owner_user_id") or "")
+    return rows
 
 
 class DatasetStatus(BaseModel):
@@ -149,7 +248,7 @@ def _row(dataset_id: str, row: dict, status_code: int = 200) -> JSONResponse:
 @router.get("/manage")
 def manage_list(q: str = Query("", max_length=80), status: Optional[str] = Query(None, max_length=12),
                 _user: PlatformUserRecord = Depends(require_dataset_manager)):
-    rows = catalog_service.list_admin(q, status)
+    rows = _owner_handles(catalog_service.list_admin(q, status))
     for r in rows:
         r["has_data"] = bool(r.get("column_count"))
     return JSONResponse([_safe(r) for r in rows])
@@ -158,11 +257,15 @@ def manage_list(q: str = Query("", max_length=80), status: Optional[str] = Query
 @router.post("/manage")
 def manage_create(meta: DatasetMeta, request: Request, admin_db: Session = Depends(get_admin_db),
                   user: PlatformUserRecord = Depends(require_dataset_manager)):
-    """New dataset record; the code (ds_00001, ...) is generated. Inactive until its file is uploaded."""
-    fields = meta.model_dump(exclude_unset=True)
+    """New dataset record; the code (ds_00001, ...) is generated. Inactive until its file is uploaded.
+    Title, source name and copyright holder are required; the publisher is the account creating it."""
+    fields = _resolve_owner(meta.model_dump(exclude_unset=True))
+    _require(fields)
+    fields["publisher"] = f"@{user.user_handle}"
+    _licence_text(fields)
     _check_refs(fields)
     try:
-        row = catalog_service.create(fields)
+        row = catalog_service.create(fields, owner_user_id=fields.pop("owner_user_id", None))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     _audit(admin_db, user, request, "dataset.create", row["dataset_id"], {"title": row["title"]})
@@ -173,7 +276,10 @@ def manage_create(meta: DatasetMeta, request: Request, admin_db: Session = Depen
 def manage_update(dataset_id: str, meta: DatasetMeta, request: Request, admin_db: Session = Depends(get_admin_db),
                   user: PlatformUserRecord = Depends(require_dataset_manager)):
     dataset_id = _check_id(dataset_id)
-    changes = meta.model_dump(exclude_unset=True)
+    changes = _resolve_owner(meta.model_dump(exclude_unset=True))
+    _require(changes, {})
+    changes.pop("publisher", None)                    # the publisher is who created the dataset
+    _licence_text(changes)
     _check_refs(changes)
     try:
         row = catalog_service.update_meta(dataset_id, changes)
@@ -182,8 +288,9 @@ def manage_update(dataset_id: str, meta: DatasetMeta, request: Request, admin_db
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     vs.invalidate(dataset_id)
-    _audit(admin_db, user, request, "dataset.update", dataset_id, {"fields": sorted(changes)})
-    return _row(dataset_id, row)
+    _audit(admin_db, user, request, "dataset.update", dataset_id,
+           {"fields": sorted(changes), **{k: changes[k] for k in ("visibility", "pipeline", "license_code") if k in changes}})
+    return _row(dataset_id, _owner_handles([row])[0])
 
 
 @router.put("/manage/{dataset_id}/status")
@@ -367,6 +474,8 @@ def manage_show_data(dataset_id: str, body: DatasetShowData, request: Request, a
         row = catalog_service.set_show_data(dataset_id, body.show)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     _audit(admin_db, user, request, "dataset.show_data_on" if body.show else "dataset.show_data_off", dataset_id)
     return _row(dataset_id, row)
 
@@ -378,6 +487,7 @@ def manage_metadata(dataset_id: str, _user: PlatformUserRecord = Depends(require
     if meta is None:
         raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' does not exist")
     meta["has_data"] = bool(meta.get("column_count"))
+    meta = _owner_handles([meta])[0]
     meta["columns"] = [_safe(c) for c in meta["columns"]]
     meta["post_count"] = catalog_service.post_count(dataset_id)
     try:                                       # what gisviz.duckdb itself says about the table
@@ -403,6 +513,37 @@ def manage_preview(dataset_id: str, limit: int = Query(50, ge=1, le=500),
     return JSONResponse(_store_guard(duckdb_service.preview, _check_id(dataset_id), limit))
 
 
+@router.post("/manage/{dataset_id}/ingest-key")
+def manage_ingest_key(dataset_id: str, request: Request, admin_db: Session = Depends(get_admin_db),
+                      user: PlatformUserRecord = Depends(require_dataset_manager)):
+    """A new ingest key for a stream dataset (the old one stops working). Returned ONCE; only its hash is kept."""
+    import hashlib
+    import secrets
+    dataset_id = _check_id(dataset_id)
+    ds = catalog_service.raw(dataset_id)
+    if ds is None:
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' does not exist")
+    if (ds.pipeline or "batch") != "stream":
+        raise HTTPException(status_code=409, detail="Only stream datasets take pushed rows (set the pipeline to stream)")
+    key = "gvk_" + secrets.token_hex(24)
+    catalog_service.set_ingest_key(dataset_id, hashlib.sha256(key.encode()).hexdigest())
+    _audit(admin_db, user, request, "dataset.ingest_key_rotated", dataset_id)
+    return {"dataset_id": dataset_id, "ingest_key": key,
+            "endpoint": f"/api/v0/datasets/{dataset_id}/stream", "header": "X-Ingest-Key"}
+
+
+@router.delete("/manage/{dataset_id}/ingest-key")
+def manage_ingest_key_revoke(dataset_id: str, request: Request, admin_db: Session = Depends(get_admin_db),
+                             user: PlatformUserRecord = Depends(require_dataset_manager)):
+    dataset_id = _check_id(dataset_id)
+    try:
+        catalog_service.set_ingest_key(dataset_id, None)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    _audit(admin_db, user, request, "dataset.ingest_key_revoked", dataset_id)
+    return {"dataset_id": dataset_id, "ingest_key": None}
+
+
 @router.get("/manage/sync")
 def manage_sync_status(_user: PlatformUserRecord = Depends(require_dataset_manager)):
     """Always 200, so the page can show the store's state, including "unreachable"."""
@@ -425,13 +566,15 @@ def public_rows(dataset_id: str, limit: int = Query(100, ge=1, le=200), offset: 
                 user=Depends(get_optional_current_user)):
     """Every column of the dataset, a page at a time, for the Data tab of a visual. Public when an
     admin switched show_data on; publishers and admins can always read it (to build posts)."""
-    from app.services.auth_service import PUBLISHING_ROLES
     dataset_id = _check_id(dataset_id)
     card = catalog_service.get(dataset_id, include_inactive=True)    # posts keep working after deactivation
-    if card is None:
+    ds = catalog_service.raw(dataset_id)
+    if card is None or ds is None:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    role = getattr(getattr(user, "role", None), "name", None)
-    if not card.get("show_data") and role not in (*PUBLISHING_ROLES, "admin"):
+    viewer = access_service.viewer_for(user)
+    if not access_service.can_view_dataset(viewer, ds):
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if not access_service.can_see_rows(viewer, ds):
         raise HTTPException(status_code=403, detail="The data of this dataset is not published")
     excl = "_gv_id, _gv_geom" if card.get("geometry_type") else "_gv_id"   # geometry stays internal
     rows = _store_guard(duckdb_service.query, dataset_id,
@@ -439,13 +582,60 @@ def public_rows(dataset_id: str, limit: int = Query(100, ge=1, le=200), offset: 
     cols = [c["column_name"] for c in catalog_service.get_columns(dataset_id)] or (list(rows[0].keys()) if rows else [])
     return JSONResponse({"dataset_id": dataset_id, "total_rows": card.get("row_count"), "offset": offset,
                          "limit": limit, "columns": cols, "rows": rows},
-                        headers={"Cache-Control": "public, max-age=300" if card.get("show_data") else "private, max-age=60"})
+                        headers={"Cache-Control": "public, max-age=300" if card.get("show_data") and ds.visibility != "private"
+                                 and ds.pipeline != "stream" else "private, max-age=30"})
+
+
+class StreamRows(BaseModel):
+    rows: list = Field(..., min_length=1, max_length=5000)
+
+
+INGEST_PER_MINUTE = int(os.getenv("STREAM_INGEST_PER_MINUTE", "120"))
+
+
+@router.post("/{dataset_id}/stream")
+def stream_ingest(dataset_id: str, body: StreamRows, x_ingest_key: Optional[str] = Header(None),
+                  authorization: Optional[str] = Header(None)):
+    """Machines push rows to a STREAM dataset with its ingest key (header X-Ingest-Key, or Authorization: Bearer).
+    Rows must use the dataset's column names; point data may send latitude/longitude or a GeoJSON `geometry`."""
+    import hashlib
+    import hmac as _hmac
+    from app.services.cache_service import cache_service
+    dataset_id = _check_id(dataset_id)
+    ds = catalog_service.raw(dataset_id)
+    key = x_ingest_key or ((authorization or "")[7:] if (authorization or "").lower().startswith("bearer ") else None)
+    if ds is None or not ds.ingest_key_hash or not key or not _hmac.compare_digest(
+            hashlib.sha256(key.encode()).hexdigest(), ds.ingest_key_hash):
+        raise HTTPException(status_code=401, detail="Invalid ingest key")
+    if (ds.pipeline or "batch") != "stream":
+        raise HTTPException(status_code=409, detail="This dataset is not a stream dataset")
+    if not ds.columns:
+        raise HTTPException(status_code=409, detail="Upload a first file to define the dataset's columns")
+    if cache_service.hit(f"gisviz:ingest:{dataset_id}", 60) > INGEST_PER_MINUTE:
+        raise HTTPException(status_code=429, detail=f"Too many pushes: at most {INGEST_PER_MINUTE} per minute")
+    res = _store_guard(duckdb_service.append, dataset_id, body.rows, ds.retention_rows)
+    catalog_service.record_ingest(dataset_id, res["rows"], res["data_version"])
+    vs.invalidate(dataset_id)
+    try:                                        # the feed / share images of live posts follow, at most every 10 minutes
+        from app.services.post_service import post_service
+        post_service.refresh_live_images(dataset_id)
+    except Exception as e:
+        print(f"[datasets] live image refresh skipped: {e}")
+    return {"dataset_id": dataset_id, "added": res["added"], "rows": res["rows"], "data_version": res["data_version"]}
 
 
 @router.get("/{dataset_id}")
-def catalog_detail(dataset_id: str):
+def catalog_detail(dataset_id: str, user=Depends(get_optional_current_user)):
+    viewer = access_service.viewer_for(user)
+    ds = catalog_service.raw(_check_id(dataset_id))
+    if ds is None or not access_service.can_view_dataset(viewer, ds):
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
     def run():
         card = vs.get_card(dataset_id)
+        card.pop("owner_user_id", None)
+        card["can_see_rows"] = access_service.can_see_rows(viewer, ds)
         cols = [_safe(c) for c in vs.get_columns(card["dataset_id"])]
         return {"dataset": card, "columns": cols, "post_count": catalog_service.post_count(card["dataset_id"])}
-    return JSONResponse(_guard(run), headers={"Cache-Control": "public, max-age=60"})
+    private = (ds.visibility or "public") == "private"
+    return JSONResponse(_guard(run), headers={"Cache-Control": "private, max-age=30" if private or user else "public, max-age=60"})

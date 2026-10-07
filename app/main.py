@@ -48,6 +48,8 @@ from app.api.v0.endpoints import regions as regions_endpoints
 from app.api.v0.endpoints import admin as admin_endpoints
 from app.api.v0.endpoints import support as support_endpoints
 from app.api.v0.endpoints import legal as legal_endpoints
+from app.api.v0.endpoints import access as access_endpoints
+from app.api.v0.endpoints import orgs as orgs_endpoints
 from app.services.auth_service import auth_service, get_optional_current_user
 import uuid
 
@@ -101,6 +103,11 @@ async def lifespan(app: FastAPI):
         dataset_sync.startup_check()
     except Exception as e:              # never block start-up on this check
         print(f"[dataset_sync] start-up check skipped: {type(e).__name__}: {e}", flush=True)
+    try:                                # analytics DB: daily stats captured every hour (SNAPSHOT_EVERY_SECONDS)
+        from app.analytics.snapshot import start_scheduler
+        start_scheduler()
+    except Exception as e:
+        print(f"[analytics] snapshot scheduler not started: {type(e).__name__}: {e}", flush=True)
     yield
     await redis_client.aclose()
     print("[FastAPICache] Redis connection closed")
@@ -136,9 +143,15 @@ def _upgrade_schemas() -> None:
         "ALTER TABLE posts ADD COLUMN IF NOT EXISTS backdrop JSONB",
         "CREATE INDEX IF NOT EXISTS ix_posts_region ON posts (region)",
         "CREATE INDEX IF NOT EXISTS ix_posts_views_count ON posts (views_count)",
+        # private posts + live posts (stream datasets); every existing post stays public / standard
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS visibility VARCHAR(10) NOT NULL DEFAULT 'public'",
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS post_type VARCHAR(10) NOT NULL DEFAULT 'standard'",
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS deactivated_by_dataset INTEGER NOT NULL DEFAULT 0",
+        "CREATE INDEX IF NOT EXISTS ix_posts_visibility ON posts (visibility)",
         "ALTER TABLE categories ADD COLUMN IF NOT EXISTS description TEXT",
         "ALTER TABLE categories ADD COLUMN IF NOT EXISTS theme_color VARCHAR(7)",
         "ALTER TABLE categories ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE categories ADD COLUMN IF NOT EXISTS banner JSONB",
         # the catalog lives in its own database, so any old foreign key from posts.dataset_id to a
         # datasets table in the posts database is dropped, whatever it was named
         # (fk_posts_dataset, posts_dataset_id_fkey, ...); the link is checked in code instead
@@ -160,6 +173,8 @@ def _upgrade_schemas() -> None:
     users_stmts = [
         # sessions: no expiry, ended by logout (revoked_tokens) or password change (token_version)
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0",
+        # individual / organisation accounts
+        "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS account_type VARCHAR(16) NOT NULL DEFAULT 'individual'",
     ]
     dataset_stmts = [
         "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS columns JSONB",
@@ -168,6 +183,21 @@ def _upgrade_schemas() -> None:
         "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS file_size_bytes BIGINT",
         "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS show_data INTEGER NOT NULL DEFAULT 0",
         "CREATE INDEX IF NOT EXISTS ix_datasets_region ON datasets (region)",
+        # private datasets, stream (live) pipelines, licensing, GDPR; every existing dataset stays public / batch
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS visibility VARCHAR(10) NOT NULL DEFAULT 'public'",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS owner_user_id UUID",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS pipeline VARCHAR(10) NOT NULL DEFAULT 'batch'",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS refresh_seconds INTEGER NOT NULL DEFAULT 60",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS retention_rows INTEGER",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS ingest_key_hash VARCHAR(64)",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS last_ingested_at TIMESTAMPTZ",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS license_code VARCHAR(40)",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS attribution TEXT",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS copyright_holder VARCHAR(255)",
+        "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS contains_personal_data INTEGER NOT NULL DEFAULT 0",
+        "CREATE INDEX IF NOT EXISTS ix_datasets_visibility ON datasets (visibility)",
+        "CREATE INDEX IF NOT EXISTS ix_datasets_pipeline ON datasets (pipeline)",
+        "CREATE INDEX IF NOT EXISTS ix_datasets_owner_user_id ON datasets (owner_user_id)",
         # two states only: active / inactive (older draft/hidden/retired rows become inactive)
         "ALTER TABLE datasets ALTER COLUMN status SET DEFAULT 'inactive'",
         "UPDATE datasets SET status = 'inactive' WHERE status NOT IN ('active', 'inactive') "
@@ -189,6 +219,112 @@ def _upgrade_schemas() -> None:
 
 
 _upgrade_schemas()
+
+
+def _category_banners() -> None:
+    """Every category gets its feed-banner scene (only missing / outdated ones are rebuilt)."""
+    from app.db.database import PostsSessionLocal
+    from app.services import banner_service
+    with PostsSessionLocal() as db:
+        if banner_service.ensure_all(db):
+            try:
+                from app.services.cache_service import cache_service
+                cache_service.delete("gisviz-cache:categories:list")
+            except Exception:
+                pass
+
+
+def _post_activity() -> None:
+    """Posts follow their dataset's active state (catalog_service.cascade_posts)."""
+    from app.services import catalog_service
+    n = catalog_service.sync_post_activity()
+    if n:
+        print(f"[posts] {n} post(s) switched on / off to match their dataset", flush=True)
+
+
+try:
+    _post_activity()
+except Exception as e:          # never block start-up
+    print(f"[posts] dataset activity sync skipped: {type(e).__name__}: {e}", flush=True)
+
+try:
+    _category_banners()
+except Exception as e:          # never block start-up
+    print(f"[categories] banner scenes skipped: {type(e).__name__}: {e}", flush=True)
+
+
+def _repair_post_images() -> None:
+    """In the background, shortly after start-up: posts whose image file is missing get it drawn again.
+    One worker does it (a 10-minute Redis lock)."""
+    import threading
+    import time as _t
+    from app.services.cache_service import cache_service
+    if os.getenv("REPAIR_POST_IMAGES", "1") != "1" or cache_service.hit("gisviz:repair-post-images", 600) > 1:
+        return
+
+    def run():
+        _t.sleep(int(os.getenv("REPAIR_POST_IMAGES_DELAY", "30")))
+        try:
+            from app.services.post_service import PostService
+            r = PostService().repair_missing_images()
+            if r["missing"]:
+                print(f"[posts] images: {r['missing']} missing, {r['fixed']} drawn again, {r['failed']} failed", flush=True)
+                if r["fixed"]:
+                    cache_service.delete_pattern("gisviz-cache:posts:*")
+        except Exception as e:
+            print(f"[posts] image repair skipped: {type(e).__name__}: {e}", flush=True)
+    threading.Thread(target=run, daemon=True, name="repair-post-images").start()
+
+
+try:
+    _repair_post_images()
+except Exception as e:          # never block start-up
+    print(f"[posts] image repair not started: {type(e).__name__}: {e}", flush=True)
+
+
+def _retire_old_analytics() -> None:
+    """One-time move to the slim analytics DB (idempotent, several workers safe):
+    1. views recorded in analytics.fact_post_view are copied into posts.post_views (same viewer hash,
+       posts.views_count already includes them);
+    2. the old star-schema tables nothing reads any more are dropped."""
+    from sqlalchemy import text
+    from app.db.models import OBSOLETE_ANALYTICS_TABLES
+    with analytics_engine.connect() as aconn:
+        aconn.execute(text("SELECT pg_advisory_lock(424243)"))
+        try:
+            has_views = aconn.execute(text("SELECT to_regclass('public.fact_post_view') IS NOT NULL")).scalar()
+            if has_views:
+                first = aconn.execute(text(
+                    "SELECT post_id, viewer_key, first_seen_timestamp FROM fact_post_view "
+                    "ORDER BY first_seen_timestamp NULLS LAST, post_id, viewer_key LIMIT 1")).first()
+                with posts_engine.begin() as pconn:
+                    done = first is None or pconn.execute(text(
+                        "SELECT 1 FROM post_views WHERE post_id = :p AND viewer_hash = :v LIMIT 1"),
+                        {"p": first.post_id, "v": first.viewer_key}).first() is not None
+                    if not done:
+                        rows = aconn.execute(text(
+                            "SELECT v.post_id, v.user_id, v.viewer_key, "
+                            "COALESCE(v.first_seen_timestamp, v.view_date::timestamptz) AS ts "
+                            "FROM fact_post_view v")).mappings().all()
+                        live = {r[0] for r in pconn.execute(text("SELECT post_id FROM posts"))}
+                        batch = [{"p": r["post_id"], "u": r["user_id"], "v": r["viewer_key"], "t": r["ts"]}
+                                 for r in rows if r["post_id"] in live]
+                        for i in range(0, len(batch), 5000):
+                            pconn.execute(text("INSERT INTO post_views (post_id, user_id, viewer_hash, viewed_timestamp) "
+                                               "VALUES (:p, :u, :v, :t)"), batch[i:i + 5000])
+                        print(f"[analytics] moved {len(batch)} views from fact_post_view to post_views", flush=True)
+            for t in OBSOLETE_ANALYTICS_TABLES:
+                aconn.execute(text(f'DROP TABLE IF EXISTS "{t}" CASCADE'))
+            aconn.commit()
+        finally:
+            aconn.execute(text("SELECT pg_advisory_unlock(424243)"))
+            aconn.commit()
+
+
+try:
+    _retire_old_analytics()
+except Exception as e:          # never block start-up; the old tables just stay until the next start
+    print(f"[analytics] retiring the old tables skipped: {type(e).__name__}: {e}", flush=True)
 
 
 # ── App — docs disabled at framework level, served manually below ─────────────
@@ -244,6 +380,8 @@ app.include_router(datasets_endpoints.router, prefix=f"{settings.API_VERSION_STR
 app.include_router(visuals_endpoints.router, prefix=f"{settings.API_VERSION_STR}/visuals",    tags=["Visuals"])
 app.include_router(regions_endpoints.router, prefix=f"{settings.API_VERSION_STR}/regions",    tags=["Regions"])
 app.include_router(seo.router,               prefix=f"{settings.API_VERSION_STR}/seo",        tags=["SEO"])
+app.include_router(access_endpoints.router,  prefix=f"{settings.API_VERSION_STR}/access",     tags=["Access & sharing"])
+app.include_router(orgs_endpoints.router,    prefix=f"{settings.API_VERSION_STR}/orgs",       tags=["Organisations"])
 
 # ── Admin-only API docs ───────────────────────────────────────────────────────
 # Both /docs and /redoc validate the JWT and check for the admin role before

@@ -31,9 +31,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from fastapi import Request
+
 from app.db.models import PlatformUserRecord
-from app.services import duckdb_service, visual_service as vs
-from app.services.auth_service import require_publisher
+from app.services import access_service, catalog_service, duckdb_service, visual_service as vs
+from app.services.auth_service import get_optional_current_user, require_publisher
 
 router = APIRouter()
 
@@ -51,6 +53,19 @@ def _guard(fn, *a, **kw):
 
 def _safe(d: dict) -> dict:
     return {k: vs._json_safe(v) for k, v in d.items()}
+
+
+def _usable(dataset_id: str, user) -> object:
+    """The dataset record if this publisher may build visuals from it (private: only who can see it)."""
+    ds = catalog_service.raw((dataset_id or "").strip().lower())
+    if ds is None or not access_service.can_view_dataset(access_service.viewer_for(user), ds):
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return ds
+
+
+def _signed(spec: dict, ds) -> dict:
+    """Spec for the publisher's live preview: private datasets get a data token in their URLs."""
+    return access_service.sign_spec(spec, ds.dataset_id) if (ds.visibility or "public") == "private" else spec
 
 
 @router.get("/catalog")
@@ -76,6 +91,8 @@ def visual_catalog(all: bool = Query(False)):
 
 @router.get("/datasets/{dataset_id}/suggest")
 def suggest(dataset_id: str, _user: PlatformUserRecord = Depends(require_publisher)):
+    _usable(dataset_id, _user)
+
     def run():
         info = vs.suggest(dataset_id)
         info["columns"] = [_safe(c) for c in info["columns"]]
@@ -91,7 +108,8 @@ def spec(
     z: Optional[str] = None, size: Optional[str] = None,
     _user: PlatformUserRecord = Depends(require_publisher),
 ):
-    return JSONResponse(_guard(vs.build_spec, dataset_id, viz, x, y, label_field, accent, z, size))
+    ds = _usable(dataset_id, _user)
+    return JSONResponse(_signed(_guard(vs.build_spec, dataset_id, viz, x, y, label_field, accent, z, size), ds))
 
 
 class SpecRequest(BaseModel):
@@ -109,18 +127,32 @@ class SpecRequest(BaseModel):
 @router.post("/datasets/{dataset_id}/spec")
 def spec_with_story(dataset_id: str, body: SpecRequest, _user: PlatformUserRecord = Depends(require_publisher)):
     """Same as GET /spec, plus the presentation options (the upload page's live preview)."""
-    return JSONResponse(_guard(vs.build_spec, dataset_id, body.viz, body.x, body.y, body.label_field, body.accent,
-                               body.z, body.size, False, body.color, body.story or {}))
+    ds = _usable(dataset_id, _user)
+    return JSONResponse(_signed(_guard(vs.build_spec, dataset_id, body.viz, body.x, body.y, body.label_field, body.accent,
+                                       body.z, body.size, False, body.color, body.story or {}), ds))
 
 
 @router.get("/datasets/{dataset_id}/data")
 def data(dataset_id: str, viz: Optional[str] = None, x: Optional[str] = None,
          y: Optional[str] = None, label_field: Optional[str] = None,
          z: Optional[str] = None, size: Optional[str] = None, color: Optional[str] = None,
-         part: Optional[str] = None):
+         part: Optional[str] = None, t: Optional[str] = None,
+         user: Optional[PlatformUserRecord] = Depends(get_optional_current_user)):
+    """Public datasets: anyone. Private datasets: a valid data token `t` (handed out with the post / spec to
+    viewers allowed to see it) or a signed-in viewer who can see the dataset."""
+    ds = catalog_service.raw((dataset_id or "").strip().lower())
+    if ds is None:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    private = (ds.visibility or "public") == "private"
+    if private and not access_service.verify_data_token(ds.dataset_id, t) \
+            and not access_service.can_view_dataset(access_service.viewer_for(user), ds):
+        raise HTTPException(status_code=404, detail="Dataset not found")
     params = {"viz": viz, "x": x, "y": y, "z": z, "size": size, "label_field": label_field, "color": color,
               "part": part if part == "series" else None}
     # deactivated datasets keep serving the posts already built on them
     body, hit = _guard(vs.payload_json, dataset_id, params, True)
+    live = (ds.pipeline or "batch") == "stream"
+    age = max(5, min(int(ds.refresh_seconds or 60), 300)) if live else 300
     return Response(body, media_type="application/json",
-                    headers={"Cache-Control": "public, max-age=300", "X-Cache": "HIT" if hit else "MISS"})
+                    headers={"Cache-Control": f"{'private' if private else 'public'}, max-age={age if not live else max(1, age // 2)}",
+                             "X-Cache": "HIT" if hit else "MISS"})

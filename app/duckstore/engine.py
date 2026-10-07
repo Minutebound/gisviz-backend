@@ -358,6 +358,82 @@ class Engine:
         info.pop("staged", None)
         return info
 
+    # ── stream datasets: append rows to the live table ────────────────────
+    MAX_APPEND = 5000
+
+    def append(self, code: str, rows: list, keep_last: Optional[int] = None) -> dict:
+        """Append rows (JSON objects keyed by the table's column names) to table <code>, in one transaction.
+        Geometry: a `geometry` GeoJSON object, or the table's latitude / longitude columns (point data).
+        keep_last drops the oldest rows beyond that many (a rolling window for live posts)."""
+        import json
+        self.check(code)
+        if not isinstance(rows, list) or not rows:
+            raise EngineError("Send a non-empty list of rows", 422)
+        if len(rows) > self.MAX_APPEND:
+            raise EngineError(f"At most {self.MAX_APPEND} rows per request", 413)
+        if not self.exists(code):
+            raise EngineError(f"No data loaded for {code}", 404)
+        cur = self._cursor()
+        try:
+            with self._write:
+                schema = cur.execute(f'DESCRIBE main."{code}"').fetchall()
+                types = {name: typ for name, typ, *_ in schema}
+                cols = [n for n in types if n not in ("_gv_id", "_gv_geom")]
+                has_geom = "_gv_geom" in types
+                low = {c.lower(): c for c in cols}
+                lat = next((low[c] for c in di.LAT if c in low), None)
+                lon = next((low[c] for c in di.LON if c in low), None)
+                allowed = set(cols) | ({"geometry"} if has_geom else set())
+                values = []
+                for i, row in enumerate(rows):
+                    if not isinstance(row, dict):
+                        raise EngineError(f"Row {i + 1} is not an object", 422)
+                    extra = set(row) - allowed
+                    if extra:
+                        raise EngineError(f"Row {i + 1}: unknown column(s) {', '.join(sorted(extra))[:200]}; "
+                                          f"columns are {', '.join(cols)[:300]}", 422)
+                    vals = [row.get(c) for c in cols]
+                    if has_geom:
+                        g = row.get("geometry")
+                        if isinstance(g, dict) and g.get("type"):
+                            geom = json.dumps(g, separators=(",", ":"))
+                        elif lat and lon and row.get(lat) is not None and row.get(lon) is not None:
+                            try:
+                                geom = json.dumps({"type": "Point", "coordinates": [float(row[lon]), float(row[lat])]},
+                                                  separators=(",", ":"))
+                            except (TypeError, ValueError):
+                                raise EngineError(f"Row {i + 1}: latitude / longitude must be numbers", 422)
+                        else:
+                            geom = None
+                        vals.append(geom)
+                    values.append(vals)
+                cur.execute("BEGIN TRANSACTION")
+                start = cur.execute(f'SELECT coalesce(max(_gv_id), 0) FROM main."{code}"').fetchone()[0]
+                names = ", ".join(['"_gv_id"', *[f'"{c}"' for c in cols], *(['"_gv_geom"'] if has_geom else [])])
+                marks = ", ".join(["?", *[f"CAST(? AS {types[c]})" for c in cols], *(["?"] if has_geom else [])])
+                try:
+                    cur.executemany(f'INSERT INTO main."{code}" ({names}) VALUES ({marks})',
+                                    [[start + i + 1, *v] for i, v in enumerate(values)])
+                except duckdb.Error as e:
+                    cur.execute("ROLLBACK")
+                    raise EngineError(f"Rows rejected: {str(e).splitlines()[0][:300]}", 422)
+                if keep_last:
+                    cur.execute(f'DELETE FROM main."{code}" WHERE _gv_id <= (SELECT max(_gv_id) FROM main."{code}") - ?',
+                                [int(keep_last)])
+                total = cur.execute(f'SELECT count(*) FROM main."{code}"').fetchone()[0]
+                version = f"s{int(total):x}-{int(start + len(values)):x}"
+                cur.execute(f"UPDATE {INTERNAL_SCHEMA}.tables SET rows = ?, data_version = ?, loaded_at = current_timestamp "
+                            "WHERE code = ?", [int(total), version, code])
+                cur.execute("COMMIT")
+        except duckdb.Error as e:
+            self._cleanup(cur, "")
+            if self._recover(e):
+                raise EngineError("The analytical store was restarted after an internal error; please retry", 503)
+            raise EngineError(f"Could not append: {str(e).splitlines()[0][:300]}", 400)
+        finally:
+            cur.close()
+        return {"code": code, "added": len(values), "rows": int(total), "data_version": version}
+
     @staticmethod
     def _cleanup(cur, new: str) -> None:
         try:

@@ -103,6 +103,22 @@ def _squarify(values: list[float], x: float, y: float, w: float, h: float):
     return [out[i] for i in range(len(values))]
 
 
+def _fill_top(fig, target: float) -> None:
+    """Every chart leaves a blank band above its plot (room for a legend, 14-20% of its area). On the square image
+    that band is the gap under the title: stretch the axes up until the highest one reaches `target` (a fraction
+    of the area's height). Text sizes do not change."""
+    axes = list(fig.axes)
+    if not axes:
+        return
+    top = max(a.get_position().y1 for a in axes)
+    if not (0.4 < top < target):
+        return
+    k = target / top
+    for a in axes:
+        p = a.get_position()
+        a.set_position([p.x0, p.y0 * k, p.width, p.height * k])
+
+
 def _draw_chart(fig, spec: dict, rows: list[dict], accent: str):
     x, y, kind = spec["x"], spec["y"], spec["chart_type"]
     ax = fig.add_axes([0.08, 0.14, 0.88, 0.66])
@@ -318,6 +334,7 @@ def _draw_map(fig, spec: dict, fc: dict, accent: str):
     cmap = LinearSegmentedColormap.from_list("gv", [_mix(accent, "#ffffff", 0.88), _mix(accent, "#ffffff", 0.55), accent, _mix(accent, "#000000", 0.45)])
     norm = Normalize(min(known), max(known)) if known and min(known) != max(known) else Normalize(0, 1)
     ax = fig.add_axes([0.02, 0.02, 0.96, 0.84])
+    ax.set_anchor("N")                       # a map narrower than its box sits right under the header, not centred
     ax.set_facecolor("none")
     ax.axis("off")
     legend = {"field": field, "lo": min(known), "hi": max(known)} if known else None
@@ -680,7 +697,7 @@ def _draw_extra(fig, ax, spec: dict, rows: list[dict], accent: str) -> bool:
 
 # ═════════════════════════════════ the poster image ═════════════════════════════════
 # One square PNG per post (feed card, thumbnails, link previews): the whole poster as readers see it — background
-# colour + texture, eyebrow, title in the poster font, subtitle, the chart / map with its legend, the GISViz mark and
+# colour + texture, title in the poster font, subtitle, the chart / map with its legend, the GISViz mark and
 # the "(Source: …)" line — drawn at 80% of the image with a margin around it. Block offsets from the poster editor
 # (posts.backdrop.layout, % of the poster width) are applied as on the page. Maps are drawn without street tiles.
 
@@ -830,10 +847,8 @@ def render_poster(*, title: str, spec: dict, payload: Any, design: dict | None =
             xh = (X0 + P / 2 if center else X0 + pad) + ox
             ha = "center" if center else "left"
             mono = FontProperties(family="DejaVu Sans Mono", weight="bold")
-            if eyebrow:
-                fig.text(fx(xh), fy(y), eyebrow.upper()[:70], fontproperties=mono, fontsize=pt(12 * k), color=accent,
-                         ha=ha, va="top")
-                y += 24 * k
+            # (no category / region line above the title on the image: the title starts the poster; `eyebrow` is
+            # still accepted so existing callers keep working)
             tprop = _title_font(font_code)
             size = 62 * k * float(d.get("title_size") or 1.0)
             text = (title or "Untitled").strip()
@@ -882,7 +897,7 @@ def render_poster(*, title: str, spec: dict, payload: Any, design: dict | None =
 
             # the chart / map: 90% of the poster width, between header and footer
             vx, vy = off("visual")
-            top = header_bottom + 14 * k
+            top = header_bottom + 6 * k
             bottom = fb - foot_h - 20 * k
             cw, ch = P * 0.90, max(120.0, bottom - top)
             cx, cy = X0 + P * 0.05 + vx, top + vy
@@ -893,8 +908,10 @@ def render_poster(*, title: str, spec: dict, payload: Any, design: dict | None =
             legend = None
             if spec.get("kind") == "map":
                 legend = _draw_map(sub, spec, payload, accent)
+                _fill_top(sub, 0.97)       # up to the title block; the colour key sits over the map's top right, as on the page
             else:
                 _draw_chart(sub, spec, payload, accent)
+                _fill_top(sub, 0.97)
 
             # map colour key, top right of the map (five steps of the post colour, as on the page)
             if legend:
