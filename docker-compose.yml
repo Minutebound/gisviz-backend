@@ -281,6 +281,8 @@ services:
       # No Docker volume used. Files persist across redeploys because
       # git clean -fd never touches uploads/ (it is gitignored).
       - ./uploads:/app/uploads
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
     depends_on:
       users-db:
         condition: service_healthy

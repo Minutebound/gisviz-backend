@@ -167,12 +167,15 @@ def _draw_chart(fig, spec: dict, rows: list[dict], accent: str):
 
     if kind == "bubble":
         s_key = spec["size"]
-        pts = [(_num(r.get(x)), _num(r.get(y)), _num(r.get(s_key))) for r in rows]
-        pts = [p for p in pts if None not in p]
+        pts, groups = _xy_points(spec, rows, x, y, accent, s_key)
         if pts:
             lo, hi = min(p[2] for p in pts), max(p[2] for p in pts)
-            sizes = [40 + 900 * ((p[2] - lo) / ((hi - lo) or 1)) for p in pts]
-            ax.scatter([p[0] for p in pts], [p[1] for p in pts], s=sizes, color=accent, alpha=0.55, edgecolors=accent)
+            sizes = [30 + 1800 * ((p[2] - lo) / ((hi - lo) or 1)) for p in pts]
+            order = sorted(range(len(pts)), key=lambda i: -sizes[i])         # big bubbles behind the small ones
+            ax.scatter([pts[i][0] for i in order], [pts[i][1] for i in order], s=[sizes[i] for i in order],
+                       c=[pts[i][3] for i in order], alpha=0.55, edgecolors=[pts[i][3] for i in order], linewidths=0.8)
+            _xy_finish(ax, spec, pts)
+            _legend(ax, groups)
         ax.set_xlabel(f"{x}  (bubble size = {s_key})", color=SOFT, fontsize=10); ylab()
         return
 
@@ -182,7 +185,11 @@ def _draw_chart(fig, spec: dict, rows: list[dict], accent: str):
         return
 
     if kind == "scatter":
-        ax.scatter([_num(p[0]) for p in pts], [p[1] for p in pts], s=28, color=accent, alpha=0.75, edgecolors="none")
+        xy, groups = _xy_points(spec, rows, x, y, accent)
+        if xy:
+            ax.scatter([p[0] for p in xy], [p[1] for p in xy], s=28, c=[p[3] for p in xy], alpha=0.75, edgecolors="none")
+            _xy_finish(ax, spec, xy)
+            _legend(ax, groups)
         ax.set_xlabel(x, color=SOFT, fontsize=10); ylab()
         return
 
@@ -288,6 +295,102 @@ def _ref_values(spec: dict, vals: list):
         if isinstance(v, (int, float)):
             out.append((float(v), r.get("label") or "", r.get("mode") or "line"))
     return out
+
+
+def _xy_points(spec: dict, rows: list, x: str, y: str, accent: str, size_key: str | None = None):
+    """Drawable scatter / bubble points as (x, y, size, colour, group); a log axis drops values <= 0.
+    The colour of a class is the publisher's choice, else the next palette colour (same rule as the web chart)."""
+    by = spec.get("color_by")
+    chosen = spec.get("colors") or {}
+    free = [c for c in [accent, *PALETTE] if c not in chosen.values()] or [accent]
+    log_x, log_y = spec.get("x_scale") == "log", spec.get("y_scale") == "log"
+    seen: dict[str, str] = {}
+    out = []
+    for r in rows:
+        a, b = _num(r.get(x)), _num(r.get(y))
+        sz = _num(r.get(size_key)) if size_key else 1.0
+        if a is None or b is None or sz is None or (log_x and a <= 0) or (log_y and b <= 0):
+            continue
+        g = str(r.get(by)) if by and r.get(by) is not None else ""
+        if by and g and g not in seen:
+            seen[g] = chosen.get(g) or free[len([k for k in seen if k not in chosen]) % len(free)]
+        out.append((a, b, sz, seen.get(g, accent), g))
+    return out, list(seen.items())
+
+
+def _stat(vals: list[float], stat: str, log: bool = False):
+    """mean / median / mode of a list of numbers. The mode is the most repeated value when one clearly repeats
+    (3+ times and 5%+ of the values: counts, ratings, ages), else the middle of the fullest bin (Sturges' rule;
+    bins in log space on a log axis) so a coincidental duplicate in continuous data is not called the mode."""
+    import math
+    if not vals:
+        return None
+    if stat == "mean":
+        return sum(vals) / len(vals)
+    sv = sorted(vals)
+    if stat == "median":
+        m = len(sv) // 2
+        return sv[m] if len(sv) % 2 else (sv[m - 1] + sv[m]) / 2
+    counts: dict[float, int] = {}
+    for v in sv:
+        counts[v] = counts.get(v, 0) + 1
+    top = max(counts.values())
+    if top >= max(3, 0.05 * len(sv)):
+        return min(v for v, c in counts.items() if c == top)
+    pts = [math.log10(v) for v in sv] if log and sv[0] > 0 else sv
+    lo, hi = pts[0], pts[-1]
+    if hi == lo:
+        return sv[0]
+    n = max(1, math.ceil(math.log2(len(pts))) + 1)
+    step = (hi - lo) / n
+    bins = [0] * n
+    for v in pts:
+        bins[min(n - 1, int((v - lo) / step))] += 1
+    mid = lo + (bins.index(max(bins)) + 0.5) * step
+    return 10 ** mid if pts is not sv else mid
+
+
+def _xy_finish(ax, spec: dict, pts: list):
+    """Log axes, then the publisher's measure lines (mean / median / mode / fixed) with optional shading."""
+    from matplotlib.ticker import FuncFormatter
+    fmt = FuncFormatter(lambda v, _p: _fmt(v))
+    if spec.get("x_scale") == "log":
+        ax.set_xscale("log")
+        ax.xaxis.set_major_formatter(fmt)
+    if spec.get("y_scale") == "log":
+        ax.set_yscale("log")
+        ax.yaxis.set_major_formatter(fmt)
+    ax.margins(0.04)
+    for r in spec.get("reference_lines") or []:
+        axis = "x" if r.get("axis") == "x" else "y"
+        vals = [p[0] if axis == "x" else p[1] for p in pts]
+        v = r.get("value")
+        if r.get("stat"):
+            v = _stat(vals, r["stat"], spec.get(f"{axis}_scale") == "log")
+        if not isinstance(v, (int, float)) or v != v or (spec.get(f"{axis}_scale") == "log" and v <= 0):
+            continue
+        label = (r.get("label") or r.get("stat") or "").strip()
+        text = (f"{label}: {_fmt(v)}" if label else _fmt(v)) if r.get("stat") else (label or _fmt(v))   # a fixed value is its own label
+        if axis == "y":
+            lo, hi = ax.get_ylim()
+            if r.get("shade") == "below":
+                ax.axhspan(lo, v, color=ACCENT, alpha=0.10, lw=0, zorder=0)
+            elif r.get("shade") == "above":
+                ax.axhspan(v, hi, color=ACCENT, alpha=0.10, lw=0, zorder=0)
+            ax.axhline(v, color=INK, lw=1.1, ls=(0, (5, 4)), alpha=0.8, zorder=1)
+            ax.annotate(text, (0.995, v), xycoords=("axes fraction", "data"), ha="right", va="bottom",
+                        fontsize=9, color=INK, xytext=(0, 3), textcoords="offset points")
+            ax.set_ylim(lo, hi)
+        else:
+            lo, hi = ax.get_xlim()
+            if r.get("shade") == "below":
+                ax.axvspan(lo, v, color=ACCENT, alpha=0.10, lw=0, zorder=0)
+            elif r.get("shade") == "above":
+                ax.axvspan(v, hi, color=ACCENT, alpha=0.10, lw=0, zorder=0)
+            ax.axvline(v, color=INK, lw=1.1, ls=(0, (5, 4)), alpha=0.8, zorder=1)
+            ax.annotate(text, (v, 0.995), xycoords=("data", "axes fraction"), ha="left", va="top",
+                        fontsize=9, color=INK, xytext=(4, 0), textcoords="offset points")
+            ax.set_xlim(lo, hi)
 
 
 def _legend(ax, groups):

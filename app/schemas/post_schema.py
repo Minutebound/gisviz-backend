@@ -55,13 +55,19 @@ class VisualParams(BaseModel):
     subtitle: Optional[str] = None
     y_label: Optional[str] = None                      # friendly name of the measure
     colors: Optional[dict] = None                      # {group: "#rrggbb"}
-    reference_lines: Optional[List[dict]] = None       # [{"value"|"stat": ..., "label": ..., "mode": "line"|"divider"}]
+    # measures drawn over the chart: [{"value"|"stat": mean|median|mode, "label": ..., "mode": "line"|"divider",
+    #                                   "axis": "x"|"y", "shade": "below"|"above"}]
+    reference_lines: Optional[List[dict]] = None
     filter_default: Optional[List[str]] = None         # labels pre-selected in the post page's filter (None = all)
     show_labels: Optional[bool] = None                 # labels drawn on the map / points from the start (reader can toggle)
+    x_scale: Optional[str] = None                      # scatter / bubble axes: "linear" (default) or "log"
+    y_scale: Optional[str] = None
+    show_summary: Optional[bool] = None                # scatter / bubble: a mean / median / mode strip under the chart
 
     def story(self) -> dict:
         return {k: getattr(self, k) for k in ("title", "subtitle", "y_label", "colors", "reference_lines",
-                                              "filter_default", "show_labels", "visual_type") if getattr(self, k) is not None}
+                                              "filter_default", "show_labels", "visual_type",
+                                              "x_scale", "y_scale", "show_summary") if getattr(self, k) is not None}
 
 
 class PostPayload(BaseModel):

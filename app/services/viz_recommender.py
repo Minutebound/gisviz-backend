@@ -60,8 +60,8 @@ VIZ_REGISTRY: dict[str, dict] = {
     "circle_packing": _v("Circular packing", "chart", ["x", "y"], ["z"], count=True, x_="Groups", z="Inside (second level)"),
     "dendrogram":     _v("Dendrogram", "chart", ["x", "z"], ["y"], count=True, x_="Parent", z="Child"),
     # correlation
-    "scatter":        _v("Scatter plot", "chart", ["x", "y"], ["label_field"], x="num"),
-    "bubble":         _v("Bubble chart", "chart", ["x", "y", "size"], ["label_field"], x="num"),
+    "scatter":        _v("Scatter plot", "chart", ["x", "y"], ["label_field", "color"], x="num", color="Colour by (class)"),
+    "bubble":         _v("Bubble chart", "chart", ["x", "y", "size"], ["label_field", "color"], x="num", color="Colour by (class)"),
     "heatmap":        _v("Heatmap (grid)", "chart", ["x", "y", "z"], count=True, z="Rows"),
     "correlogram":    _v("Correlogram", "chart", ["y"], x="any", y="Any measure (all are compared)"),
     "connected_scatter": _v("Connected scatter", "chart", ["x", "y", "z"], x="num", z="Order (time)"),

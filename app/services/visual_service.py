@@ -263,7 +263,9 @@ LABEL_FILTER_VIZ = ("ranked_columns", "bar", "hbar", "line", "area", "donut", "p
                     "circle_packing", "dendrogram", "stacked_area", "streamgraph", "connected_scatter",
                     "sankey", "chord", "network", "arc_diagram", "edge_bundling")
 SERIES_FILTER = ("stacked_area", "streamgraph", "radar", "connected_scatter")
-REF_VIZ = ("bar", "hbar", "lollipop")
+XY_VIZ = ("scatter", "bubble")                      # numeric x and y: log axes, measure lines on either axis
+REF_VIZ = ("bar", "hbar", "lollipop", *XY_VIZ)
+REF_STATS = ("mean", "median", "mode")
 MAP_STYLE = {"map_heat": "heat", "bubble_map": "bubble", "hexbin_map": "hexbin", "cartogram": "cartogram",
              "connection_map": "connection"}
 
@@ -299,17 +301,29 @@ def _story(story: dict, p: dict) -> dict:
         if not isinstance(r, dict):
             continue
         ref = {"label": _text(r.get("label"), 60) or "", "mode": "divider" if r.get("mode") == "divider" else "line"}
-        if r.get("stat") in ("mean", "median"):
+        if r.get("stat") in REF_STATS:
             ref["stat"] = r["stat"]
-        elif isinstance(r.get("value"), (int, float)):
+        elif isinstance(r.get("value"), (int, float)) and not isinstance(r.get("value"), bool):
             ref["value"] = float(r["value"])
         else:
-            raise VisualError("A reference line needs a value or a statistic (mean / median)", 400)
+            raise VisualError("A reference line needs a value or a statistic (mean / median / mode)", 400)
+        if p["viz"] in XY_VIZ:                                   # scatter / bubble: a line on either axis, optional shading
+            ref["axis"] = "x" if r.get("axis") == "x" else "y"
+            if r.get("shade") in ("below", "above"):
+                ref["shade"] = r["shade"]
         refs.append(ref)
     if refs:
         if p["viz"] not in REF_VIZ:
-            raise VisualError("Reference lines are available for bar and lollipop charts", 400)
+            raise VisualError("Reference lines are available for bar, lollipop, scatter and bubble charts", 400)
         out["reference_lines"] = refs
+    if p["kind"] == "chart" and p["viz"] in XY_VIZ:
+        for k in ("x_scale", "y_scale"):                         # log axes: spread data that spans orders of magnitude
+            if story.get(k) == "log":
+                out[k] = "log"
+        if story.get("show_summary") is True:
+            out["show_summary"] = True
+    if story.get("show_labels") is True and (p["kind"] == "map" or p["viz"] in XY_VIZ):
+        out["show_labels"] = True                                # names drawn from the start; readers can switch them off
     # labels the reader can filter by (dropdown on the post page); the publisher may pre-select some
     field = p["x"] if p["kind"] == "chart" else (p["label_field"] or None)
     if p["kind"] == "chart" and p["viz"] in SERIES_FILTER and p.get("z"):
@@ -400,12 +414,16 @@ def chart_rows(p: dict) -> list[dict]:
     if extra is not None:
         return [{k: _json_safe(v) for k, v in r.items()} for r in extra]
 
-    if viz == "scatter":                       # raw rows: x, y
-        sel = ", ".join(q(c) for c in [x] + [f for f in fields if f != x])
+    if viz == "scatter":                       # raw rows: x, y (+ a label and a class column when chosen)
+        keep = list(dict.fromkeys([x] + [f for f in fields if f != x]
+                                  + ([p["label_field"]] if p.get("label_field") else [])
+                                  + ([p["color"]] if p.get("color") else [])))
+        sel = ", ".join(q(c) for c in keep)
         rows = run(f"SELECT {sel} FROM {table} WHERE {q(x)} IS NOT NULL AND {q(y)} IS NOT NULL LIMIT {MAX_CHART_ROWS}")
 
-    elif viz == "bubble":                      # raw rows: x, y, size (+ a label when there is one)
-        keep = [x, y, p["size"]] + ([p["label_field"]] if p.get("label_field") else [])
+    elif viz == "bubble":                      # raw rows: x, y, size (+ a label and a class column when chosen)
+        keep = [x, y, p["size"]] + ([p["label_field"]] if p.get("label_field") else []) \
+            + ([p["color"]] if p.get("color") else [])
         keep = list(dict.fromkeys(keep))
         rows = run(
             f"SELECT {', '.join(q(c) for c in keep)} FROM {table} "
