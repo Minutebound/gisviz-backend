@@ -822,11 +822,11 @@ SEED_VISUAL_TYPES = [
       "Every individual point visible; small to medium datasets.", "Thousands of points (overplotting).", _N),
 
     # Correlation
-    _vt("scatter", "Scatter plot", "correlation", "chart", {"x": "numeric", "y": "numeric", "label?": "any"},
-      "Relationship between two numeric variables; spot clusters and outliers.", "One variable is categorical.", _L,
+    _vt("scatter", "Scatter plot", "correlation", "chart", {"x": "numeric", "y": "numeric", "label?": "any", "color?": "categorical"},
+      "Relationship between two numeric variables; spot clusters and outliers. Colour by a class column; log axes and mean / median / mode lines are available.", "One variable is categorical.", _L,
       ("tooltip", "label_filter", "zoom"), legacy="scatter"),
-    _vt("bubble", "Bubble chart", "correlation", "chart", {"x": "numeric", "y": "numeric", "size": "numeric", "label?": "any"},
-      "Three numeric variables (the third as size).", "Precise reading of the size variable matters.", _L,
+    _vt("bubble", "Bubble chart", "correlation", "chart", {"x": "numeric", "y": "numeric", "size": "numeric", "label?": "any", "color?": "categorical"},
+      "Three numeric variables (the third as size). Colour by a class column; log axes and mean / median / mode lines are available.", "Precise reading of the size variable matters.", _L,
       ("tooltip", "label_filter", "time_play"), legacy="bubble"),
     _vt("heatmap", "Heatmap (grid)", "correlation", "chart", {"x": "categorical", "z": "categorical", "y": "numeric"},
       "A measure across two categories (e.g. weekday × hour, country × year).", "Exact values must be compared.", _L,
