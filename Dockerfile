@@ -6,7 +6,8 @@ FROM python:3.11-slim AS base
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
@@ -47,10 +48,15 @@ ENV APP_ENV=development
 
 RUN pip install --no-cache /app/wheels/*
 
+# poster image title fonts (SIL OFL, google/fonts) -> /app/fonts, read by app/services/visual_image.py
+COPY scripts/fetch_fonts.py /tmp/fetch_fonts.py
+RUN python /tmp/fetch_fonts.py /app/fonts
+
 COPY alembic.ini .
 COPY alembic/ ./alembic/
+COPY app ./app
 
-RUN mkdir -p /app/uploads
+RUN mkdir -p /app/uploads /app/duckdb
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
 
@@ -71,17 +77,27 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload
 FROM base AS prod
 
 ENV APP_ENV=production
+# matplotlib (feed preview images) needs a writable config/cache dir for the non-root user
+ENV MPLCONFIGDIR=/tmp/mpl
 
 RUN addgroup --system gisvizgroup && adduser --system --group gisvizuser
 
 COPY --from=builder /app/wheels /wheels
 RUN pip install --no-cache /wheels/*
 
+# poster image title fonts (SIL OFL, google/fonts) -> /app/fonts, read by app/services/visual_image.py
+COPY scripts/fetch_fonts.py /tmp/fetch_fonts.py
+RUN python /tmp/fetch_fonts.py /app/fonts
+
 COPY --chown=gisvizuser:gisvizgroup ./app /app/app
 COPY --chown=gisvizuser:gisvizgroup alembic.ini .
 COPY --chown=gisvizuser:gisvizgroup alembic/ ./alembic/
 
-RUN mkdir -p /app/uploads && chown -R gisvizuser:gisvizgroup /app/uploads
+# /app/duckdb (gisviz.duckdb, used by the duckdb service) is a named volume; creating it here, owned by
+# the app user, makes a new volume inherit that ownership so the service can write it.
+RUN mkdir -p /app/uploads /app/duckdb && chown -R gisvizuser:gisvizgroup /app/uploads /app/duckdb \
+    && chmod -R a+rX /app/app /app/alembic /app/fonts \
+    && test -f /app/app/duckstore/server.py && test -f /app/app/main.py
 
 USER gisvizuser
 

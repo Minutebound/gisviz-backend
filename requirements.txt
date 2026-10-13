@@ -23,6 +23,7 @@ pydantic-settings==2.2.1
 # ==========================================
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+bcrypt==4.0.1              # passlib 1.7.4 breaks with bcrypt 4.1+/5.x (login errors); keep pinned
 
 # ==========================================
 # Caching
@@ -38,3 +39,19 @@ Pillow>=10.3.0
 # In-process nightly scheduler (only needed if ENABLE_SCHEDULER=1)
 apscheduler==3.10.4
  
+
+# ==========================================
+# DuckDB serving store + server-side preview images
+# ==========================================
+duckdb>=1.3,<2          # >=1.3 for allowed_directories (sandboxed file access)
+matplotlib>=3.8.0
+
+# API -> DuckDB service client
+httpx>=0.27
+
+# Upload conversion in the DuckDB service: any common tabular/GIS format -> Parquet (+ WGS84 geometry)
+pyarrow>=16
+pyogrio>=0.10          # bundles GDAL: Shapefile, GeoPackage, KML/KMZ, GPX, FlatGeobuf, GML, TopoJSON, DXF, FileGDB, XLSX, ODS
+shapely>=2.0
+pyproj>=3.6
+xlrd>=2.0              # legacy .xls

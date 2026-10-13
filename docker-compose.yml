@@ -1,3 +1,11 @@
+# ──────────────────────────────────────────────────────────────────────
+# Two env files (both gitignored), each loaded through env_file: on the services that need it.
+# No --env-file flag is needed:   docker compose up --build -d
+#   .env.database  DB users/passwords/names + pgAdmin login  -> db containers, pgadmin
+#   .env.backend   FastAPI settings (JWT, DB URLs, Redis, SMTP...) -> api container
+# Postgres images only understand POSTGRES_*, so each db container maps its own
+# <PREFIX>_DB_* variables to POSTGRES_* in a tiny entrypoint wrapper.
+# ──────────────────────────────────────────────────────────────────────
 services:
 
   # ────────────────────────────────────────────────────────
@@ -9,14 +17,18 @@ services:
     restart: always
     ports:
       - "5433:5432"
-    environment:
-      POSTGRES_USER:     "${USERS_DB_USER}"
-      POSTGRES_PASSWORD: "${USERS_DB_PASSWORD}"
-      POSTGRES_DB:       "${USERS_DB_NAME}"
+    env_file:
+      - .env.database
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        export POSTGRES_USER="$$USERS_DB_USER" POSTGRES_PASSWORD="$$USERS_DB_PASSWORD" POSTGRES_DB="$$USERS_DB_NAME";
+        exec docker-entrypoint.sh postgres
     volumes:
       - users-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${USERS_DB_USER} -d ${USERS_DB_NAME}"]
+      test: ["CMD-SHELL", "pg_isready -U $$USERS_DB_USER -d $$USERS_DB_NAME"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -32,14 +44,18 @@ services:
     restart: always
     ports:
       - "5434:5432"
-    environment:
-      POSTGRES_USER:     "${POSTS_DB_USER}"
-      POSTGRES_PASSWORD: "${POSTS_DB_PASSWORD}"
-      POSTGRES_DB:       "${POSTS_DB_NAME}"
+    env_file:
+      - .env.database
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        export POSTGRES_USER="$$POSTS_DB_USER" POSTGRES_PASSWORD="$$POSTS_DB_PASSWORD" POSTGRES_DB="$$POSTS_DB_NAME";
+        exec docker-entrypoint.sh postgres
     volumes:
       - posts-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTS_DB_USER} -d ${POSTS_DB_NAME}"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTS_DB_USER -d $$POSTS_DB_NAME"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -55,14 +71,18 @@ services:
     restart: always
     ports:
       - "5435:5432"
-    environment:
-      POSTGRES_USER:     "${ANALYTICS_DB_USER}"
-      POSTGRES_PASSWORD: "${ANALYTICS_DB_PASSWORD}"
-      POSTGRES_DB:       "${ANALYTICS_DB_NAME}"
+    env_file:
+      - .env.database
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        export POSTGRES_USER="$$ANALYTICS_DB_USER" POSTGRES_PASSWORD="$$ANALYTICS_DB_PASSWORD" POSTGRES_DB="$$ANALYTICS_DB_NAME";
+        exec docker-entrypoint.sh postgres
     volumes:
       - analytics-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${ANALYTICS_DB_USER} -d ${ANALYTICS_DB_NAME}"]
+      test: ["CMD-SHELL", "pg_isready -U $$ANALYTICS_DB_USER -d $$ANALYTICS_DB_NAME"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -78,14 +98,70 @@ services:
     restart: always
     ports:
       - "5436:5432"
-    environment:
-      POSTGRES_USER:     "${ADMIN_DB_USER}"
-      POSTGRES_PASSWORD: "${ADMIN_DB_PASSWORD}"
-      POSTGRES_DB:       "${ADMIN_DB_NAME}"
+    env_file:
+      - .env.database
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        export POSTGRES_USER="$$ADMIN_DB_USER" POSTGRES_PASSWORD="$$ADMIN_DB_PASSWORD" POSTGRES_DB="$$ADMIN_DB_NAME";
+        exec docker-entrypoint.sh postgres
     volumes:
       - admin-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${ADMIN_DB_USER} -d ${ADMIN_DB_NAME}"]
+      test: ["CMD-SHELL", "pg_isready -U $$ADMIN_DB_USER -d $$ADMIN_DB_NAME"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gisviz-network
+
+  # ────────────────────────────────────────────────────────
+  # 4b. Datasets DB (catalog of the datasets: code, details, status, column profile)
+  # ────────────────────────────────────────────────────────
+  datasets-db:
+    image: postgres:15-alpine
+    container_name: gisviz-datasets-db
+    restart: always
+    ports:
+      - "127.0.0.1:5437:5432"
+    env_file:
+      - .env.database
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        export POSTGRES_USER="$$DATASETS_DB_USER" POSTGRES_PASSWORD="$$DATASETS_DB_PASSWORD" POSTGRES_DB="$$DATASETS_DB_NAME";
+        exec docker-entrypoint.sh postgres
+    volumes:
+      - datasets-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$DATASETS_DB_USER -d $$DATASETS_DB_NAME"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gisviz-network
+
+  # Shared reference data (regions, ...): MISC_DATABASE_URL
+  misc-db:
+    image: postgres:15-alpine
+    container_name: gisviz-misc-db
+    restart: always
+    ports:
+      - "127.0.0.1:5438:5432"
+    env_file:
+      - .env.database
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        export POSTGRES_USER="$$MISC_DB_USER" POSTGRES_PASSWORD="$$MISC_DB_PASSWORD" POSTGRES_DB="$$MISC_DB_NAME";
+        exec docker-entrypoint.sh postgres
+    volumes:
+      - misc-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$MISC_DB_USER -d $$MISC_DB_NAME"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -135,10 +211,31 @@ services:
     image: dpage/pgadmin4:latest
     container_name: gisviz-pgadmin
     restart: always
+    env_file:
+      - .env.database
+    # Pre-registers the 4 databases in pgAdmin (first start of an empty pgadmin-data volume only).
+    # pgAdmin asks for each DB password once; tick "Save password" to remember it.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        export PGADMIN_DEFAULT_EMAIL="$$PGADMIN_EMAIL" PGADMIN_DEFAULT_PASSWORD="$$PGADMIN_PASSWORD"
+        cat > /tmp/servers.json <<EOF
+        {"Servers": {
+          "1": {"Name": "gisviz-users-db", "Group": "GisViz", "Host": "users-db", "Port": 5432,
+            "MaintenanceDB": "$$USERS_DB_NAME", "Username": "$$USERS_DB_USER", "SSLMode": "prefer"},
+          "2": {"Name": "gisviz-posts-db", "Group": "GisViz", "Host": "posts-db", "Port": 5432,
+            "MaintenanceDB": "$$POSTS_DB_NAME", "Username": "$$POSTS_DB_USER", "SSLMode": "prefer"},
+          "3": {"Name": "gisviz-analytics-db", "Group": "GisViz", "Host": "analytics-db", "Port": 5432,
+            "MaintenanceDB": "$$ANALYTICS_DB_NAME", "Username": "$$ANALYTICS_DB_USER", "SSLMode": "prefer"},
+          "4": {"Name": "gisviz-admin-db", "Group": "GisViz", "Host": "admin-db", "Port": 5432,
+            "MaintenanceDB": "$$ADMIN_DB_NAME", "Username": "$$ADMIN_DB_USER", "SSLMode": "prefer"}
+        }}
+        EOF
+        export PGADMIN_SERVER_JSON_FILE=/tmp/servers.json
+        exec /entrypoint.sh
     environment:
-      PGADMIN_DEFAULT_EMAIL:    "${PGADMIN_EMAIL}"
-      PGADMIN_DEFAULT_PASSWORD: "${PGADMIN_PASSWORD}"
-      PGADMIN_LISTEN_PORT:      "80"
+      PGADMIN_LISTEN_PORT: "80"
     ports:
       - "5050:80"
     volumes:
@@ -162,22 +259,30 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: prod
+      # prod: real SMTP, code baked in, non-root, 4 workers (the VPS).
+      # On your computer docker-compose.override.yml switches this to dev (OTP printed in the log, --reload).
+      target: dev
     container_name: gisviz-api
     restart: always
     env_file:
-      - .env.backend
+      - path: .env.backend
+        required: true
     ports:
       # Dockerfile CMD: uvicorn ... --port 8001
       # Caddy: reverse_proxy localhost:8001
       # Format: "host_port:container_port"
       - "8001:8001"
     volumes:
+      # App code from the repo. Required for the dev target (uvicorn --reload watches it);
+      # on the VPS it simply mounts the same checked-out code (restart the api after git pull).
+      - ./app:/app/app
       # Bind mount — uploads live in the repo folder on the VPS host at
       # /srv/gisviz/gisviz-backend/uploads/
       # No Docker volume used. Files persist across redeploys because
       # git clean -fd never touches uploads/ (it is gitignored).
       - ./uploads:/app/uploads
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
     depends_on:
       users-db:
         condition: service_healthy
@@ -186,6 +291,12 @@ services:
       analytics-db:
         condition: service_healthy
       admin-db:
+        condition: service_healthy
+      datasets-db:
+        condition: service_healthy
+      misc-db:
+        condition: service_healthy
+      duckdb:
         condition: service_healthy
       cache:
         condition: service_healthy
@@ -226,6 +337,51 @@ services:
     networks:
       - gisviz-network
 
+  # ────────────────────────────────────────────────────────
+  # 9. DuckDB analytical store (gisviz.duckdb: one table per dataset, ds_00001, ds_00002, ...)
+  #    The ONLY process that opens gisviz.duckdb (one worker), so there are no file-lock conflicts.
+  #    The API reaches it at http://duckdb:8100 with the shared DUCKDB_SERVICE_TOKEN (.env.backend).
+  #    Not published to the host. Inspect data from /admin/datasets (store status + row preview).
+  #    Backup (consistent copy): docker compose stop duckdb && \
+  #      docker run --rm -v gisviz-duckdb-data:/d -v "$PWD":/b alpine tar czf /b/gisviz-duckdb.tgz -C /d . && \
+  #      docker compose start duckdb
+  # ────────────────────────────────────────────────────────
+  duckdb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prod                      # always prod, on your computer and on the VPS (no reload needed)
+    container_name: gisviz-duckdb
+    restart: always
+    working_dir: /app                   # the package `app` lives at /app/app
+    # checks the image really holds the code first (an image unpacked on a full Docker disk can miss it), then starts
+    command:
+      - sh
+      - -c
+      - >-
+        if [ ! -f /app/app/duckstore/server.py ]; then
+        echo "gisviz-duckdb: /app/app/duckstore/server.py is missing: this image is incomplete.";
+        echo "Free Docker disk space, then: docker compose build --no-cache duckdb && docker compose up -d duckdb";
+        ls -la /app /app/app 2>&1; exit 1; fi;
+        exec uvicorn app.duckstore.server:app --app-dir /app --host 0.0.0.0 --port 8100 --workers 1
+    env_file:
+      - path: .env.backend
+        required: true
+    environment:
+      DUCKDB_PATH: /app/duckdb/gisviz.duckdb
+      DUCKDB_THREADS: "4"
+      DUCKDB_MEMORY_LIMIT: 2GB
+    volumes:
+      - duckdb-data:/app/duckdb         # only the data lives outside the image; code changes need a rebuild
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    networks:
+      - gisviz-network
+
 networks:
   gisviz-network:
     name: gisviz-network
@@ -246,3 +402,9 @@ volumes:
     name: gisviz-redis-insight-data
   pgadmin-data:
     name: gisviz-pgadmin-data
+  duckdb-data:
+    name: gisviz-duckdb-data
+  datasets-db-data:
+    name: gisviz-datasets-db-data
+  misc-db-data:
+    name: gisviz-misc-db-data

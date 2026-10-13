@@ -1,3 +1,4 @@
+import uuid
 import random
 import string
 import secrets
@@ -7,7 +8,7 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from jose import JWTError, jwt
+from jose import ExpiredSignatureError, JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, status, Depends
@@ -21,7 +22,7 @@ from app.db.database import get_users_db
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 oauth2_scheme = OAuth2PasswordBearer(
-    tokenUrl=f"{settings.API_V0_STR}/auth/login",
+    tokenUrl=f"{settings.API_VERSION_STR}/auth/login",
     auto_error=False,
 )
 
@@ -42,15 +43,32 @@ class AuthenticationService:
     # ----------------------------------------------------------------
     # JWT & Roles
     # ----------------------------------------------------------------
-    def create_access_token(self, subject: str) -> str:
-        expire = datetime.now(timezone.utc) + timedelta(
-            minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES
-        )
-        return jwt.encode(
-            {"exp": expire, "sub": str(subject)},
-            settings.JWT_SECRET_KEY,
-            algorithm=settings.JWT_ALGORITHM,
-        )
+    def create_access_token(self, subject: str, token_version: int = 0) -> str:
+        """Session token. No expiry when JWT_ACCESS_TOKEN_EXPIRE_MINUTES is 0 (the default): the
+        session lasts until logout (jti revoked) or a password change/reset (token_version bumped)."""
+        now = datetime.now(timezone.utc)
+        claims = {"sub": str(subject), "jti": uuid.uuid4().hex, "tv": int(token_version or 0), "iat": now}
+        if settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES > 0:
+            claims["exp"] = now + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+        return jwt.encode(claims, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+    def revoke_token(self, db: Session, token: str) -> None:
+        """Logout: this one token (device) stops working."""
+        from app.db.models import RevokedTokenRecord
+        try:
+            claims = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM],
+                                options={"verify_exp": False})
+        except JWTError:
+            return
+        jti, sub = claims.get("jti"), claims.get("sub")
+        if jti and sub and db.get(RevokedTokenRecord, jti) is None:
+            db.add(RevokedTokenRecord(jti=jti, user_id=sub))
+            db.commit()
+
+    def end_all_sessions(self, db: Session, user: PlatformUserRecord) -> None:
+        """Password change/reset or 'log out everywhere': every existing token stops working."""
+        user.token_version = (user.token_version or 0) + 1
+        db.commit()
 
     def _resolve_default_role(self, db: Session) -> RoleRecord | None:
         return db.query(RoleRecord).filter(RoleRecord.name == DEFAULT_ROLE_NAME).first()
@@ -59,7 +77,7 @@ class AuthenticationService:
     # Token / OTP generators
     # ----------------------------------------------------------------
     def _generate_otp(self) -> str:
-        return "".join(random.choices(string.digits, k=6))
+        return "".join(secrets.choice(string.digits) for _ in range(6))      # cryptographically random
 
     def _generate_secure_token(self) -> str:
         return secrets.token_urlsafe(32)
@@ -163,6 +181,7 @@ class AuthenticationService:
         db.add(new_user)
         db.commit()
         db.refresh(new_user)
+        record_consent(db, new_user.user_id)
 
         html_content = self._build_html_email(
             title="Account Verification",
@@ -224,6 +243,9 @@ class AuthenticationService:
             raise HTTPException(status_code=404, detail="User not found")
         if user.is_verified == 1 and user.is_active == 1:
             return {"status": "Already verified"}
+        from app.services.cache_service import cache_service
+        if cache_service.hit(f"gisviz:otp-tries:{user.user_id}", 900) > 8:      # 6 digits: no brute force
+            raise HTTPException(status_code=429, detail="Too many attempts. Request a new code in a few minutes.")
         if user.verification_otp != otp:
             raise HTTPException(status_code=400, detail="Invalid OTP")
         if user.otp_expires_at and datetime.now(timezone.utc) > user.otp_expires_at:
@@ -234,6 +256,11 @@ class AuthenticationService:
         user.verification_otp = None
         user.otp_expires_at = None
         db.commit()
+        try:                                       # a verified email on a verified organisation's domain joins it
+            from app.services import access_service
+            access_service.sync_memberships(db, user)
+        except Exception as e:
+            print(f"[auth] organisation membership sync skipped: {e}")
 
         return {"status": "Email verified successfully", "reactivated": True}
 
@@ -281,8 +308,18 @@ class AuthenticationService:
         user.hashed_security_password = self.get_password_hash(new_password)
         user.password_reset_token = None
         user.reset_token_expires_at = None
+        user.token_version = (user.token_version or 0) + 1      # log out every device
         db.commit()
         return {"status": "Password has been successfully reset"}
+
+
+def record_consent(db: Session, user_id, documents=("terms", "privacy")) -> None:
+    """GDPR: keep proof of which version of the terms / privacy policy a user accepted, and when."""
+    from app.api.v0.endpoints.legal import LEGAL_VERSION
+    from app.db.models import ConsentRecord
+    for doc in documents:
+        db.add(ConsentRecord(user_id=user_id, document=doc, version=LEGAL_VERSION))
+    db.commit()
 
 
 # ----------------------------------------------------------------
@@ -295,32 +332,52 @@ auth_service = AuthenticationService()
 # FastAPI dependencies (THESE WERE MISSING!)
 # ----------------------------------------------------------------
 
+_REASONS = {
+    "missing": "Not signed in.",
+    "expired": "Your session expired. Please sign in again.",
+    "invalid": "Your session is no longer valid. Please sign in again.",
+    "ended": "You were signed out (logout or password change). Please sign in again.",
+}
+
+
+def _user_from_token(token: Optional[str], db: Session) -> tuple[Optional[PlatformUserRecord], Optional[str]]:
+    """(user, None) for a valid session token, else (None, reason)."""
+    from app.db.models import RevokedTokenRecord
+    if not token:
+        return None, "missing"
+    try:
+        claims = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    except ExpiredSignatureError:
+        return None, "expired"                     # issued with an expiry (JWT_ACCESS_TOKEN_EXPIRE_MINUTES > 0)
+    except JWTError:
+        return None, "invalid"                     # bad signature: JWT_SECRET_KEY changed, or a tampered token
+    user_id = claims.get("sub")
+    if not user_id:
+        return None, "invalid"
+    user = db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == user_id).first()
+    if user is None:
+        return None, "invalid"
+    if int(claims.get("tv", 0)) != (user.token_version or 0):
+        return None, "ended"                       # password changed / logged out everywhere
+    jti = claims.get("jti")
+    if jti and db.get(RevokedTokenRecord, jti) is not None:
+        return None, "ended"                       # this device logged out
+    return user, None
+
+
 def get_current_authenticated_user(
     token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_users_db),
 ) -> PlatformUserRecord:
-    """Requires a valid JWT — raises 401 if missing or invalid."""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-    )
-    if not token:
-        raise credentials_exception
-    try:
-        payload = jwt.decode(
-            token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
-        )
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-
-    user = db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_id == user_id
-    ).first()
+    """Requires a valid session token — raises 401 if missing, invalid or logged out."""
+    user, reason = _user_from_token(token, db)
     if user is None:
-        raise credentials_exception
+        if reason != "missing":
+            print(f"[auth] 401 ({reason})", flush=True)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_REASONS.get(reason, "Could not validate credentials"),
+        )
     if user.is_verified == 0:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -344,21 +401,7 @@ def get_optional_current_user(
     Used by public endpoints (stream, post detail) that annotate
     is_liked / is_bookmarked only when a user is authenticated.
     """
-    if not token:
-        return None
-    try:
-        payload = jwt.decode(
-            token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
-        )
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            return None
-    except JWTError:
-        return None
-
-    user = db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_id == user_id
-    ).first()
+    user, _reason = _user_from_token(token, db)
     if user is None or user.is_verified == 0 or user.is_active == 0:
         return None
     return user
@@ -381,3 +424,13 @@ class RoleChecker:
                 detail=f"Operation not permitted. Requires one of: {self.allowed_roles}",
             )
         return user
+
+
+# Roles allowed to create/edit posts and use the dataset picker. Everyone else (viewer) is read-only.
+PUBLISHING_ROLES = ["admin", "publisher", "editor", "support"]
+require_publisher = RoleChecker(PUBLISHING_ROLES)
+
+# Roles allowed to manage datasets (create, upload, activate, edit, delete) on /admin/datasets.
+# Add "publisher" here (and in the frontend lib/roles.ts) to let publishers manage datasets too.
+DATASET_MANAGER_ROLES = ["admin"]
+require_dataset_manager = RoleChecker(DATASET_MANAGER_ROLES)

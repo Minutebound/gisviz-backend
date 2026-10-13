@@ -14,11 +14,11 @@ router = APIRouter()
 
 def _search_key_builder(func, namespace, *, request, **kwargs):
     q = request.query_params.get("q", "").lower().strip()
-    return f"gisviz-cache:search:global:{q}"
+    return f"gisviz-cache:search:global:v2:{q}"
 
 
 @router.get("/global")
-@cache(expire=86400, key_builder=_search_key_builder)
+@cache(expire=600, key_builder=_search_key_builder)      # short: a post made private leaves the results soon
 async def global_search(
     q: str = Query(..., min_length=3),
     posts_db: Session = Depends(get_posts_db),
@@ -28,12 +28,14 @@ async def global_search(
     
     # 1. Search Users
     users = users_db.query(PlatformUserRecord).filter(
-        PlatformUserRecord.user_handle.ilike(f"%{q}%")
+        PlatformUserRecord.user_handle.ilike(f"%{q}%"),
+        PlatformUserRecord.is_active == 1, PlatformUserRecord.is_verified == 1,
     ).limit(10).all()
 
     # 2. Search Posts
     posts = posts_db.query(PostRecord).filter(
-        (PostRecord.title.ilike(f"%{q}%")) | (PostRecord.description.ilike(f"%{q}%"))
+        (PostRecord.title.ilike(f"%{q}%")) | (PostRecord.description.ilike(f"%{q}%")),
+        PostRecord.is_active == 1, PostRecord.visibility == "public",     # private posts never appear in search
     ).order_by(desc(PostRecord.created_timestamp)).limit(10).all()
 
     # 3. Search Categories

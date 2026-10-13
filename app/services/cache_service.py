@@ -60,6 +60,40 @@ class CacheService:
             print(f"[CacheService] set({key!r}) failed: {e}")
             return False
 
+    def get_raw(self, key: str) -> Optional[str]:
+        """Return the stored string as-is (already-serialised JSON payloads), or None."""
+        if self._client is None:
+            return None
+        try:
+            return self._client.get(key)
+        except Exception as e:
+            print(f"[CacheService] get_raw({key!r}) failed: {e}")
+            return None
+
+    def set_raw(self, key: str, value: str, ttl_seconds: int = 120) -> bool:
+        """Store a string as-is with a TTL."""
+        if self._client is None:
+            return False
+        try:
+            self._client.set(key, value, ex=ttl_seconds)
+            return True
+        except Exception as e:
+            print(f"[CacheService] set_raw({key!r}) failed: {e}")
+            return False
+
+    def hit(self, key: str, window_seconds: int = 60) -> int:
+        """Count one event in a fixed window (rate limits). 0 when Redis is unavailable (never blocks)."""
+        if self._client is None:
+            return 0
+        try:
+            n = self._client.incr(key)
+            if n == 1:
+                self._client.expire(key, window_seconds)
+            return int(n)
+        except Exception as e:
+            print(f"[CacheService] hit({key!r}) failed: {e}")
+            return 0
+
     def delete(self, key: str) -> bool:
         """Delete a key. Returns True on success, False on error."""
         if self._client is None:

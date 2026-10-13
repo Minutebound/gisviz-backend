@@ -1,6 +1,5 @@
 <%!
 import re
-from mako.runtime import Undefined
 %>"""${message}
 
 Revision ID: ${up_revision}
@@ -28,19 +27,19 @@ def upgrade(engine_name: str) -> None:
 def downgrade(engine_name: str) -> None:
     globals()["downgrade_%s" % engine_name]()
 
-
 <%
     db_names = config.get_main_option("databases")
-    _upgrades   = {} if isinstance(upgrades,   Undefined) else upgrades
-    _downgrades = {} if isinstance(downgrades, Undefined) else downgrades
 %>
+
+## generate an "upgrade_<xyz>() / downgrade_<xyz>()" function for each database;
+## the autogenerate code for each one is in "<xyz>_upgrades" / "<xyz>_downgrades"
 % for db_name in re.split(r',\s*', db_names):
 
 def upgrade_${db_name}() -> None:
-    ${_upgrades.get(db_name, "pass")}
+    ${context.get("%s_upgrades" % db_name, "pass")}
 
 
 def downgrade_${db_name}() -> None:
-    ${_downgrades.get(db_name, "pass")}
+    ${context.get("%s_downgrades" % db_name, "pass")}
 
 % endfor

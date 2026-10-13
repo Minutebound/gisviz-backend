@@ -68,6 +68,8 @@ class CategoryService:
             raise HTTPException(status_code=404, detail="Pending tag not found")
 
         category = CategoryRecord(slug=pending.normalized_slug, label=pending.label)
+        from app.services import banner_service
+        banner_service.ensure(category)
         posts_db.add(category)
         pending.status = "approved"
         pending.reviewed_timestamp = datetime.utcnow()

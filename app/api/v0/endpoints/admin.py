@@ -4,7 +4,7 @@ app/api/v0/endpoints/admin.py
 Single file for every admin endpoint. Replaces:
   - admin.py                (control panel, live analytics, audit, roles, comments)
   - admin_analytics_db.py   (REMOVED — live OLTP used instead; snapshot only for trends)
-  - admin_trends.py         (trend charts + etl-status, merged here)
+  - admin_trends.py         (trend charts + snapshot run log, merged here)
   - admin_access.py         (page registry + access matrix, merged here)
 
 Route map:
@@ -14,11 +14,11 @@ Route map:
     GET  /admin/analytics/top-users
     GET  /admin/analytics/active-commenters
 
-  SNAPSHOT TRENDS (reads analytics_db — updated on Refresh click)
+  DAILY HISTORY (reads analytics_db — filled hourly by app/analytics/snapshot.py)
     GET  /admin/analytics/trends/daily
     GET  /admin/analytics/trends/categories
-    GET  /admin/analytics/etl-status
-    POST /admin/run-snapshot          ← Refresh button calls this first, then re-fetches
+    GET  /admin/analytics/snapshot-runs
+    POST /admin/run-snapshot          ← Refresh button: capture now, then re-fetch
 
   USERS
     GET    /admin/users
@@ -88,9 +88,9 @@ from app.db.models import (
     PostRecord, PostLikeRecord, PostBookmarkRecord,
     PostCommentRecord, CategoryRecord, KeywordRecord,
     FollowCurrentRecord, PostReportRecord,
-    # Analytics warehouse
-    FactDailySnapshot, FactCategoryDaily, DimCategory,
-    EtlRunLog, 
+    PostViewRecord,
+    # Analytics DB (daily history)
+    DailyPlatformStats, DailyCategoryStats, SnapshotRun,
     # Admin audit
     AdminActionLog, RoleChangeHistory, ReportResolution, SupportTicketRecord,
     log_admin_action, log_role_change, log_report_resolution,
@@ -137,10 +137,12 @@ def analytics_overview(
             "categories":   posts_db.query(CategoryRecord).count(),
             "keywords":     posts_db.query(KeywordRecord).count(),
             "open_reports": posts_db.query(PostReportRecord).filter(PostReportRecord.status == "open").count(),
+            "views":        int(posts_db.query(func.coalesce(func.sum(PostRecord.views_count), 0)).scalar() or 0),
         },
         "this_week": {
             "new_users": users_db.query(PlatformUserRecord).filter(PlatformUserRecord.created_timestamp >= week_ago).count(),
             "new_posts": posts_db.query(PostRecord).filter(PostRecord.created_timestamp >= week_ago).count(),
+            "views": posts_db.query(PostViewRecord).filter(PostViewRecord.viewed_timestamp >= week_ago).count(),
         },
         "last_week": {
             "new_users": users_db.query(PlatformUserRecord).filter(
@@ -151,20 +153,28 @@ def analytics_overview(
                 PostRecord.created_timestamp >= two_weeks,
                 PostRecord.created_timestamp < week_ago,
             ).count(),
+            "views": posts_db.query(PostViewRecord).filter(
+                PostViewRecord.viewed_timestamp >= two_weeks,
+                PostViewRecord.viewed_timestamp < week_ago,
+            ).count(),
         },
+        "as_of": now.isoformat(),
     }
 
 
 @router.get("/analytics/top-posts")
 def analytics_top_posts(
-    by: str = Query("likes", regex="^(likes|bookmarks|comments)$"),
+    by: str = Query("likes", regex="^(likes|bookmarks|comments|views)$"),
     limit: int = Query(10, ge=1, le=50),
     users_db: Session = Depends(get_users_db),
     posts_db: Session = Depends(get_posts_db),
     _: PlatformUserRecord = Depends(ADMIN),
 ):
+    cnt: dict = {}
     if by == "likes":
         posts = posts_db.query(PostRecord).order_by(PostRecord.total_likes_count.desc()).limit(limit).all()
+    elif by == "views":
+        posts = posts_db.query(PostRecord).order_by(PostRecord.views_count.desc()).limit(limit).all()
     elif by == "comments":
         posts = posts_db.query(PostRecord).order_by(PostRecord.total_comments_count.desc()).limit(limit).all()
     else:  # bookmarks
@@ -186,6 +196,9 @@ def analytics_top_posts(
             "publisher_handle": handle_map.get(p.publisher_user_id, "deleted_user"),
             "total_likes_count": p.total_likes_count,
             "total_comments_count": p.total_comments_count,
+            "views_count": p.views_count or 0,
+            "metric_value": {"likes": p.total_likes_count, "comments": p.total_comments_count,
+                             "views": p.views_count or 0}.get(by, cnt.get(p.post_id, 0) if by == "bookmarks" else 0),
         }
         for p in posts
     ]
@@ -240,7 +253,7 @@ def analytics_active_commenters(
 
 
 # ════════════════════════════════════════════════════════════════════
-#  SNAPSHOT TRENDS  — reads analytics_db (updated via run-snapshot)
+#  DAILY HISTORY  — reads analytics_db (snapshot.py runs hourly + on Refresh)
 # ════════════════════════════════════════════════════════════════════
 
 @router.get("/analytics/trends/daily")
@@ -250,28 +263,28 @@ def analytics_trends_daily(
     _: PlatformUserRecord = Depends(ADMIN),
 ):
     cutoff = datetime.now(timezone.utc).date() - timedelta(days=days)
-    rows   = (a_db.query(FactDailySnapshot)
-              .filter(FactDailySnapshot.snapshot_date >= cutoff)
-              .order_by(FactDailySnapshot.snapshot_date.asc()).all())
-    latest = a_db.query(func.max(FactDailySnapshot.snapshot_date)).scalar()
+    rows   = (a_db.query(DailyPlatformStats)
+              .filter(DailyPlatformStats.stat_date >= cutoff)
+              .order_by(DailyPlatformStats.stat_date.asc()).all())
+    last   = (a_db.query(SnapshotRun).filter(SnapshotRun.status == "success")
+              .order_by(desc(SnapshotRun.started_timestamp)).first())
     stale  = None
-    if latest is None:
-        stale = "No snapshots yet — click Refresh to run the first snapshot."
-    elif (datetime.now(timezone.utc).date() - latest).days >= 2:
-        stale = f"Latest snapshot is {(datetime.now(timezone.utc).date() - latest).days} days old."
+    if last is None:
+        stale = "No snapshot yet: the first one runs a minute after the API starts, or click Refresh."
+    elif datetime.now(timezone.utc) - last.started_timestamp > timedelta(hours=3):
+        stale = f"Last snapshot {last.started_timestamp:%Y-%m-%d %H:%M} UTC: the hourly job may not be running."
     return {
         "points": [
             {
-                "date": r.snapshot_date.isoformat(),
-                "total_users": r.total_users, "total_posts": r.total_posts,
-                "total_likes": r.total_likes, "total_bookmarks": r.total_bookmarks,
-                "total_comments": r.total_comments, "total_follows": r.total_follows,
-                "open_reports": r.open_reports,
-                "new_users": r.new_users, "new_posts": r.new_posts,
+                "date": r.stat_date.isoformat(),
+                "users": r.users, "posts": r.posts, "likes": r.likes, "bookmarks": r.bookmarks,
+                "comments": r.comments, "follows": r.follows, "open_reports": r.open_reports,
+                "new_users": r.new_users, "new_posts": r.new_posts, "views": r.views, "viewers": r.viewers,
             }
             for r in rows
         ],
         "count": len(rows),
+        "last_snapshot": last.started_timestamp.isoformat() if last else None,
         "stale_warning": stale,
     }
 
@@ -283,43 +296,37 @@ def analytics_category_trends(
     _: PlatformUserRecord = Depends(ADMIN),
 ):
     cutoff = datetime.now(timezone.utc).date() - timedelta(days=days)
-    rows   = (a_db.query(FactCategoryDaily, DimCategory.label)
-              .join(DimCategory, DimCategory.category_id == FactCategoryDaily.category_id)
-              .filter(FactCategoryDaily.snapshot_date >= cutoff)
-              .order_by(FactCategoryDaily.snapshot_date.asc()).all())
+    rows   = (a_db.query(DailyCategoryStats)
+              .filter(DailyCategoryStats.stat_date >= cutoff)
+              .order_by(DailyCategoryStats.stat_date.asc(), DailyCategoryStats.category_id.asc()).all())
     return {
         "points": [
-            {
-                "date": fc.snapshot_date.isoformat(),
-                "category_id": fc.category_id,
-                "label": label,
-                "usage_count": fc.usage_count,
-                "post_count": fc.post_count,
-            }
-            for fc, label in rows
+            {"date": r.stat_date.isoformat(), "category_id": r.category_id, "label": r.label,
+             "posts": r.posts, "new_posts": r.new_posts, "views": r.views}
+            for r in rows
         ]
     }
 
 
-@router.get("/analytics/etl-status")
-def analytics_etl_status(
+@router.get("/analytics/snapshot-runs")
+def analytics_snapshot_runs(
     limit: int = Query(10, ge=1, le=50),
     a_db: Session = Depends(get_analytics_db),
     _: PlatformUserRecord = Depends(ADMIN),
 ):
-    runs = (a_db.query(EtlRunLog)
-            .order_by(desc(EtlRunLog.started_timestamp)).limit(limit).all())
+    runs = (a_db.query(SnapshotRun)
+            .order_by(desc(SnapshotRun.started_timestamp)).limit(limit).all())
     return [
         {
             "run_id": str(r.run_id),
-            "job_name": r.job_name,
-            "snapshot_date": r.snapshot_date.isoformat() if r.snapshot_date else None,
+            "trigger": r.trigger,
+            "stat_date": r.stat_date.isoformat() if r.stat_date else None,
             "status": r.status,
             "rows_written": r.rows_written,
             "error_message": r.error_message,
             "started": r.started_timestamp,
             "finished": r.finished_timestamp,
-            "duration_seconds": float(r.duration_seconds) if r.duration_seconds else None,
+            "duration_seconds": float(r.duration_seconds) if r.duration_seconds is not None else None,
         }
         for r in runs
     ]
@@ -329,14 +336,9 @@ def analytics_etl_status(
 def trigger_snapshot(
     _: PlatformUserRecord = Depends(ADMIN),
 ):
-    """
-    Called by the Refresh button on the analytics page.
-    Runs the ETL snapshot for today (UTC), which populates analytics_db
-    so that trends/daily, trends/categories, and etl-status reflect
-    the current state of users_db + posts_db.
-    """
-    from app.analytics.snapshot import run_daily_snapshot
-    return run_daily_snapshot()
+    """Refresh button on /admin/analytics: capture today's numbers now (the job also runs hourly)."""
+    from app.analytics.snapshot import run_snapshot
+    return run_snapshot("manual")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -791,6 +793,8 @@ async def update_category(           # ← was `def`, now `async def`
     old = {"label": cat.label, "slug": cat.slug}
     cat.label = payload.label
     cat.slug  = payload.slug
+    from app.services import banner_service
+    banner_service.ensure(cat)
     posts_db.commit()
  
     log_admin_action(

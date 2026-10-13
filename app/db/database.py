@@ -42,6 +42,22 @@ admin_engine = create_engine(settings.ADMIN_DATABASE_URL, pool_pre_ping=True,
                               pool_size=5, max_overflow=5, pool_recycle=1800)
 AdminSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=admin_engine)
 AdminBase = declarative_base()
+
+# ============================================================
+# 5. DATASETS Database  (catalog of the DuckDB datasets; written by the dataset sync)
+# ============================================================
+datasets_engine = create_engine(settings.DATASETS_DATABASE_URL or settings.POSTS_DATABASE_URL, pool_pre_ping=True,
+                                pool_size=5, max_overflow=5, pool_recycle=1800)
+DatasetsSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=datasets_engine)
+DatasetsBase = declarative_base()
+
+# ============================================================
+# 6. MISC Database  (shared reference data: regions, ... ; falls back to the datasets/posts DB)
+# ============================================================
+misc_engine = create_engine(settings.MISC_DATABASE_URL or settings.DATASETS_DATABASE_URL or settings.POSTS_DATABASE_URL,
+                            pool_pre_ping=True, pool_size=5, max_overflow=5, pool_recycle=1800)
+MiscSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=misc_engine)
+MiscBase = declarative_base()
  
  
 # FastAPI dependency helpers
@@ -71,6 +87,22 @@ def get_analytics_db():
  
 def get_admin_db():
     db = AdminSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_datasets_db():
+    db = DatasetsSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_misc_db():
+    db = MiscSessionLocal()
     try:
         yield db
     finally:

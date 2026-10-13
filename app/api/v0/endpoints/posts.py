@@ -1,7 +1,7 @@
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from fastapi_cache import FastAPICache
 from fastapi_cache.decorator import cache
 from sqlalchemy.orm import Session
@@ -15,6 +15,7 @@ from app.db.models import (
     PostCommentRecord, PostReportRecord, RoleRecord,
 )
 from app.schemas.post_schema import (
+    BackdropPreviewPayload,
     PostResponse, PostPayload, LikeResponse, BookmarkResponse,
     CommentPayload, CommentData, PostReportPayload, PostReportResponse,ReportStatusPayload
 )
@@ -24,9 +25,28 @@ from app.services.auth_service import (
     get_current_authenticated_user,
     get_optional_current_user,
     RoleChecker,
+    require_publisher,
 )
 
 router = APIRouter()
+
+
+def _viewer(user, users_db=None):
+    from app.services import access_service
+    return access_service.viewer_for(user, users_db)
+
+
+def _readable_post(posts_db, post_id, viewer) -> PostRecord:
+    """The post if this viewer may read it, else 404 (a private post is never confirmed to exist)."""
+    from app.services import access_service
+    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
+    if post is None:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post.is_active != 1 and not access_service.can_manage_post(viewer, post):
+        raise HTTPException(status_code=404, detail="Post not found")
+    if not access_service.can_view_post(viewer, post, posts_db):
+        raise HTTPException(status_code=404, detail="Post not found")
+    return post
 
 # TTL constants in seconds
 STREAM_TTL = 30
@@ -50,6 +70,15 @@ async def _invalidate_user_posts(handle: str) -> None:
             await backend.clear(key=f"gisviz-cache:posts:user:{handle.lower()}:{skip}:50")
     except Exception as exc:
         print(f"[cache] user posts invalidation failed for {handle}: {exc}")
+
+
+def _invalidate_post_images() -> None:
+    """A post was created / edited / deleted: its poster image changed, so cached lists that carry image paths
+    (the feed banner's editor's pick) are dropped."""
+    try:
+        cache_service.delete_pattern("gisviz-cache:posts:featured:*")
+    except Exception as exc:
+        print(f"[cache] featured invalidation failed: {exc}")
 
 
 # -------------------------------------------------------------------
@@ -95,6 +124,118 @@ async def trending_posts(n: int = Query(10, ge=1, le=50)):
 #  Per-user is_liked / is_bookmarked included when JWT present.
 #  Client-side 2-minute TTL in api.ts prevents hammering.
 # -------------------------------------------------------------------
+@router.get("/keywords/trending")
+def trending_keywords(
+    category: Optional[str] = Query(None, max_length=60),
+    limit: int = Query(10, ge=1, le=30),
+    posts_db: Session = Depends(get_posts_db),
+):
+    """Public: the tags (keywords) used by the most active posts, optionally within one category
+    (categories.slug). Feeds the "Trending Tags" rail; nothing about it is hard-coded."""
+    from sqlalchemy import func
+    from app.db.models import CategoryRecord, KeywordRecord, PostCategoryLink, PostKeywordLink, PostRecord
+    from app.services.cache_service import cache_service
+    key = f"gisviz-cache:keywords:trending:{category or 'all'}:{limit}"
+    cached = cache_service.get(key)
+    if cached is not None:
+        return cached
+    n = func.count(PostKeywordLink.post_id)
+    q = (posts_db.query(KeywordRecord.word, n.label("posts"))
+         .join(PostKeywordLink, PostKeywordLink.keyword_id == KeywordRecord.keyword_id)
+         .join(PostRecord, PostRecord.post_id == PostKeywordLink.post_id)
+         .filter(PostRecord.is_active == 1, PostRecord.visibility == "public"))
+    if category:
+        q = (q.join(PostCategoryLink, PostCategoryLink.post_id == PostRecord.post_id)
+              .join(CategoryRecord, CategoryRecord.category_id == PostCategoryLink.category_id)
+              .filter(CategoryRecord.slug == category))
+    rows = q.group_by(KeywordRecord.word).order_by(n.desc(), KeywordRecord.word).limit(limit).all()
+    result = [{"word": w, "posts": c} for w, c in rows]
+    cache_service.set(key, result, ttl_seconds=3600 if result else 60)
+    return result
+
+
+@router.get("/feed", response_model=List[PostResponse])
+def filtered_feed(
+    category: Optional[str] = Query(None, max_length=60),
+    region: Optional[str] = Query(None, max_length=60),
+    chart_type: Optional[str] = Query(None, max_length=40),     # visual type: catalog code (misc DB)
+    search: Optional[str] = Query(None, max_length=120),
+    publisher: Optional[str] = Query(None, max_length=60),
+    sort: str = Query("trending", pattern="^(trending|recent|popular)$"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(12, ge=1, le=60),
+    posts_db: Session = Depends(get_posts_db),
+    users_db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
+):
+    """Public: the feed with its filters (category bar, region, visual type, search, publisher)."""
+    return post_service.feed(posts_db, users_db, category=category or None, region=region or None,
+                             visual_type=chart_type or None, search=search or None, publisher=publisher or None,
+                             sort=sort, skip=skip, limit=limit,
+                             current_user_id=current_user.user_id if current_user else None)
+
+
+@router.get("/backdrop/options")
+def backdrop_options():
+    """Public: what the poster editor can choose from (textures, title fonts, movable blocks, map bases)."""
+    from app.services import backdrop_service
+    return backdrop_service.options()
+
+
+@router.post("/backdrop/preview")
+def backdrop_preview(
+    body: BackdropPreviewPayload,
+    posts_db: Session = Depends(get_posts_db),
+    _user: PlatformUserRecord = Depends(require_publisher),
+):
+    """Publishers: the poster design "auto" would pick for this topic (colour, texture, title font), or the
+    publisher's design cleaned the way publishing would clean it."""
+    body.title = (body.title or "").strip()
+    return post_service._backdrop(posts_db, body)
+
+
+@router.post("/manage/rerender-images")
+def rerender_images(
+    posts_db: Session = Depends(get_posts_db),
+    _admin: PlatformUserRecord = Depends(RoleChecker(["admin"])),
+):
+    """Admin: redraw every post's poster image (feed card / thumbnail / share preview) with the current renderer."""
+    return post_service.rerender_images(posts_db)
+
+
+@router.get("/featured")
+def featured_post(
+    category: Optional[str] = Query(None, max_length=60),
+    posts_db: Session = Depends(get_posts_db),
+    users_db: Session = Depends(get_users_db),
+):
+    """Public: the feed banner's editor's pick — the most-viewed active post, in one category
+    (categories.slug) or overall. Ties go to the most liked, then the newest. null when none."""
+    from app.db.models import CategoryRecord, PostCategoryLink, PostRecord
+    key = f"gisviz-cache:posts:featured:{category or 'all'}"
+    cached = cache_service.get(key)
+    if cached:
+        return cached
+    q = posts_db.query(PostRecord).filter(PostRecord.is_active == 1, PostRecord.visibility == "public")
+    if category:
+        q = (q.join(PostCategoryLink, PostCategoryLink.post_id == PostRecord.post_id)
+              .join(CategoryRecord, CategoryRecord.category_id == PostCategoryLink.category_id)
+              .filter(CategoryRecord.slug == category))
+    p = q.order_by(PostRecord.views_count.desc(), PostRecord.total_likes_count.desc(),
+                   PostRecord.created_timestamp.desc()).first()
+    result = {}
+    if p is not None:
+        pub = users_db.query(PlatformUserRecord).filter(PlatformUserRecord.user_id == p.publisher_user_id).first()
+        result = {"post_id": str(p.post_id), "title": p.title, "visual_image_path": p.visual_image_path,
+                  "theme_color": p.theme_color, "views_count": p.views_count or 0,
+                  "total_likes_count": p.total_likes_count, "share_slug": p.share_slug,
+                  "publisher_handle": pub.user_handle if pub else None,
+                  "created_timestamp": p.created_timestamp.isoformat() if p.created_timestamp else None}
+    if result:  # never cache "no pick": the first post of a category must appear at once
+        cache_service.set(key, result, ttl_seconds=120)
+    return result or None
+
+
 @router.get("/trending-full", response_model=List[PostResponse])
 async def trending_posts_full(
     n: int = Query(20, ge=1, le=50),
@@ -109,7 +250,8 @@ async def trending_posts_full(
         id_list = [uuid.UUID(i) for i in trending_ids[:n]]
         posts = posts_db.query(PostRecord).filter(
             PostRecord.post_id.in_(id_list),
-            PostRecord.is_active == 1,   
+            PostRecord.is_active == 1,
+            PostRecord.visibility == "public",
         ).all()
         # preserve Redis order
         order = {pid: idx for idx, pid in enumerate(id_list)}
@@ -117,7 +259,7 @@ async def trending_posts_full(
     else:
         posts = (
             posts_db.query(PostRecord)
-            .filter(PostRecord.is_active == 1)   
+            .filter(PostRecord.is_active == 1, PostRecord.visibility == "public")
             .order_by(desc(PostRecord.total_likes_count))
             .limit(n)
             .all()
@@ -144,7 +286,8 @@ async def search_post_stream(
     posts = (
         posts_db.query(PostRecord)
         .filter(
-            (PostRecord.title.ilike(f"%{q}%")) | (PostRecord.description.ilike(f"%{q}%"))
+            (PostRecord.title.ilike(f"%{q}%")) | (PostRecord.description.ilike(f"%{q}%")),
+            PostRecord.is_active == 1, PostRecord.visibility == "public",
         )
         .order_by(desc(PostRecord.created_timestamp))
         .offset(skip).limit(limit).all()
@@ -183,13 +326,14 @@ async def get_user_posts(
         current_user is not None
         and current_user.user_id == user.user_id
     )
-    if not is_own_profile:
-        query = query.filter(PostRecord.is_active == 1)
+    if not is_own_profile:      # others: active public posts (private ones are in the Shared tab of who can see them)
+        query = query.filter(PostRecord.is_active == 1, PostRecord.visibility == "public")
 
     posts = query.order_by(PostRecord.created_timestamp.desc()).offset(skip).limit(limit).all()
     current_user_id = current_user.user_id if current_user else None
+    viewer = _viewer(current_user, users_db) if is_own_profile else None
     return [
-        post_service._format_post_response(posts_db, users_db, p, current_user_id)
+        post_service._format_post_response(posts_db, users_db, p, current_user_id, viewer)
         for p in posts
     ]
 
@@ -229,10 +373,12 @@ async def get_user_bookmarks(
             PostRecord.post_id.in_([b.post_id for b in bookmarks])
         ).all()
     }
+    from app.services import access_service
+    viewer = _viewer(current_user, users_db)
     results = []
     for bm in bookmarks:
         post = post_map.get(bm.post_id)
-        if post:
+        if post and post.is_active == 1 and access_service.can_view_post(viewer, post, posts_db):
             results.append(
                 post_service._format_post_response(posts_db, users_db, post, current_user.user_id)
             )
@@ -251,13 +397,10 @@ async def get_post(
     users_db: Session = Depends(get_users_db),
     current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
-    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    if post.is_active != 1:
-        raise HTTPException(status_code=404, detail="Post not found")  # treat inactive as non-existent publicly
+    viewer = _viewer(current_user, users_db)
+    post = _readable_post(posts_db, post_id, viewer)
     current_user_id = current_user.user_id if current_user else None
-    return post_service._format_post_response(posts_db, users_db, post, current_user_id)
+    return post_service._format_post_response(posts_db, users_db, post, current_user_id, viewer)
 
 # -------------------------------------------------------------------
 #  POST CRUD
@@ -267,11 +410,11 @@ async def create_post(
     payload: PostPayload,
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
-    current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
+    current_user: PlatformUserRecord = Depends(require_publisher),
 ):
     new_post = await post_service.create_post(
         posts_db=posts_db, users_db=users_db,
-        user_id=current_user.user_id, payload=payload,
+        user_id=current_user.user_id, payload=payload, viewer=_viewer(current_user, users_db),
     )
     current_user.post_count = (current_user.post_count or 0) + 1
     if current_user.role and current_user.role.name == "viewer":
@@ -282,6 +425,7 @@ async def create_post(
                 current_user.title = "Platform Publisher"
     users_db.commit()
     await _invalidate_user_posts(current_user.user_handle)
+    _invalidate_post_images()
     return new_post
 
 
@@ -290,13 +434,14 @@ async def update_post(
     post_id: uuid.UUID, payload: PostPayload,
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
-    current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
+    current_user: PlatformUserRecord = Depends(require_publisher),
 ):
     result = await post_service.update_post(
         posts_db=posts_db, users_db=users_db,
         post_id=post_id, payload=payload, current_user=current_user,
     )
     await _invalidate_user_posts(current_user.user_handle)
+    _invalidate_post_images()
     return result
 
 
@@ -307,12 +452,14 @@ async def delete_post(
     users_db: Session = Depends(get_users_db),    # ← ADD this dependency
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    return await post_service.delete_post(
+    out = await post_service.delete_post(
         posts_db=posts_db,
         post_id=post_id,
         current_user=current_user,
-        users_db=users_db,    # ← pass it
+        users_db=users_db,
     )
+    _invalidate_post_images()
+    return out
 
 @router.put("/{post_id}/status")
 async def set_post_status(
@@ -325,6 +472,7 @@ async def set_post_status(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     post.is_active = 1 if is_active else 0
+    post.deactivated_by_dataset = 0          # an admin decision: no longer tied to the dataset's state
     posts_db.commit()
     return {"post_id": str(post_id), "is_active": post.is_active}
 
@@ -338,6 +486,7 @@ async def report_post(
     posts_db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
+    _readable_post(posts_db, post_id, _viewer(current_user))
     report = PostReportRecord(
         post_id=post_id, reporter_user_id=current_user.user_id, reason=payload.reason,
     )
@@ -462,15 +611,37 @@ async def update_report_status(
 # -------------------------------------------------------------------
 #  LIKES
 # -------------------------------------------------------------------
+@router.post("/{post_id}/view")
+def record_post_view(
+    post_id: str,
+    request: Request,
+    posts_db: Session = Depends(get_posts_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
+):
+    """Public: called each time a post page opens. Every call is a view (post_views in the posts DB),
+    except a repeat by the same viewer within a few seconds; returns the post's view total."""
+    from app.services import view_service
+    try:
+        pid = uuid.UUID(post_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Post not found")
+    _readable_post(posts_db, pid, _viewer(current_user))
+    fwd = request.headers.get("x-forwarded-for", "")
+    ip = fwd.split(",")[0].strip() or (request.client.host if request.client else None)
+    try:
+        return view_service.record_view(post_id, str(current_user.user_id) if current_user else None,
+                                        ip, request.headers.get("user-agent"))
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+
 @router.post("/{post_id}/like", response_model=LikeResponse)
 async def toggle_like(
     post_id: uuid.UUID,
     posts_db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
+    post = _readable_post(posts_db, post_id, _viewer(current_user))
 
     existing = posts_db.query(PostLikeRecord).filter(
         PostLikeRecord.post_id == post_id,
@@ -504,9 +675,7 @@ async def toggle_bookmark(
     posts_db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
+    post = _readable_post(posts_db, post_id, _viewer(current_user))
 
     # Users cannot bookmark their own posts
     if post.publisher_user_id == current_user.user_id:
@@ -537,9 +706,7 @@ async def add_comment(
     posts_db: Session = Depends(get_posts_db),
     current_user: PlatformUserRecord = Depends(get_current_authenticated_user),
 ):
-    post = posts_db.query(PostRecord).filter(PostRecord.post_id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
+    post = _readable_post(posts_db, post_id, _viewer(current_user))
     new_comment = PostCommentRecord(
         post_id=post_id, user_id=current_user.user_id,
         parent_comment_id=payload.parent_comment_id, content=payload.content,
@@ -563,7 +730,9 @@ async def get_comments(
     post_id: uuid.UUID,
     posts_db: Session = Depends(get_posts_db),
     users_db: Session = Depends(get_users_db),
+    current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
+    _readable_post(posts_db, post_id, _viewer(current_user, users_db))
     all_comments = (
         posts_db.query(PostCommentRecord)
         .filter(PostCommentRecord.post_id == post_id)
@@ -603,7 +772,9 @@ async def get_post_by_slug(
     current_user: Optional[PlatformUserRecord] = Depends(get_optional_current_user),
 ):
     post = posts_db.query(PostRecord).filter(PostRecord.share_slug == slug).first()
-    if not post or post.is_active != 1:
+    if not post:
         raise HTTPException(status_code=404, detail="Post not found")
+    viewer = _viewer(current_user, users_db)
+    post = _readable_post(posts_db, post.post_id, viewer)
     current_user_id = current_user.user_id if current_user else None
-    return post_service._format_post_response(posts_db, users_db, post, current_user_id)
+    return post_service._format_post_response(posts_db, users_db, post, current_user_id, viewer)
